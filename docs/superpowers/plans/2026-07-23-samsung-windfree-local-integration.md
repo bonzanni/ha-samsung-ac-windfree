@@ -2498,5 +2498,7 @@ Before Task 1 implementation begins:
 6. Repeat the Fable review until its verdict is `APPROVE`.
 7. Record the approved plan commit and verdict below.
 
-**Review record:** populated after the mandatory gate; implementation must not
-start while this line lacks an approved commit and `APPROVE` verdict.
+**Review record:** Claude Fable reviewed commit
+`7903e902806cc097e0a76c428be7bc3ba6b75724` and returned `APPROVE` with no
+required changes on 2026-07-23. The following commit changes only this review
+record.
