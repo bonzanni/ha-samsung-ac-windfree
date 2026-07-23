@@ -6,15 +6,19 @@ from pathlib import Path
 from custom_components.samsung_ac_windfree.const import (
     DOMAIN,
     PROBE_PORTS,
+    SUPPORTED_DEVICE_TYPE,
     SUPPORTED_FIRMWARE_PREFIX,
     SUPPORTED_MODEL,
+    SUPPORTED_PLATFORM,
 )
 
 
 def test_fixed_product_contract() -> None:
     assert DOMAIN == "samsung_ac_windfree"
     assert SUPPORTED_MODEL == "AR60F12C1AWNEU"
+    assert SUPPORTED_DEVICE_TYPE == "oic.d.airconditioner"
     assert SUPPORTED_FIRMWARE_PREFIX == "TP1X_DA-AC-RAC-01001"
+    assert SUPPORTED_PLATFORM == "TizenRT 4.0"
     assert PROBE_PORTS == tuple(range(49152, 49161))
 
 

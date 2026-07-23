@@ -17,7 +17,7 @@ state cache, tiered polling, OBSERVE updates, verified writes, capability
 drift detection, and availability. Home Assistant entities read coordinator
 memory only.
 
-**Tech Stack:** Python 3.13+, Home Assistant 2026.5.4+,
+**Tech Stack:** Python 3.14.2+, Home Assistant 2026.5.4+,
 `smartthings-local==0.1.0`,
 `cbor2==6.1.3`, Home Assistant's pyOpenSSL/cryptography stack, pytest,
 pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
@@ -430,7 +430,7 @@ fail_under = 95
 show_missing = true
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 line-length = 88
 
 [tool.ruff.lint]
@@ -2346,7 +2346,7 @@ Create jobs for:
 10. Scheduled Samsung leaf/SPKI pin canary that reports mismatch without
    committing or accepting new material
 
-Use Python 3.13, `actions/checkout@v4`, `actions/setup-python@v5`,
+Use Python 3.14, `actions/checkout@v4`, `actions/setup-python@v5`,
 `home-assistant/actions/hassfest@master`, and `hacs/action@main`.
 
 - [ ] **Step 2: Run the complete local suite with coverage**
