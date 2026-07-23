@@ -1,0 +1,4 @@
+pytest-homeassistant-custom-component==0.13.347
+ruff==0.15.21
+smartthings-local==0.1.0
+cbor2==6.1.3
