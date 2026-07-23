@@ -1159,6 +1159,14 @@ bootstrap traceback frames and require the exact injected bytes, objects,
 content, and representations to be absent; caller/test frames are outside this
 guarantee. Preserve the original `CancelledError` object unchanged and scrub
 sensitive production locals before re-raising cancellation.
+Apply that same boundary to both fetch helpers: partial streamed bundle chunks,
+response/session objects, parsed URLs and dates, Home Assistant/executor job
+objects, returned DER, and raw failures must unwind inside private
+result-or-fixed-category helpers. Direct tests must cover oversize bodies,
+stream failures after a private-key-like chunk, invalid status/URL/Date, and
+cancellation after a partial chunk, and a parametrized audit must exercise every
+public bootstrap function on ordinary failure plus every async public function
+on cancellation.
 
 - [ ] **Step 5: Run focused and full bootstrap tests**
 

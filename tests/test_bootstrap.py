@@ -177,8 +177,9 @@ def _mismatched_inner_outer_algorithm_certificate(
 
 
 def _assert_no_sensitive_bootstrap_frame_locals(
-    error: BootstrapError,
+    error: BaseException,
     *sensitive_values: object,
+    forbidden_names: frozenset[str] = frozenset(),
 ) -> None:
     current = error.__traceback__
     bootstrap_frames = []
@@ -190,6 +191,10 @@ def _assert_no_sensitive_bootstrap_frame_locals(
 
     assert bootstrap_frames
     for frame in bootstrap_frames:
+        assert forbidden_names.isdisjoint(frame.f_locals), (
+            frame.f_code.co_name,
+            forbidden_names.intersection(frame.f_locals),
+        )
         for name, value in frame.f_locals.items():
             for sensitive in sensitive_values:
                 assert value is not sensitive, (frame.f_code.co_name, name)
@@ -735,6 +740,17 @@ class _FakeContent:
         yield self._body
 
 
+class _ScriptedContent:
+    def __init__(self, *events: bytes | BaseException) -> None:
+        self.events = events
+
+    async def iter_chunked(self, _size: int):
+        for event in self.events:
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+
 class _FakeResponse:
     def __init__(
         self,
@@ -821,6 +837,80 @@ async def test_bundle_fetch_rejects_non_200_and_oversize_response() -> None:
         )
 
 
+async def test_bundle_fetch_cancellation_scrubs_partial_private_key_chunk() -> None:
+    private_chunk = b"-----BEGIN PRIVATE KEY-----\nCANCELLED-CHUNK-SECRET"
+    cancellation = asyncio.CancelledError("CANCELLED-RAW-SECRET")
+    response = _FakeResponse(date=format_datetime(datetime(2026, 7, 23, tzinfo=UTC)))
+    response.content = _ScriptedContent(private_chunk, cancellation)
+    session = _FakeSession(response)
+
+    with pytest.raises(asyncio.CancelledError) as err:
+        await async_fetch_bundle(session)
+
+    assert err.value is cancellation
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        session,
+        response,
+        response.content,
+        private_chunk,
+        "CANCELLED-RAW-SECRET",
+        forbidden_names=frozenset({"session", "response", "chunks", "chunk"}),
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("oversize", bootstrap.ERROR_INVALID_MATERIAL),
+        ("stream", bootstrap.ERROR_UNAVAILABLE),
+        ("status", bootstrap.ERROR_UNAVAILABLE),
+        ("url", bootstrap.ERROR_UNAVAILABLE),
+        ("date", bootstrap.ERROR_INVALID_MATERIAL),
+    ],
+)
+async def test_bundle_fetch_failures_scrub_all_response_material(
+    failure: str,
+    expected: str,
+) -> None:
+    private_chunk = b"-----BEGIN PRIVATE KEY-----\nFETCH-FAILURE-SECRET"
+    raw_secret = "https://secret.invalid/FETCH-RAW-SECRET"
+    raw_error = RuntimeError(raw_secret, private_chunk)
+    response = _FakeResponse(date=format_datetime(datetime(2026, 7, 23, tzinfo=UTC)))
+    if failure == "oversize":
+        response.content = _ScriptedContent(
+            private_chunk,
+            b"x" * (bootstrap._MAX_BUNDLE_SIZE + 1),
+        )
+    elif failure == "stream":
+        response.content = _ScriptedContent(private_chunk, raw_error)
+    elif failure == "status":
+        response.status = 503
+        response.content = _ScriptedContent(private_chunk)
+    elif failure == "url":
+        response.url = URL("https://attacker.invalid/FETCH-RAW-SECRET")
+        response.content = _ScriptedContent(private_chunk)
+    else:
+        response.headers["Date"] = raw_secret
+        response.content = _ScriptedContent(private_chunk)
+    session = _FakeSession(response)
+
+    with pytest.raises(BootstrapError) as err:
+        await async_fetch_bundle(session)
+
+    _assert_clean_error(err.value, expected, raw_secret, private_chunk.decode())
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        session,
+        response,
+        response.content,
+        private_chunk,
+        raw_error,
+        raw_secret,
+        forbidden_names=frozenset({"session", "response", "chunks", "chunk"}),
+    )
+
+
 async def test_bundle_fetch_timeout_is_sanitized(monkeypatch) -> None:
     class SlowContext:
         async def __aenter__(self):
@@ -904,6 +994,45 @@ async def test_identity_fetch_runs_in_executor_and_sanitizes_all_failures() -> N
     with pytest.raises(BootstrapError) as err:
         await async_fetch_identity_der(FakeHass())
     _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, secret)
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["executor-error", "cancel"])
+async def test_identity_fetch_scrubs_executor_state_and_preserves_cancellation(
+    cancelled: bool,
+) -> None:
+    raw_result = b"IDENTITY-DER-EXECUTOR-SECRET"
+    raw_secret = "IDENTITY-EXECUTOR-RAW-SECRET"
+    job = object()
+    failure: BaseException
+    if cancelled:
+        failure = asyncio.CancelledError(raw_secret, raw_result, job)
+    else:
+        failure = RuntimeError(raw_secret, raw_result, job)
+
+    class FakeHass:
+        async def async_add_executor_job(self, target, *_args):
+            assert target is bootstrap._fetch_identity_der
+            raise failure
+
+    hass = FakeHass()
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError) as err:
+            await async_fetch_identity_der(hass)
+        assert err.value is failure
+    else:
+        with pytest.raises(BootstrapError) as err:
+            await async_fetch_identity_der(hass)
+        _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, raw_secret)
+
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        hass,
+        job,
+        raw_result,
+        failure,
+        raw_secret,
+        forbidden_names=frozenset({"hass", "job", "result"}),
+    )
 
 
 async def test_bootstrap_runs_cpu_work_in_executor_and_sanitizes_failure(
@@ -1095,7 +1224,10 @@ async def test_async_bootstrap_helpers_preserve_cancellation(
     monkeypatch,
     helper: str,
 ) -> None:
-    cancellation = asyncio.CancelledError()
+    raw_secret = "PUBLIC-CANCELLATION-RAW-SECRET"
+    cancellation = asyncio.CancelledError(raw_secret)
+    sensitive_owner: object
+    forbidden_names: frozenset[str]
 
     if helper == "bundle":
 
@@ -1103,28 +1235,124 @@ async def test_async_bootstrap_helpers_preserve_cancellation(
             def get(self, _url, **_kwargs):
                 raise cancellation
 
-        coroutine = async_fetch_bundle(CancelSession())
+        sensitive_owner = CancelSession()
+        forbidden_names = frozenset({"session"})
+        coroutine = async_fetch_bundle(sensitive_owner)
     elif helper == "identity":
 
         class CancelHass:
             async def async_add_executor_job(self, _target, *_args):
                 raise cancellation
 
-        coroutine = async_fetch_identity_der(CancelHass())
+        sensitive_owner = CancelHass()
+        forbidden_names = frozenset({"hass"})
+        coroutine = async_fetch_identity_der(sensitive_owner)
     else:
 
         async def cancel_bundle(_session):
             raise cancellation
 
+        sensitive_owner = SimpleNamespace()
+        forbidden_names = frozenset({"hass"})
         monkeypatch.setattr(
             bootstrap, "async_get_clientsession", lambda _hass: object()
         )
         monkeypatch.setattr(bootstrap, "async_fetch_bundle", cancel_bundle)
-        coroutine = async_bootstrap_credentials(SimpleNamespace())
+        coroutine = async_bootstrap_credentials(sensitive_owner)
 
     with pytest.raises(asyncio.CancelledError) as err:
         await coroutine
     assert err.value is cancellation
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        sensitive_owner,
+        raw_secret,
+        forbidden_names=forbidden_names,
+    )
+
+
+@pytest.mark.parametrize(
+    "public_name",
+    [
+        "validate_bundle",
+        "validate_identity_certificate",
+        "create_credentials",
+        "async_fetch_bundle",
+        "async_fetch_identity_der",
+        "async_bootstrap_credentials",
+    ],
+)
+async def test_every_public_bootstrap_boundary_scrubs_arguments_on_error(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    public_name: str,
+) -> None:
+    raw_secret = b"PUBLIC-SYNC-BOUNDARY-SECRET"
+    sensitive_owner: object = raw_secret
+    forbidden_names: frozenset[str] = frozenset()
+    if public_name == "validate_bundle":
+
+        def call():
+            return validate_bundle(raw_secret)
+    elif public_name == "validate_identity_certificate":
+
+        def call():
+            return validate_identity_certificate(raw_secret)
+    elif public_name == "create_credentials":
+        monkeypatch.setattr(
+            bootstrap,
+            "_create_credentials_outcome",
+            lambda _inputs, _pins: bootstrap.ERROR_INVALID_MATERIAL,
+        )
+        sensitive_owner = bootstrap_inputs
+
+        def call():
+            return create_credentials(bootstrap_inputs)
+    elif public_name == "async_fetch_bundle":
+
+        class FailingSession:
+            def get(self, _url, **_kwargs):
+                raise RuntimeError(raw_secret)
+
+        sensitive_owner = FailingSession()
+        forbidden_names = frozenset({"session"})
+
+        def call():
+            return async_fetch_bundle(sensitive_owner)
+    elif public_name == "async_fetch_identity_der":
+
+        class FailingHass:
+            async def async_add_executor_job(self, _target, *_args):
+                raise RuntimeError(raw_secret)
+
+        sensitive_owner = FailingHass()
+        forbidden_names = frozenset({"hass"})
+
+        def call():
+            return async_fetch_identity_der(sensitive_owner)
+    else:
+
+        def fail_session(_hass):
+            raise RuntimeError(raw_secret)
+
+        monkeypatch.setattr(bootstrap, "async_get_clientsession", fail_session)
+        sensitive_owner = SimpleNamespace()
+        forbidden_names = frozenset({"hass"})
+
+        def call():
+            return async_bootstrap_credentials(sensitive_owner)
+
+    with pytest.raises(BootstrapError) as err:
+        outcome = call()
+        if asyncio.iscoroutine(outcome):
+            await outcome
+
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        raw_secret,
+        sensitive_owner,
+        forbidden_names=forbidden_names,
+    )
 
 
 def test_all_bootstrap_errors_are_sanitized_categories() -> None:

@@ -775,12 +775,17 @@ def _parse_http_date(value: str | None) -> datetime:
     return parsed.astimezone(UTC)
 
 
-async def async_fetch_bundle(
+async def _async_fetch_bundle_outcome(
     session: aiohttp.ClientSession,
-) -> tuple[bytes, datetime]:
-    """Fetch via normal PKI, require HTTP Date, size <= 64 KiB, and status 200."""
+) -> tuple[bytes, datetime] | str:
     failure_category: str | None = None
     result: tuple[bytes, datetime] | None = None
+    response: aiohttp.ClientResponse | None = None
+    response_url: URL | None = None
+    server_date: datetime | None = None
+    chunks: list[bytes] = []
+    chunk = b""
+    size = 0
     try:
         async with asyncio.timeout(HTTPS_TIMEOUT):
             async with session.get(BUNDLE_URL, allow_redirects=False) as response:
@@ -793,8 +798,6 @@ async def async_fetch_bundle(
                 ):
                     raise BootstrapError(ERROR_UNAVAILABLE)
                 server_date = _parse_http_date(response.headers.get("Date"))
-                chunks: list[bytes] = []
-                size = 0
                 async for chunk in response.content.iter_chunked(16 * 1024):
                     size += len(chunk)
                     if size > _MAX_BUNDLE_SIZE:
@@ -802,16 +805,55 @@ async def async_fetch_bundle(
                     chunks.append(chunk)
                 result = b"".join(chunks), server_date
     except asyncio.CancelledError:
+        chunks.clear()
+        chunk = b""
+        result = None
+        del session
+        del response
+        del response_url
+        del server_date
+        del chunks
+        del chunk
+        del result
         raise
     except BootstrapError as error:
         failure_category = _fixed_error_category(error, fallback=ERROR_UNAVAILABLE)
     except Exception:
         failure_category = ERROR_UNAVAILABLE
+    del session
+    del response
+    del response_url
+    del server_date
+    chunks.clear()
+    del chunks
+    chunk = b""
+    del chunk
+    result_or_category: tuple[bytes, datetime] | str
     if failure_category is not None:
-        raise BootstrapError(failure_category)
-    if result is None:
-        raise BootstrapError(ERROR_UNAVAILABLE)
-    return result
+        result_or_category = failure_category
+    elif result is None:
+        result_or_category = ERROR_UNAVAILABLE
+    else:
+        result_or_category = result
+    result = None
+    return result_or_category
+
+
+async def async_fetch_bundle(
+    session: aiohttp.ClientSession,
+) -> tuple[bytes, datetime]:
+    """Fetch via normal PKI, require HTTP Date, size <= 64 KiB, and status 200."""
+    try:
+        outcome = await _async_fetch_bundle_outcome(session)
+    except asyncio.CancelledError:
+        del session
+        raise
+    del session
+    if isinstance(outcome, str):
+        category = outcome
+        outcome = None
+        raise BootstrapError(category)
+    return outcome
 
 
 def _fetch_identity_der() -> bytes:
@@ -831,24 +873,54 @@ def _fetch_identity_der() -> bytes:
     return der
 
 
-async def async_fetch_identity_der(hass: HomeAssistant) -> bytes:
-    """Fetch untrusted TLS leaf in executor; validation happens before use."""
+async def _async_fetch_identity_der_outcome(
+    hass: HomeAssistant,
+) -> bytes | str:
     failure_category: str | None = None
     result: bytes | None = None
+    job = None
     try:
         async with asyncio.timeout(HTTPS_TIMEOUT):
-            result = await hass.async_add_executor_job(_fetch_identity_der)
+            job = hass.async_add_executor_job(_fetch_identity_der)
+            result = await job
     except asyncio.CancelledError:
+        del hass
+        job = None
+        result = None
+        del job
+        del result
         raise
     except BootstrapError as error:
         failure_category = _fixed_error_category(error, fallback=ERROR_UNAVAILABLE)
     except Exception:
         failure_category = ERROR_UNAVAILABLE
+    del hass
+    job = None
+    del job
+    result_or_category: bytes | str
     if failure_category is not None:
-        raise BootstrapError(failure_category)
-    if result is None:
-        raise BootstrapError(ERROR_UNAVAILABLE)
-    return result
+        result_or_category = failure_category
+    elif result is None:
+        result_or_category = ERROR_UNAVAILABLE
+    else:
+        result_or_category = result
+    result = None
+    return result_or_category
+
+
+async def async_fetch_identity_der(hass: HomeAssistant) -> bytes:
+    """Fetch untrusted TLS leaf in executor; validation happens before use."""
+    try:
+        outcome = await _async_fetch_identity_der_outcome(hass)
+    except asyncio.CancelledError:
+        del hass
+        raise
+    del hass
+    if isinstance(outcome, str):
+        category = outcome
+        outcome = b""
+        raise BootstrapError(category)
+    return outcome
 
 
 async def _async_bootstrap_outcome(
