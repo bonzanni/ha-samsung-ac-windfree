@@ -1,0 +1,73 @@
+{
+  "/power/vs/0": {
+    "x.com.samsung.da.power": "Off"
+  },
+  "/mode/vs/0": {
+    "x.com.samsung.da.modes": ["Cool"],
+    "x.com.samsung.da.supportedModes": [
+      "Auto", "Cool", "Dry", "Fan", "Heat"
+    ]
+  },
+  "/temperatures/vs/0": {
+    "x.com.samsung.da.items": [{
+      "x.com.samsung.da.id": "0",
+      "x.com.samsung.da.current": "26.0",
+      "x.com.samsung.da.desired": "26.0",
+      "x.com.samsung.da.minimum": "16",
+      "x.com.samsung.da.maximum": "30",
+      "x.com.samsung.da.increment": "1",
+      "x.com.samsung.da.unit": "Celsius"
+    }]
+  },
+  "/wind/strength/vs/0": {
+    "x.com.samsung.da.modes": "0",
+    "x.com.samsung.da.supportedModes": ["0", "1", "2", "3", "4"]
+  },
+  "/wind/direction/vs/0": {
+    "x.com.samsung.da.modes": "Fix",
+    "x.com.samsung.da.supportedModes": [
+      "Fix", "Up_And_Low", "Left_And_Right", "All"
+    ]
+  },
+  "/mode/convenient/vs/0": {
+    "x.com.samsung.da.modes": "Off",
+    "x.com.samsung.da.supportedModes": [
+      "Off", "Sleep", "Quiet", "Smart", "Speed",
+      "Nano", "NanoSleep", "DryComfort"
+    ]
+  },
+  "/light/vs/0": {
+    "mode": "On",
+    "supportedModes": ["On", "Off"]
+  },
+  "/option/autoclean/vs/0": {
+    "x.com.samsung.da.settingStatus": "On",
+    "x.com.samsung.da.supportedSettingStatus": ["On", "Off"]
+  },
+  "/humidity/vs/0": {
+    "x.com.samsung.da.humidity": "0",
+    "x.com.samsung.da.fivepercentHumidity": "36"
+  },
+  "/filter/airdustfilter/vs/0": {
+    "x.com.samsung.da.filterCapacity": "500",
+    "x.com.samsung.da.filterUsage": "42",
+    "x.com.samsung.da.filterDesiredUsage": "500",
+    "x.com.samsung.da.filterStatus": "normal"
+  },
+  "/energy/consumption/vs/0": {
+    "x.com.samsung.da.cumulativePower": "12345",
+    "x.com.samsung.da.cumulativeUnit": "Wh",
+    "x.com.samsung.da.cumulativePowerType": "total"
+  },
+  "/alarms/vs/0": {
+    "x.com.samsung.da.items": [{
+      "x.com.samsung.da.alarmType": "Device",
+      "x.com.samsung.da.code": "ErrorCode_OFF",
+      "x.com.samsung.da.state": "Deleted"
+    }]
+  },
+  "/electriccurrent/vs/0": {
+    "x.com.samsung.da.settingStatus": "Off",
+    "x.com.samsung.da.level": "3"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "always_allowed": [
+    "power", "hvac_mode", "display_light", "auto_clean"
+  ],
+  "by_mode": {
+    "Auto": [],
+    "Cool": ["temperature", "fan", "swing", "preset"],
+    "Dry": [],
+    "Fan": [],
+    "Heat": []
+  }
+}
