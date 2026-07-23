@@ -134,6 +134,19 @@ class CapabilityContract:
         default_factory=lambda: MappingProxyType({})
     )
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "writable_paths", frozenset(self.writable_paths))
+        object.__setattr__(
+            self,
+            "mode_controls",
+            MappingProxyType(
+                {
+                    mode: frozenset(controls)
+                    for mode, controls in self.mode_controls.items()
+                }
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class WindFreeData:

@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from custom_components.samsung_ac_windfree.models import (
+    CapabilityContract,
     ClimateState,
     Credentials,
     HvacMode,
@@ -37,3 +38,28 @@ def test_windfree_data_is_immutable() -> None:
 def test_climate_state_rejects_invalid_temperature() -> None:
     with pytest.raises(ValueError, match="target temperature"):
         ClimateState(target_temperature=31.0)
+
+
+def test_capability_contract_copies_mutable_inputs() -> None:
+    writable_paths = {"/power/vs/0"}
+    mode_controls = {HvacMode.COOL: {"temperature"}}
+    contract = CapabilityContract(
+        writable_paths=writable_paths,
+        mode_controls=mode_controls,
+    )
+
+    writable_paths.add("/mode/vs/0")
+    mode_controls[HvacMode.COOL].add("fan")
+    mode_controls[HvacMode.HEAT] = {"swing"}
+
+    assert contract.writable_paths == frozenset({"/power/vs/0"})
+    assert contract.mode_controls == {HvacMode.COOL: frozenset({"temperature"})}
+
+
+def test_capability_contract_mode_sets_are_immutable() -> None:
+    contract = CapabilityContract(
+        mode_controls={HvacMode.COOL: {"temperature"}},
+    )
+
+    with pytest.raises(AttributeError):
+        contract.mode_controls[HvacMode.COOL].add("fan")
