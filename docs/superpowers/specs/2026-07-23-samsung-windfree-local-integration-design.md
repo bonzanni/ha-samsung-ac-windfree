@@ -5,9 +5,9 @@ Status: Approved for implementation planning
 
 ## Objective
 
-Build a Home Assistant custom integration in this repository for the 2025
-Samsung WindFree Comfort room-air-conditioner firmware family represented by
-model `AR60F12C1AWNEU`.
+Build a Home Assistant custom integration in this repository for the exact 2025
+Samsung WindFree Comfort room-air-conditioner model `AR60F12C1AWNEU` on its
+verified firmware family.
 
 Normal operation must be fully local. Home Assistant communicates directly
 with the air conditioner over authenticated OCF/CoAP-DTLS and never uses a
@@ -20,8 +20,8 @@ integration must operate and restart without internet access.
 
 ## Scope
 
-Version 1 supports only the live-verified 2025 Tizen Lite/RT OCF firmware
-family:
+Version 1 supports only the exact live-verified 2025 Tizen Lite/RT OCF model
+and firmware combination:
 
 - Consumer model: `AR60F12C1AWNEU`
 - OCF device type: `oic.d.airconditioner`
@@ -30,8 +30,11 @@ family:
 - OCF endpoint: DTLS 1.2 over a discovered UDP port in `49152` through `49160`
 - Live target port observed during research: `49154`
 
-The integration must reject unsupported device types and firmware families
-with a translated config-flow error.
+The integration must require all four identity checks: the exact consumer
+model `AR60F12C1AWNEU`, OCF device type, firmware-description prefix, and
+platform. A model that shares the firmware prefix but has another consumer
+model number is not accepted. Unsupported devices receive a translated
+config-flow error.
 
 ### Non-goals
 
@@ -58,6 +61,17 @@ The legacy ports `2878/tcp` and `8888/tcp` actively refused connections on the
 target. UDP `49154` completed DTLS 1.2 with a Samsung OCF appliance certificate.
 An authenticated local GET of `/oic/sec/acl` returned CoAP `2.05`.
 
+The exact PyPI distribution `smartthings-local==0.1.0` was installed during
+research. Its `DtlsCoapSession` completed the authenticated DTLS 1.2 handshake,
+Block2 reads, OBSERVE registration, and the reversible verified writes in this
+document against the target. Implementation still records and locks the release
+artifact hash so dependency provenance is reproducible.
+
+The target remained connected to Samsung's service during the live probes:
+local OBSERVE notifications continued to arrive, which the upstream project
+documents as cloud-connection-gated behavior. This is evidence that the shared
+Samsung cloud identity can coexist with the target's ordinary cloud session.
+
 ## Security and Certificate Bootstrap
 
 Samsung does not expose a supported per-device local pairing flow for this
@@ -66,6 +80,11 @@ intermediate signing key whose identity is trusted by the appliance's factory
 OCF access-control list.
 
 This is an authentication workaround and must be documented as such.
+
+The UUID used below is Samsung's public, shared OCF cloud-service identity, not
+a device identifier or per-user credential. The target's factory ACL grants
+that identity access. Each Home Assistant installation generates a distinct
+private key but presents the shared public identity in its leaf certificate.
 
 ### Zero-input config flow
 
@@ -93,30 +112,57 @@ On the first setup:
    `REMOVED_IDENTITY_SPKI_DIGEST`.
    Also require the expected Samsung issuer and a
    `CN=*.REMOVED_HOST.com` subject before extracting the `uuid:<UUID>`
-   identity.
+   identity. The pinned leaf is valid through 2035-04-09. Keeping both the leaf
+   and SPKI pins is intentional fail-closed policy, not ordinary Web PKI.
 7. Generate a fresh RSA-2048 private key in memory.
-8. Mint a ten-year client leaf certificate containing that UUID in the
-   subject and SAN, signed by REMOVED_IDENTITY with the legacy SHA-1 signature required by
-   the device trust chain.
+8. Require a plausibly synchronized system clock, backdate `notBefore` by five
+   minutes for device clock skew, and mint a ten-year client leaf certificate
+   containing that UUID in the subject and SAN. Sign it with REMOVED_IDENTITY using the
+   legacy SHA-1 signature required by the device trust chain.
 9. Sweep UDP ports `49152` through `49160`, establish authenticated DTLS, and
    require successful reads of `/oic/d`, `/oic/p`, and `/device/0`.
 10. Verify the device type, model, firmware family, and live capability
     contract before creating the config entry.
-11. Persist only the generated client private key, client certificate chain,
+11. Only after local authentication and identity validation succeed, atomically
+    persist the generated client private key, client certificate chain,
     discovered port, host, and sanitized identity metadata.
-12. Drop all references to the downloaded universal CA key and bundle.
+12. Retain no universal CA key or downloaded bundle in configuration, files,
+    diagnostics, or backups. Python cannot promise secure zeroization of
+    transient in-memory buffers; the guarantee is non-persistence.
 
 The bundle digest and Samsung identity-certificate pins are release-time
 security pins. Supporting changed bootstrap material requires a reviewed
 integration release that changes the affected pins explicitly.
+
+The bundle URL is a bootstrap availability dependency, not a trust source.
+Before release, maintainers must retain a recoverable copy of the already
+public, digest-pinned bytes outside the integration artifact and document how a
+new integration release can move the unchanged pin to a project-controlled
+mirror. The integration does not silently try unpinned mirrors. Vendoring the
+universal signing key requires a separate legal and governance decision.
+
+Maintainers must monitor the Samsung identity certificate before its 2035
+expiry and publish a reviewed pin update with adequate lead time. A bootstrap
+failure caused by an unavailable source or changed pin is reported distinctly
+from a local device or credential failure.
 
 The integration must not download or regenerate certificate material during
 ordinary startup. A stored client-certificate authentication failure starts a
 reauthentication flow. Reauthentication repeats the pinned bootstrap only
 after explicit user confirmation in the Home Assistant UI.
 
+Ordinary startup checks the stored client certificate's validity window. A
+Repairs issue is created 90 days before expiry. Reauthentication creates and
+validates replacement credentials before atomically replacing the existing
+working credentials; a failed attempt leaves the prior config-entry data
+unchanged.
+
 Certificates, private keys, UUIDs, serials, MAC addresses, SSIDs, IP addresses,
 and raw payloads must never appear in logs or diagnostics.
+
+The generated per-installation client key is secret config-entry data stored by
+Home Assistant and is therefore present in Home Assistant backups. User
+documentation must disclose this and recommend protecting backups accordingly.
 
 ## Dependency Boundary
 
@@ -126,6 +172,15 @@ Pin `smartthings-local==0.1.0` and use it only for:
 - CoAP encoding, parsing, Block2 reads, and response correlation
 - OBSERVE registration and deregistration
 - Request pacing primitives
+
+The dependency is installed from PyPI, not from a Git URL. Home Assistant's
+manifest pins the exact version; release records retain the PyPI wheel and
+source-distribution SHA-256 values for audit, while CI installs the audited
+artifact on every supported Home Assistant Python architecture. Home
+Assistant's ordinary requirement installer enforces the version but does not
+enforce those hashes, and documentation must not claim otherwise. Because the
+package is pre-1.0 and its DTLS stack is load-bearing, upgrades require the same
+transport contract tests and an authorized live smoke test.
 
 The integration owns:
 
@@ -155,6 +210,13 @@ Responsibilities:
 - Ensure only one active session and one foreground write per device
 - Redact protocol errors before they reach logs or UI
 
+The DTLS context uses the dependency's cipher-specific
+`@SECLEVEL=0` setting solely for this appliance connection because Samsung's
+chain requires SHA-1. It must not change Python, OpenSSL, Home Assistant, or
+process-global TLS policy. CI and the release smoke test verify certificate
+generation and handshake on the supported Home Assistant OS/container
+OpenSSL build.
+
 ### `WindFreeSessionSupervisor`
 
 Owns the connection generation and reconnect lifecycle.
@@ -164,10 +226,34 @@ Responsibilities:
 - Establish the one permitted DTLS session
 - Register and refresh OBSERVE subscriptions
 - Reconnect with exponential backoff from 2 to 60 seconds
+- After three consecutive connection failures to the stored UDP port, close the
+  failed generation and resweep the verified `49152` through `49160` range
+  before the next backoff cycle
 - Replace state only with data from the current connection generation
 - Prevent in-flight reconnect tasks from resurrecting a session after unload
 - Detect likely competing-client/session conflicts and expose a sanitized
   diagnostic reason
+
+The supervisor does not assume that every UDP ephemeral port is an OCF
+endpoint. The supported discovery contract remains the live- and
+upstream-verified `49152` through `49160` range. Exhausting that range leaves
+the device unavailable and produces a Repairs issue; it does not scan arbitrary
+LAN ports.
+
+Handshake timeouts, generic handshake errors, socket errors, device reboot, and
+competing-session symptoms are transient. They trigger reconnect and port
+rediscovery, never reauthentication. Fatal credential rejection requires
+either:
+
+- An explicit peer-sent fatal DTLS alert whose code is limited to
+  `bad_certificate`, `unsupported_certificate`, `certificate_expired`,
+  `certificate_unknown`, `unknown_ca`, or `access_denied`; or
+- A completed DTLS session followed by CoAP `4.01 Unauthorized` or
+  `4.03 Forbidden` from a resource that the validated identity contract permits.
+
+Either signal must repeat on a fresh connection generation before the
+integration offers reauthentication. Unclassified SSL/DTLS errors remain
+transient and appear only as sanitized reconnect reasons.
 
 ### `WindFreeCoordinator`
 
@@ -182,6 +268,13 @@ Responsibilities:
 - Publish immutable, typed `WindFreeData`
 - Track availability, latency, update source, failure counts, and resource
   coverage
+- Revalidate the exact model, firmware prefix, and required safe-write resource
+  contract during startup and every full reconciliation
+
+If firmware drift removes or changes a required resource, the coordinator
+disables only the affected controls, retains safe readable entities, and
+creates a Repairs issue describing a sanitized capability-contract mismatch.
+It never attempts a legacy or guessed write shape.
 
 Entity properties read only coordinator memory and perform no I/O.
 
@@ -218,18 +311,45 @@ Polling tiers:
 Polling requests are distributed through the two-request-per-second limiter
 rather than sent as a burst.
 
+The steady-state polling budget is approximately 1.4 logical requests per
+second before OBSERVE deadline resets: six hot resources per five seconds,
+five warm resources per 30 seconds, two cold resources per five minutes, and
+one full reconciliation per five minutes. Block2 continuation datagrams,
+retries, and command verification consume the remaining headroom.
+
+The scheduler staggers resource deadlines and uses this priority order:
+
+1. User command and its authoritative verification
+2. Overdue hot resource
+3. Connection/authentication health check
+4. Warm resource
+5. Cold resource
+6. Full reconciliation
+
+Priority applies when admitting a logical request. A token-stable Block2
+transaction is not preempted between blocks, so full reconciliation begins only
+when no command is queued and no hot read is overdue. Its dependency-enforced
+block limit bounds the delay once admitted. Tests use a fake monotonic clock and
+rate limiter to prove that nominal, failure-free hot state remains within about
+five seconds and that Block2 work and retries degrade freshness in a bounded,
+observable way.
+
 OBSERVE subscriptions cover all hot and warm resources. Any notification
 updates the cache immediately and resets that resource's next poll deadline.
-Polling remains enabled so internet-blocked operation has a worst-case core
-state delay of about five seconds.
+Polling remains enabled so internet-blocked operation has a nominal core-state
+delay of about five seconds. Diagnostics report the measured stalest hot
+resource age; no strict five-second claim is made during reconnects, Block2
+retries, or command verification.
 
 ## Command Semantics
 
 All writes use this sequence:
 
 1. Acquire the coordinator operation lock.
-2. Capture the authoritative original value when a read/modify/write payload
-   is required.
+2. When a read/modify/write payload is required, perform a fresh GET under that
+   lock immediately before modification. Do not start from coordinator cache.
+   Change only the intended writable field and preserve the freshly read sibling
+   fields required by the device's aggregate schema.
 3. Send the smallest verified CBOR representation.
 4. Treat CoAP `2.04 Changed` only as acknowledgement.
 5. Wait briefly for a matching OBSERVE update.
@@ -242,14 +362,50 @@ All writes use this sequence:
 
 Commands are never reported as successful solely because POST returned `2.04`.
 
+Setting a non-Off HVAC mode while the AC is off is one serialized logical
+operation:
+
+1. Persist and verify the requested mode while power is off, which the live
+   firmware supports.
+2. Turn power on and verify both power and mode.
+3. If power-on fails, publish the authoritative remaining Off state while
+   retaining the device's verified remembered mode.
+4. If the device changes the mode during power-on, refresh all climate
+   resources and raise a translated action error.
+
+`turn_on` without an explicit mode restores the device's remembered non-Off
+mode. `turn_off` changes power only and verifies Off without rewriting mode.
+
+### Mode-dependent controls
+
+The UI may list every model-supported fan, swing, and preset option because
+Home Assistant climate capabilities are device-wide, but a command is sent
+only when its combination is present in the sanitized compatibility matrix
+derived from live evidence. Version 1 must not infer undocumented
+combinations.
+
+Before release, live probes must verify at least:
+
+- Whether target temperature is writable in Auto, Cool, Dry, Fan, and Heat
+- Supported fan codes in each HVAC mode
+- Supported airflow values in each HVAC mode
+- Valid HVAC-mode combinations for Quiet, Smart, Speed, Nano, NanoSleep,
+  Sleep, and DryComfort
+- Whether changing HVAC mode clears or coerces an active preset
+
+Unsupported combinations raise a translated error without sending a request.
+If the device nevertheless coerces a previously verified combination, normal
+read-back verification wins, related state is refreshed, and a sanitized
+capability-contract Repairs issue is created.
+
 ## Sanitized Live Protocol Contract
 
-All observations below were captured on the target model family. Identifiers
+All observations below were captured on the exact target model. Identifiers
 and raw production payloads are intentionally omitted.
 
 | Capability | Resource and request shape | Live result |
 | --- | --- | --- |
-| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; device type and model family confirmed |
+| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact consumer model, device type, and firmware family confirmed |
 | Standard power path | POST `/power/0` with `{"value": false}` | `4.04`; must not be used |
 | Power | POST `/power/vs/0` with `{"x.com.samsung.da.power": "On"}` | `2.04`, OBSERVE, authoritative read-back `On`; restored `Off` |
 | HVAC mode | POST `/mode/vs/0` with `{"x.com.samsung.da.modes": ["<mode>"]}` | Auto, Cool, Dry, Fan, and Heat each persisted; restored Cool |
@@ -262,7 +418,7 @@ and raw production payloads are intentionally omitted.
 | Auto-clean setting | POST `/option/autoclean/vs/0` with setting status | Both values persisted, notified, and restored |
 | Air purification | POST advertised On value | Returned `2.04` but remained Off; exclude |
 | Mute once | POST advertised On value | Returned `2.04` but remained Off; exclude |
-| Humidity | GET `/humidity/vs/0` | Primary field stayed zero; alternate five-percent field returned plausible changing room humidity |
+| Humidity | GET `/humidity/vs/0` | Primary field stayed zero; alternate `fivepercentHumidity` field returned direct percentage-like values, including 36 and 40 |
 | Filter | GET `/filter/airdustfilter/vs/0` | Capacity, usage, desired interval, and wash status available |
 | Energy | GET `/energy/consumption/vs/0` | Cumulative Wh available; instantaneous W field absent |
 | Alarms | GET `/alarms/vs/0` | Stateful device and filter alarm records available |
@@ -300,7 +456,7 @@ Climate attributes and features:
 - Explicit TURN_ON and TURN_OFF features
 - Fan modes Auto, Low, Medium, High, and Turbo
 - Combined swing modes Fixed, Vertical, Horizontal, and Both
-- Presets None, Quiet, Smart, Boost/MAX, WindFree, WindFree Sleep, Good Sleep,
+- Presets None, Quiet, Smart, Boost/MAX, WindFree, WindFree Sleep, Sleep,
   and Dry Comfort
 
 The AC exposes airflow as one mutually exclusive enum. Therefore all choices
@@ -323,6 +479,12 @@ Preset mappings:
 The integration does not expose `hvac_action`. The firmware reports selected
 mode but no authoritative compressor/action state.
 
+Despite its vendor name, `fivepercentHumidity` is parsed as the directly
+reported integer percentage; it is not multiplied by five. Values outside
+0 through 100, booleans, non-numeric strings, and missing fields produce
+unknown humidity without failing the climate entity. Parser fixtures cover
+valid numeric strings and invalid boundaries.
+
 ### Additional entities
 
 | Platform | Key | Default | Source |
@@ -332,7 +494,7 @@ mode but no authoritative compressor/action state.
 | Sensor | `filter_usage` | Enabled | Used/capacity as percent |
 | Sensor | `filter_status` | Enabled | Normal, wash, or replace |
 | Binary sensor | `filter_attention` | Enabled | Filter status or active filter alarm |
-| Sensor | `energy_consumption` | Enabled | Cumulative Wh converted to kWh, `total_increasing` |
+| Sensor | `energy_consumption` | Enabled | Cumulative Wh converted to kWh; energy device class and `total_increasing` state class |
 | Binary sensor | `problem` | Enabled | Any active non-filter device alarm |
 | Sensor | `active_alarm` | Diagnostic | Active alarm code |
 | Binary sensor | `current_limit_enabled` | Diagnostic, disabled | Read-only current-limit state |
@@ -340,6 +502,14 @@ mode but no authoritative compressor/action state.
 
 Device information carries the consumer model, manufacturer, firmware, and
 hardware platform. Firmware fields do not become standalone entities.
+
+The energy entity uses native unit kWh, `SensorDeviceClass.ENERGY`,
+`SensorStateClass.TOTAL_INCREASING`, and a precision that preserves the source
+Wh resolution. A decreasing non-negative counter is published as the new
+authoritative value so Home Assistant's statistics layer can recognize a reset;
+negative, non-finite, malformed, or implausibly overflowing values are unknown
+and never synthesized. Tests cover monotonic growth, device reset, missing
+instantaneous power, and malformed input.
 
 ### Excluded capabilities
 
@@ -363,8 +533,9 @@ hardware platform. Firmware fields do not become standalone entities.
   published as current while unavailable.
 - Recovery logs once, performs a complete refresh, and restores entities
   together.
-- Authentication failures start reauthentication instead of infinite
-  reconnects.
+- Only the repeatable post-handshake CoAP authorization failure defined by the
+  supervisor starts reauthentication. Transport and handshake failures remain
+  reconnectable.
 - Unsupported/coerced writes raise a translated action error containing only
   the requested feature, never payload or identity data.
 - Shutdown deregisters OBSERVE tokens, closes the exact session, joins
@@ -379,12 +550,24 @@ User step:
 Validation:
 
 - Resolve and reach host
-- Perform the pinned one-time bootstrap
+- Show a cancellable progress step while performing the pinned one-time
+  bootstrap, certificate generation, port sweep, and local validation
 - Sweep OCF ports
 - Authenticate locally
 - Read identity and resource tree
-- Reject non-air-conditioners and unsupported model families
+- Reject non-air-conditioners, any consumer model other than
+  `AR60F12C1AWNEU`, and unsupported firmware/platform combinations
 - Set the OCF device identifier as the unique ID
+
+Every network operation has its own bounded timeout: 15 seconds for each HTTPS
+bootstrap fetch, 12 seconds for an individual DTLS handshake, and 8 seconds for
+an authenticated CoAP read. Port attempts are sequential and cancelled before
+the next begins. The complete flow has a 150-second deadline. Cancellation
+closes sockets, stops executor work at its next bounded operation, retains no
+universal signing material, and returns no partial config entry. Failures are
+classified as bootstrap unavailable, pin mismatch, invalid clock, device
+unreachable, local authentication rejected, unsupported exact model, or
+capability mismatch.
 
 Reconfigure:
 
@@ -409,7 +592,7 @@ Diagnostics are an explicit allowlist and perform zero device I/O.
 Allowed:
 
 - Integration and dependency versions
-- Supported model-family label
+- Supported exact-model and firmware-family label
 - Connection state and generation
 - Last update success and source
 - Poll and OBSERVE health
@@ -417,6 +600,8 @@ Allowed:
 - Sanitized request latency buckets
 - Known resource coverage
 - Certificate validity dates without subject, issuer details, or fingerprints
+- Days until generated client-certificate expiry and whether the 90-day Repairs
+  threshold is active
 - Entity support flags
 
 Forbidden:
@@ -485,21 +670,36 @@ fixtures.
 
 Required test groups:
 
-- Bootstrap download pin, malformed bundles, wrong key, wrong chain, UUID
-  extraction, in-memory leaf generation, and universal-key disposal
+- Bootstrap download pin, source outage, malformed bundles, wrong key, wrong
+  chain, UUID extraction, clock validation, backdated in-memory leaf
+  generation, non-persistence of the universal key, atomic credential
+  replacement, and certificate-expiry Repairs
 - Config flow success and all failure branches
-- Unsupported device and model-family rejection
+- Config-flow progress, per-operation/overall timeout, and cancellation cleanup
+- Unsupported device, exact-model, and firmware-family rejection
+- Exact consumer-model rejection even when the firmware prefix matches
 - Duplicate detection, reconfigure, and reauthentication
 - Coordinator polling tiers, OBSERVE merges, generation isolation, reconnects,
   cancellation, and unload
-- Correct vendor power path and aggregate-temperature read/modify/write
+- Stored-port failure followed by automatic verified-range rediscovery
+- Transient DTLS failure versus repeatable post-handshake authorization failure
+- Poll-budget, priority, staggering, Block2 admission bounds, and hot-resource
+  age
+- Correct vendor power path and fresh aggregate-temperature
+  read/modify/write under the operation lock
+- Off-to-mode sequencing and partial-failure reconciliation
 - All HVAC, fan, airflow, and preset mappings
+- The live-verified HVAC-mode/control compatibility matrix and rejection of
+  unverified combinations without device I/O
 - Verified command success, coercion, timeout, and related-resource refresh
+- Startup/full-reconciliation capability drift and affected-control disabling
 - Entity availability and disabled-by-default diagnostics
-- Humidity, filter, energy, and alarm parsers
+- Direct-percentage humidity parsing plus filter, energy reset, and alarm
+  parsers
 - Diagnostics privacy with adversarial secret-like values
 - No I/O from entity properties
 - Config-entry setup, unload, and reload
+- Scoped OpenSSL security-level behavior on the supported HA runtime
 
 CI runs:
 
@@ -520,11 +720,14 @@ The repository includes:
 - HACS metadata
 - UI setup and removal instructions
 - A clear warning about the unofficial certificate-authentication workaround
+- Disclosure that the generated client key is included in protected Home
+  Assistant backups
 - Supported model and firmware scope
 - Entity and preset documentation
 - Local-only runtime and air-gapped polling behavior
 - Known limitations
 - Troubleshooting for bootstrap, authentication, Wi-Fi, and competing clients
+- Bootstrap-source/pin maintenance and certificate-expiry recovery
 - Automation examples
 - Changelog
 - Home Assistant `quality_scale.yaml`
@@ -539,22 +742,27 @@ coverage gaps.
 The implementation is ready for its first release only when:
 
 1. A user can configure the verified model by entering only its host/IP.
-2. Bootstrap validates pinned public material and stores no universal CA key.
+2. Bootstrap validates pinned public material, uses cancellable bounded
+   progress, and persists no universal CA key.
 3. Home Assistant can restart and operate the integration with internet access
    removed.
 4. All included climate modes, temperature, fan, airflow, presets, display
    light, and auto-clean pass automated write-verification tests.
 5. Air purification, mute-once, and other rejected/unverified surfaces are not
    exposed as working controls.
-6. OBSERVE produces immediate updates when present and polling keeps core state
-   within about five seconds when it is absent.
+6. OBSERVE produces immediate updates when present and failure-free polling
+   keeps nominal core state within about five seconds when it is absent; the
+   measured hot-resource age proves the claim in tests and live diagnostics.
 7. Every failure path preserves availability semantics and contains no private
    information.
 8. Diagnostics pass the adversarial redaction tests.
 9. The full automated suite, linting, and validation pass.
 10. A final authorized live smoke test confirms setup, representative reads,
     representative reversible writes, unload, restart, internet-blocked
-    polling, and exact state restoration.
+    polling, scoped SHA-1 DTLS compatibility, stored-port failure recovery, and
+    exact state restoration.
+11. The exact-model gate, mode/control compatibility matrix, fatal-auth
+    discriminator, and firmware-drift behavior are covered by automated tests.
 
 ## References
 
