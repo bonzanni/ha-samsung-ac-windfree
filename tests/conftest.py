@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
+import cbor2
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -14,7 +18,9 @@ from cryptography.x509.oid import NameOID
 from custom_components.samsung_ac_windfree.bootstrap import (
     BootstrapInputs,
     BootstrapPins,
+    create_credentials,
 )
+from custom_components.samsung_ac_windfree.models import Credentials
 
 _NOT_BEFORE = datetime(2020, 1, 1, tzinfo=UTC)
 _NOT_AFTER = datetime(2040, 1, 1, tzinfo=UTC)
@@ -270,6 +276,107 @@ def pins_for(synthetic_bootstrap_material: SyntheticBootstrapMaterial):
         return _pins_for(synthetic_bootstrap_material, bundle, identity_der)
 
     return build
+
+
+@pytest.fixture(scope="session")
+def credentials(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+) -> Credentials:
+    return create_credentials(bootstrap_inputs, pins=bootstrap_pins)
+
+
+@pytest.fixture
+def resource_representations() -> dict[str, dict[str, object]]:
+    fixtures = Path(__file__).parent / "fixtures"
+    identity = json.loads((fixtures / "device_identity.json").read_text())
+    state = json.loads((fixtures / "device_state.json").read_text())
+    return {
+        "/oic/d": identity["oic_d"],
+        "/oic/p": identity["oic_p"],
+        "/device/0": identity["device_0"],
+        **state,
+    }
+
+
+@pytest.fixture
+def encoded_resources(
+    resource_representations: dict[str, dict[str, object]],
+) -> dict[str, bytes]:
+    return {
+        path: cbor2.dumps(representation)
+        for path, representation in resource_representations.items()
+    }
+
+
+class FakeSession:
+    """Synthetic implementation of the pinned blocking session contract."""
+
+    def __init__(self, encoded_resources: dict[str, bytes]) -> None:
+        self.encoded_resources = encoded_resources
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.call_threads: dict[str, list[int]] = {}
+        self.on_notification = None
+        self.handshake_timeout: float | None = None
+        self.connect_error: Exception | None = None
+        self.start_reader_error: Exception | None = None
+        self.get_error: Exception | None = None
+        self.post_error: Exception | None = None
+        self.subscribe_error: Exception | None = None
+        self.close_error: Exception | None = None
+        self.join_error: Exception | None = None
+        self.get_code = 69
+        self.post_code = 68
+        self.active_observations: set[tuple[str, ...]] = set()
+
+    def _record(self, name: str, *args: object) -> None:
+        self.calls.append((name, args))
+        self.call_threads.setdefault(name, []).append(threading.get_ident())
+
+    def connect(self) -> None:
+        self._record("connect")
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def start_reader(self) -> None:
+        self._record("start_reader")
+        if self.start_reader_error is not None:
+            raise self.start_reader_error
+
+    def get(self, path: tuple[str, ...]) -> tuple[int, bytes]:
+        self._record("get", path)
+        if self.get_error is not None:
+            raise self.get_error
+        href = "/" + "/".join(path)
+        return self.get_code, self.encoded_resources[href]
+
+    def post(self, path: tuple[str, ...], payload: bytes) -> tuple[int, bytes]:
+        self._record("post", path, payload)
+        if self.post_error is not None:
+            raise self.post_error
+        return self.post_code, b""
+
+    def subscribe(self, path: tuple[str, ...]) -> bytes:
+        self._record("subscribe", path)
+        if self.subscribe_error is not None:
+            raise self.subscribe_error
+        self.active_observations.add(path)
+        return b"\x41"
+
+    def close(self) -> None:
+        self._record("close")
+        self.active_observations.clear()
+        if self.close_error is not None:
+            raise self.close_error
+
+    def join(self) -> None:
+        self._record("join")
+        if self.join_error is not None:
+            raise self.join_error
+
+    def emit(self, path: str, payload: bytes) -> None:
+        assert self.on_notification is not None
+        self.on_notification(path, payload)
 
 
 @pytest.fixture(autouse=True)
