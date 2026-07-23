@@ -131,6 +131,76 @@ def _assert_clean_error(
         assert secret not in formatted
 
 
+def _der_length(length: int) -> bytes:
+    if length < 0x80:
+        return bytes([length])
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(encoded)]) + encoded
+
+
+def _test_read_tlv(data: bytes, offset: int) -> tuple[bytes, int]:
+    start = offset
+    offset += 1
+    first_length = data[offset]
+    offset += 1
+    if first_length < 0x80:
+        length = first_length
+    else:
+        count = first_length & 0x7F
+        length = int.from_bytes(data[offset : offset + count], "big")
+        offset += count
+    end = offset + length
+    return data[start:end], end
+
+
+def _mismatched_inner_outer_algorithm_certificate(
+    provisional_der: bytes,
+    signing_key_pem: bytes,
+) -> bytes:
+    outer, _outer_end = _test_read_tlv(provisional_der, 0)
+    outer_header_length = len(outer) - (
+        len(outer) - (2 if outer[1] < 0x80 else 2 + (outer[1] & 0x7F))
+    )
+    content_offset = outer_header_length
+    tbs, tbs_end = _test_read_tlv(outer, content_offset)
+    _old_outer_algorithm, _algorithm_end = _test_read_tlv(outer, tbs_end)
+
+    signing_key = serialization.load_pem_private_key(signing_key_pem, password=None)
+    assert isinstance(signing_key, rsa.RSAPrivateKey)
+    signature = signing_key.sign(tbs, padding.PKCS1v15(), hashes.SHA1())
+    canonical_sha1_algorithm = bytes.fromhex("300d06092a864886f70d0101050500")
+    signature_bit_string = (
+        b"\x03" + _der_length(len(signature) + 1) + b"\x00" + signature
+    )
+    certificate_content = tbs + canonical_sha1_algorithm + signature_bit_string
+    return b"\x30" + _der_length(len(certificate_content)) + certificate_content
+
+
+def _assert_no_sensitive_bootstrap_frame_locals(
+    error: BootstrapError,
+    *sensitive_values: object,
+) -> None:
+    current = error.__traceback__
+    bootstrap_frames = []
+    while current is not None:
+        frame = current.tb_frame
+        if frame.f_globals.get("__name__") == bootstrap.__name__:
+            bootstrap_frames.append(frame)
+        current = current.tb_next
+
+    assert bootstrap_frames
+    for frame in bootstrap_frames:
+        for name, value in frame.f_locals.items():
+            for sensitive in sensitive_values:
+                assert value is not sensitive, (frame.f_code.co_name, name)
+                if isinstance(sensitive, bytes) and isinstance(value, bytes):
+                    assert sensitive not in value, (frame.f_code.co_name, name)
+                assert repr(sensitive) not in repr(value), (
+                    frame.f_code.co_name,
+                    name,
+                )
+
+
 def test_wrong_bundle_digest_fails_before_parsing(
     bootstrap_inputs: BootstrapInputs,
     bootstrap_pins: BootstrapPins,
@@ -520,6 +590,37 @@ def test_pyopenssl_resign_rejects_every_tbs_profile_mutation(
         create_credentials(bootstrap_inputs, pins=bootstrap_pins)
 
 
+def test_pyopenssl_resign_rejects_mismatched_inner_outer_algorithm_identifiers(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "_resign_with_pyopenssl",
+        _mismatched_inner_outer_algorithm_certificate,
+    )
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        create_credentials(bootstrap_inputs, pins=bootstrap_pins)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        b"\x30\x80",
+        b"\x30\x81\x01\x00",
+        b"\x30\x05\x30\x03",
+        b"\x30\x00\x00",
+    ],
+    ids=["indefinite", "non-minimal", "out-of-bounds", "trailing"],
+)
+def test_algorithm_identifier_der_reader_rejects_malformed_der(
+    malformed: bytes,
+) -> None:
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        bootstrap._certificate_algorithm_identifiers(malformed)
+
+
 def test_generated_leaf_has_exact_key_signature_subject_and_extensions(
     bootstrap_inputs: BootstrapInputs,
     bootstrap_pins: BootstrapPins,
@@ -862,6 +963,61 @@ def test_bundle_validation_sanitizes_raw_parser_exception_chain(
     _assert_clean_error(err.value, bootstrap.ERROR_INVALID_MATERIAL, secret)
 
 
+def test_validate_bundle_traceback_scrubs_sensitive_production_locals(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    synthetic_bootstrap_material,
+) -> None:
+    secret = "VALIDATE-BUNDLE-RAW-SECRET"
+
+    def fail_parser(*_args, **_kwargs):
+        raise RuntimeError(
+            secret,
+            bootstrap_inputs.bundle_bytes,
+            synthetic_bootstrap_material.signing_key,
+        )
+
+    monkeypatch.setattr(bootstrap.serialization, "load_pem_private_key", fail_parser)
+    with pytest.raises(BootstrapError) as err:
+        validate_bundle(bootstrap_inputs.bundle_bytes, pins=bootstrap_pins)
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        bootstrap_inputs.bundle_bytes,
+        bootstrap_inputs.identity_der,
+        synthetic_bootstrap_material.signing_key,
+        secret,
+    )
+
+
+def test_create_credentials_traceback_scrubs_material_and_inputs(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    synthetic_bootstrap_material,
+) -> None:
+    secret = "CREATE-CREDENTIALS-RAW-SECRET"
+
+    def fail_after_material(material, _identity_uuid, _server_date):
+        raise RuntimeError(
+            secret,
+            material.signing_key,
+            bootstrap_inputs.bundle_bytes,
+            bootstrap_inputs.identity_der,
+        )
+
+    monkeypatch.setattr(bootstrap, "_mint_credentials", fail_after_material)
+    with pytest.raises(BootstrapError) as err:
+        create_credentials(bootstrap_inputs, pins=bootstrap_pins)
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        bootstrap_inputs.bundle_bytes,
+        bootstrap_inputs.identity_der,
+        synthetic_bootstrap_material.signing_key,
+        secret,
+    )
+
+
 async def test_bootstrap_sanitizes_session_acquisition_failure(
     monkeypatch,
 ) -> None:
@@ -874,6 +1030,42 @@ async def test_bootstrap_sanitizes_session_acquisition_failure(
     with pytest.raises(BootstrapError) as err:
         await async_bootstrap_credentials(SimpleNamespace())
     _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, secret)
+
+
+async def test_async_bootstrap_traceback_scrubs_fetched_material(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    synthetic_bootstrap_material,
+) -> None:
+    secret = "ASYNC-BOOTSTRAP-RAW-SECRET"
+
+    async def fake_bundle(_session):
+        return bootstrap_inputs.bundle_bytes, bootstrap_inputs.server_date
+
+    async def fake_identity(_hass):
+        return bootstrap_inputs.identity_der
+
+    class FailingHass:
+        async def async_add_executor_job(self, _target, *_args):
+            raise RuntimeError(
+                secret,
+                synthetic_bootstrap_material.signing_key,
+                bootstrap_inputs.bundle_bytes,
+                bootstrap_inputs.identity_der,
+            )
+
+    monkeypatch.setattr(bootstrap, "async_fetch_bundle", fake_bundle)
+    monkeypatch.setattr(bootstrap, "async_fetch_identity_der", fake_identity)
+    monkeypatch.setattr(bootstrap, "async_get_clientsession", lambda _hass: object())
+    with pytest.raises(BootstrapError) as err:
+        await async_bootstrap_credentials(FailingHass())
+    _assert_no_sensitive_bootstrap_frame_locals(
+        err.value,
+        bootstrap_inputs.bundle_bytes,
+        bootstrap_inputs.identity_der,
+        synthetic_bootstrap_material.signing_key,
+        secret,
+    )
 
 
 def test_signing_failure_has_no_raw_exception_or_key_in_chain(

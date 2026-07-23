@@ -60,6 +60,116 @@ _ROLE_OID = ObjectIdentifier("1.3.6.1.4.1.51414.1.3")
 _OCF_CLIENT_OID = ObjectIdentifier("1.3.6.1.4.1.51414.0.1.2")
 _ROLE_VALUE = b"\x0c\x10samsung.role.hub"
 _BUNDLE_ENDPOINT = URL(BUNDLE_URL)
+_CANONICAL_SHA1_RSA_ALGORITHM = bytes.fromhex("300d06092a864886f70d0101050500")
+_SAFE_IDENTITY_ERRORS = frozenset(
+    {
+        f"{ERROR_INVALID_MATERIAL} (unexpected issuer)",
+        f"{ERROR_INVALID_MATERIAL} (unexpected common name)",
+        f"{ERROR_INVALID_MATERIAL} (unexpected organizational unit)",
+        f"{ERROR_INVALID_MATERIAL} (unexpected subject)",
+    }
+)
+
+
+class _DerDecodeError(ValueError):
+    """Generated certificate DER was not minimally and safely encoded."""
+
+
+def _read_der_tlv(
+    data: bytes,
+    offset: int,
+    limit: int,
+) -> tuple[int, bytes, int, int]:
+    if offset < 0 or offset >= limit or limit > len(data):
+        raise _DerDecodeError
+    start = offset
+    tag = data[offset]
+    if tag & 0x1F == 0x1F:
+        raise _DerDecodeError
+    offset += 1
+    if offset >= limit:
+        raise _DerDecodeError
+    first_length = data[offset]
+    offset += 1
+    if first_length < 0x80:
+        length = first_length
+    else:
+        length_octets = first_length & 0x7F
+        if (
+            length_octets == 0
+            or length_octets > 4
+            or offset + length_octets > limit
+            or data[offset] == 0
+        ):
+            raise _DerDecodeError
+        length = int.from_bytes(data[offset : offset + length_octets], "big")
+        if length < 0x80:
+            raise _DerDecodeError
+        offset += length_octets
+    end = offset + length
+    if end > limit:
+        raise _DerDecodeError
+    return tag, data[start:end], offset, end
+
+
+def _parse_certificate_algorithm_identifiers(
+    der: bytes,
+) -> tuple[bytes, bytes]:
+    outer_tag, _outer_raw, outer_content, outer_end = _read_der_tlv(der, 0, len(der))
+    if outer_tag != 0x30 or outer_end != len(der):
+        raise _DerDecodeError
+
+    tbs_tag, _tbs_raw, tbs_content, tbs_end = _read_der_tlv(
+        der, outer_content, outer_end
+    )
+    if tbs_tag != 0x30:
+        raise _DerDecodeError
+    outer_algorithm_tag, outer_algorithm, _outer_alg_content, algorithm_end = (
+        _read_der_tlv(der, tbs_end, outer_end)
+    )
+    signature_tag, _signature_raw, _signature_content, signature_end = _read_der_tlv(
+        der, algorithm_end, outer_end
+    )
+    if (
+        outer_algorithm_tag != 0x30
+        or signature_tag != 0x03
+        or signature_end != outer_end
+    ):
+        raise _DerDecodeError
+
+    cursor = tbs_content
+    first_tag, _first_raw, _first_content, first_end = _read_der_tlv(
+        der, cursor, tbs_end
+    )
+    if first_tag == 0xA0:
+        cursor = first_end
+        serial_tag, _serial_raw, _serial_content, cursor = _read_der_tlv(
+            der, cursor, tbs_end
+        )
+    else:
+        serial_tag = first_tag
+        cursor = first_end
+    if serial_tag != 0x02:
+        raise _DerDecodeError
+    inner_algorithm_tag, inner_algorithm, _inner_content, _inner_end = _read_der_tlv(
+        der, cursor, tbs_end
+    )
+    if inner_algorithm_tag != 0x30:
+        raise _DerDecodeError
+    return inner_algorithm, outer_algorithm
+
+
+def _certificate_algorithm_identifiers(
+    der: bytes,
+) -> tuple[bytes, bytes]:
+    parse_failed = False
+    try:
+        result = _parse_certificate_algorithm_identifiers(der)
+    except IndexError, _DerDecodeError:
+        parse_failed = True
+    if parse_failed:
+        raise _invalid_material()
+    return result
 
 
 def _samsung_name(
@@ -209,10 +319,10 @@ def _verify_rsa_signature(
     )
 
 
-def validate_bundle(
+def _validate_bundle_impl(
     data: bytes,
     *,
-    pins: BootstrapPins = PRODUCTION_PINS,
+    pins: BootstrapPins,
 ) -> BundleMaterial:
     """Validate exact bytes, one key, four certs, key pair, chain, and REMOVED_IDENTITY."""
     if not _digest_matches(data, pins.bundle_sha256):
@@ -288,10 +398,40 @@ def validate_bundle(
     )
 
 
-def validate_identity_certificate(
-    der: bytes,
+def _validate_bundle_outcome(
+    data: bytes,
+    pins: BootstrapPins,
+) -> BundleMaterial | str:
+    failure_category: str | None = None
+    try:
+        return _validate_bundle_impl(data, pins=pins)
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=ERROR_INVALID_MATERIAL)
+    except Exception:
+        failure_category = ERROR_INVALID_MATERIAL
+    return failure_category
+
+
+def validate_bundle(
+    data: bytes,
     *,
     pins: BootstrapPins = PRODUCTION_PINS,
+) -> BundleMaterial:
+    """Validate exact bytes, one key, four certs, key pair, chain, and REMOVED_IDENTITY."""
+    outcome = _validate_bundle_outcome(data, pins)
+    data = b""
+    pins = PRODUCTION_PINS
+    if isinstance(outcome, str):
+        category = outcome
+        outcome = None
+        raise BootstrapError(category)
+    return outcome
+
+
+def _validate_identity_certificate_impl(
+    der: bytes,
+    *,
+    pins: BootstrapPins,
 ) -> str:
     """Validate leaf/SPKI/issuer/CN and return UUID from the subject OU."""
     if not _digest_matches(der, pins.identity_leaf_sha256):
@@ -337,6 +477,50 @@ def validate_identity_certificate(
     if not _has_exact_name_attributes(certificate.subject, expected_subject):
         raise _invalid_material("unexpected subject")
     return identity_uuid
+
+
+def _identity_outcome(
+    der: bytes,
+    pins: BootstrapPins,
+) -> str:
+    failure_category: str | None = None
+    try:
+        identity_uuid = _validate_identity_certificate_impl(der, pins=pins)
+    except BootstrapError as error:
+        message = str(error)
+        failure_category = (
+            message
+            if message in _SAFE_IDENTITY_ERRORS
+            else _fixed_error_category(error, fallback=ERROR_INVALID_MATERIAL)
+        )
+    except Exception:
+        failure_category = ERROR_INVALID_MATERIAL
+    if failure_category is not None:
+        return failure_category
+    return identity_uuid
+
+
+def validate_identity_certificate(
+    der: bytes,
+    *,
+    pins: BootstrapPins = PRODUCTION_PINS,
+) -> str:
+    """Validate leaf/SPKI/issuer/CN and return UUID from the subject OU."""
+    outcome = _identity_outcome(der, pins)
+    der = b""
+    pins = PRODUCTION_PINS
+    if outcome.startswith(
+        (
+            "bootstrap_unavailable:",
+            "bootstrap_pin_mismatch:",
+            "invalid_clock:",
+            "bootstrap_invalid_material:",
+        )
+    ):
+        category = outcome
+        outcome = ""
+        raise BootstrapError(category)
+    return outcome
 
 
 def _validate_clock(server_date: datetime, local_now: datetime) -> None:
@@ -427,12 +611,14 @@ def _sign_sha1(
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     )
-    certificate = x509.load_der_x509_certificate(
-        _resign_with_pyopenssl(
-            provisional.public_bytes(serialization.Encoding.DER),
-            signing_key_pem,
-        )
+    certificate_der = _resign_with_pyopenssl(
+        provisional.public_bytes(serialization.Encoding.DER),
+        signing_key_pem,
     )
+    inner_algorithm, outer_algorithm = _certificate_algorithm_identifiers(
+        certificate_der
+    )
+    certificate = x509.load_der_x509_certificate(certificate_der)
     provisional_parameters = provisional.signature_algorithm_parameters
     certificate_parameters = certificate.signature_algorithm_parameters
     if (
@@ -440,6 +626,8 @@ def _sign_sha1(
         or not isinstance(provisional.signature_hash_algorithm, hashes.SHA256)
         or not isinstance(provisional_parameters, padding.PKCS1v15)
         or not _has_same_tbs_profile(provisional, certificate)
+        or inner_algorithm != _CANONICAL_SHA1_RSA_ALGORITHM
+        or outer_algorithm != _CANONICAL_SHA1_RSA_ALGORITHM
         or certificate.signature_algorithm_oid != SignatureAlgorithmOID.RSA_WITH_SHA1
         or not isinstance(certificate.signature_hash_algorithm, hashes.SHA1)
         or not isinstance(certificate_parameters, padding.PKCS1v15)
@@ -539,25 +727,37 @@ def _mint_credentials(
     )
 
 
+def _create_credentials_outcome(
+    inputs: BootstrapInputs,
+    pins: BootstrapPins,
+) -> Credentials | str:
+    failure_category: str | None = None
+    try:
+        material = validate_bundle(inputs.bundle_bytes, pins=pins)
+        identity_uuid = validate_identity_certificate(inputs.identity_der, pins=pins)
+        _validate_clock(inputs.server_date, inputs.local_now)
+        return _mint_credentials(material, identity_uuid, inputs.server_date)
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=ERROR_INVALID_MATERIAL)
+    except Exception:
+        failure_category = ERROR_INVALID_MATERIAL
+    return failure_category
+
+
 def create_credentials(
     inputs: BootstrapInputs,
     *,
     pins: BootstrapPins = PRODUCTION_PINS,
 ) -> Credentials:
     """Mint RSA-2048/SHA-1 leaf anchored to authenticated server Date."""
-    material = validate_bundle(inputs.bundle_bytes, pins=pins)
-    identity_uuid = validate_identity_certificate(inputs.identity_der, pins=pins)
-    _validate_clock(inputs.server_date, inputs.local_now)
-    failure_category: str | None = None
-    try:
-        return _mint_credentials(material, identity_uuid, inputs.server_date)
-    except BootstrapError as error:
-        failure_category = _fixed_error_category(error, fallback=ERROR_INVALID_MATERIAL)
-    except Exception:
-        failure_category = ERROR_INVALID_MATERIAL
-    if failure_category is not None:
-        raise BootstrapError(failure_category)
-    raise AssertionError("unreachable")
+    outcome = _create_credentials_outcome(inputs, pins)
+    del inputs
+    pins = PRODUCTION_PINS
+    if isinstance(outcome, str):
+        category = outcome
+        outcome = None
+        raise BootstrapError(category)
+    return outcome
 
 
 def _parse_http_date(value: str | None) -> datetime:
@@ -651,11 +851,16 @@ async def async_fetch_identity_der(hass: HomeAssistant) -> bytes:
     return result
 
 
-async def async_bootstrap_credentials(hass: HomeAssistant) -> Credentials:
-    """Run both bounded fetches and CPU certificate work in the executor."""
+async def _async_bootstrap_outcome(
+    hass: HomeAssistant,
+) -> Credentials | str:
     failure_category: str | None = None
     failure_fallback = ERROR_UNAVAILABLE
     result: Credentials | None = None
+    session: aiohttp.ClientSession | None = None
+    bundle_bytes = b""
+    identity_der = b""
+    inputs: BootstrapInputs | None = None
     try:
         session = async_get_clientsession(hass)
         bundle_bytes, server_date = await async_fetch_bundle(session)
@@ -669,13 +874,43 @@ async def async_bootstrap_credentials(hass: HomeAssistant) -> Credentials:
         )
         result = await hass.async_add_executor_job(create_credentials, inputs)
     except asyncio.CancelledError:
+        del hass
+        session = None
+        bundle_bytes = b""
+        identity_der = b""
+        inputs = None
+        result = None
         raise
     except BootstrapError as error:
         failure_category = _fixed_error_category(error, fallback=failure_fallback)
     except Exception:
         failure_category = failure_fallback
+    del hass
+    session = None
+    bundle_bytes = b""
+    identity_der = b""
+    inputs = None
+    result_or_category: Credentials | str
     if failure_category is not None:
-        raise BootstrapError(failure_category)
-    if result is None:
-        raise BootstrapError(ERROR_INVALID_MATERIAL)
-    return result
+        result_or_category = failure_category
+    elif result is None:
+        result_or_category = ERROR_INVALID_MATERIAL
+    else:
+        result_or_category = result
+    result = None
+    return result_or_category
+
+
+async def async_bootstrap_credentials(hass: HomeAssistant) -> Credentials:
+    """Run both bounded fetches and CPU certificate work in the executor."""
+    try:
+        outcome = await _async_bootstrap_outcome(hass)
+    except asyncio.CancelledError:
+        del hass
+        raise
+    del hass
+    if isinstance(outcome, str):
+        category = outcome
+        outcome = None
+        raise BootstrapError(category)
+    return outcome

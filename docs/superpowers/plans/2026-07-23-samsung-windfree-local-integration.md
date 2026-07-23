@@ -1097,11 +1097,20 @@ certificates have identical version, serial, subject, issuer, UTC validity
 bounds, public-key SPKI bytes, and complete ordered extension
 OID/critical/value tuples. Require the sole transition from provisional
 SHA256-with-RSA/PKCS1v15 to final SHA1-with-RSA/PKCS1v15, including declared
-parameters, then verify the final signature with the REMOVED_IDENTITY public key. Do not
-use temporary files, shell commands, or subprocess OpenSSL. Tests must mutate
+parameters. A minimal bounded DER reader must reject indefinite, non-minimal,
+truncated, out-of-bounds, or trailing encodings; parse the outer Certificate
+SEQUENCE, TBS SEQUENCE, optional version, serial, inner signature
+AlgorithmIdentifier, and outer signature AlgorithmIdentifier; and require both
+raw AlgorithmIdentifiers to equal the canonical DER for
+`sha1WithRSAEncryption` (`1.2.840.113549.1.1.5`) with explicit NULL parameters.
+This rejects a valid outer RSA/SHA-1 signature over a TBS structure that still
+declares SHA-256. Retain the cryptography outer OID/hash/PKCS1 checks, then
+verify the final signature with the REMOVED_IDENTITY public key. Do not add a DER dependency
+or use temporary files, shell commands, or subprocess OpenSSL. Tests must mutate
 every protected profile category at the conversion boundary, compare every
-intended TBS field after re-signing, prove the SHA-1 signature and chain
-validity, and prove that credential minting writes no files.
+intended TBS field after re-signing, prove canonical inner/outer algorithms,
+prove the SHA-1 signature and chain validity, and prove that credential minting
+writes no files.
 
 `create_credentials` composes `validate_bundle(inputs.bundle_bytes,
 pins=pins)`, `validate_identity_certificate(inputs.identity_der, pins=pins)`,
@@ -1141,7 +1150,15 @@ addresses. Translate all failures into the fixed sanitized categories:
 `bootstrap_unavailable`, `bootstrap_pin_mismatch`, `invalid_clock`, and
 `bootstrap_invalid_material`. Raise sanitized errors only after leaving the
 handling `except` block, with no cause or context retaining external errors,
-addresses, URLs, payloads, or key objects. Preserve `CancelledError` unchanged.
+addresses, URLs, payloads, or key objects. Sensitive internal work must unwind
+through result-or-fixed-category helpers. Before a public boundary raises a
+fresh `BootstrapError`, it must explicitly delete or replace bundle bytes,
+identity DER, universal signing-key objects, bootstrap inputs, sessions, and
+other sensitive intermediates in that public frame. Tests walk only production
+bootstrap traceback frames and require the exact injected bytes, objects,
+content, and representations to be absent; caller/test frames are outside this
+guarantee. Preserve the original `CancelledError` object unchanged and scrub
+sensitive production locals before re-raising cancellation.
 
 - [ ] **Step 5: Run focused and full bootstrap tests**
 
