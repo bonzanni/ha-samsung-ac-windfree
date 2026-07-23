@@ -17,11 +17,17 @@ import aiohttp
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
+from cryptography.x509.oid import (
+    ExtendedKeyUsageOID,
+    NameOID,
+    ObjectIdentifier,
+    SignatureAlgorithmOID,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 from OpenSSL import crypto
+from yarl import URL
 
 from .const import (
     REMOVED_SIGNING_DIGEST_NAME,
@@ -53,6 +59,7 @@ ERROR_INVALID_MATERIAL = "bootstrap_invalid_material: bootstrap material is inva
 _ROLE_OID = ObjectIdentifier("1.3.6.1.4.1.51414.1.3")
 _OCF_CLIENT_OID = ObjectIdentifier("1.3.6.1.4.1.51414.0.1.2")
 _ROLE_VALUE = b"\x0c\x10samsung.role.hub"
+_BUNDLE_ENDPOINT = URL(BUNDLE_URL)
 
 
 def _samsung_name(
@@ -136,6 +143,23 @@ def _invalid_material(detail: str | None = None) -> BootstrapError:
     return BootstrapError(f"{ERROR_INVALID_MATERIAL} ({detail})")
 
 
+def _fixed_error_category(
+    error: BootstrapError,
+    *,
+    fallback: str,
+) -> str:
+    message = str(error)
+    if message.startswith("bootstrap_unavailable:"):
+        return ERROR_UNAVAILABLE
+    if message.startswith("bootstrap_pin_mismatch:"):
+        return ERROR_PIN_MISMATCH
+    if message.startswith("invalid_clock:"):
+        return ERROR_INVALID_CLOCK
+    if message.startswith("bootstrap_invalid_material:"):
+        return ERROR_INVALID_MATERIAL
+    return fallback
+
+
 def _has_exact_name_attributes(actual: x509.Name, expected: x509.Name) -> bool:
     return sorted(
         (attribute.oid.dotted_string, attribute.value) for attribute in actual
@@ -174,12 +198,13 @@ def _verify_rsa_signature(
     certificate: x509.Certificate, issuer_key: rsa.RSAPublicKey
 ) -> None:
     algorithm = certificate.signature_hash_algorithm
-    if algorithm is None:
+    parameters = certificate.signature_algorithm_parameters
+    if algorithm is None or not isinstance(parameters, (padding.PKCS1v15, padding.PSS)):
         raise _invalid_material()
     issuer_key.verify(
         certificate.signature,
         certificate.tbs_certificate_bytes,
-        padding.PKCS1v15(),
+        parameters,
         algorithm,
     )
 
@@ -193,6 +218,7 @@ def validate_bundle(
     if not _digest_matches(data, pins.bundle_sha256):
         raise BootstrapError(ERROR_PIN_MISMATCH)
 
+    parse_failed = False
     try:
         key_pem, certificate_pems = _parse_exact_pem(data)
         key = serialization.load_pem_private_key(key_pem, password=None)
@@ -201,8 +227,10 @@ def validate_bundle(
         )
     except BootstrapError:
         raise
-    except Exception as err:
-        raise _invalid_material() from err
+    except Exception:
+        parse_failed = True
+    if parse_failed:
+        raise _invalid_material()
 
     if not isinstance(key, rsa.RSAPrivateKey):
         raise _invalid_material()
@@ -223,6 +251,7 @@ def validate_bundle(
     if key.public_key().public_numbers() != signing_public_key.public_numbers():
         raise _invalid_material()
 
+    chain_failed = False
     try:
         for index, certificate in enumerate(certificates):
             if not _has_exact_name_attributes(
@@ -247,8 +276,10 @@ def validate_bundle(
             _verify_rsa_signature(certificate, issuer_key)
     except BootstrapError:
         raise
-    except Exception as err:
-        raise _invalid_material() from err
+    except Exception:
+        chain_failed = True
+    if chain_failed:
+        raise _invalid_material()
 
     return BundleMaterial(
         signing_key=key,
@@ -265,14 +296,17 @@ def validate_identity_certificate(
     """Validate leaf/SPKI/issuer/CN and return UUID from the subject OU."""
     if not _digest_matches(der, pins.identity_leaf_sha256):
         raise BootstrapError(ERROR_PIN_MISMATCH)
+    parse_failed = False
     try:
         certificate = x509.load_der_x509_certificate(der)
         spki = certificate.public_key().public_bytes(
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-    except Exception as err:
-        raise _invalid_material() from err
+    except Exception:
+        parse_failed = True
+    if parse_failed:
+        raise _invalid_material()
     if not _digest_matches(spki, pins.identity_spki_sha256):
         raise BootstrapError(ERROR_PIN_MISMATCH)
     if not _has_exact_name_attributes(certificate.issuer, _IDENTITY_ISSUER):
@@ -289,13 +323,16 @@ def validate_identity_certificate(
     match = _UUID_OU.fullmatch(organizational_units[0].value)
     if match is None:
         raise _invalid_material("unexpected organizational unit")
+    invalid_uuid = False
     try:
         identity_uuid = str(UUID(match.group(1)))
-    except ValueError as err:
-        raise _invalid_material("unexpected organizational unit") from err
+    except ValueError:
+        invalid_uuid = True
+    if invalid_uuid:
+        raise _invalid_material("unexpected organizational unit")
     expected_subject = _samsung_name(
         "*.REMOVED_HOST.com",
-        organizational_unit=f"uuid:{identity_uuid}",
+        organizational_unit=organizational_units[0].value,
     )
     if not _has_exact_name_attributes(certificate.subject, expected_subject):
         raise _invalid_material("unexpected subject")
@@ -326,33 +363,92 @@ def _calendar_expiry(anchor: datetime) -> datetime:
         return anchor.replace(year=anchor.year + 10, day=28)
 
 
+def _resign_with_pyopenssl(
+    provisional_der: bytes,
+    signing_key_pem: bytes,
+) -> bytes:
+    """Replace a provisional signature using the in-memory legacy boundary."""
+    openssl_certificate = crypto.load_certificate(
+        crypto.FILETYPE_ASN1,
+        provisional_der,
+    )
+    openssl_key = crypto.load_privatekey(
+        crypto.FILETYPE_PEM,
+        signing_key_pem,
+    )
+    openssl_certificate.sign(openssl_key, "sha1")
+    return crypto.dump_certificate(crypto.FILETYPE_ASN1, openssl_certificate)
+
+
+def _extension_profile(
+    certificate: x509.Certificate,
+) -> tuple[tuple[str, bool, bytes], ...]:
+    return tuple(
+        (
+            extension.oid.dotted_string,
+            extension.critical,
+            extension.value.public_bytes(),
+        )
+        for extension in certificate.extensions
+    )
+
+
+def _has_same_tbs_profile(
+    provisional: x509.Certificate,
+    certificate: x509.Certificate,
+) -> bool:
+    provisional_spki = provisional.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    certificate_spki = certificate.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return (
+        certificate.version == provisional.version
+        and certificate.serial_number == provisional.serial_number
+        and certificate.subject == provisional.subject
+        and certificate.issuer == provisional.issuer
+        and certificate.not_valid_before_utc == provisional.not_valid_before_utc
+        and certificate.not_valid_after_utc == provisional.not_valid_after_utc
+        and hmac.compare_digest(certificate_spki, provisional_spki)
+        and _extension_profile(certificate) == _extension_profile(provisional)
+    )
+
+
 def _sign_sha1(
     builder: x509.CertificateBuilder, signing_key: rsa.RSAPrivateKey
 ) -> x509.Certificate:
     """Apply the device-required legacy SHA-1 signature to a built certificate."""
     provisional = builder.sign(signing_key, hashes.SHA256())
-    openssl_certificate = crypto.load_certificate(
-        crypto.FILETYPE_ASN1,
-        provisional.public_bytes(serialization.Encoding.DER),
+    signing_key_pem = signing_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
     )
-    openssl_key = crypto.load_privatekey(
-        crypto.FILETYPE_PEM,
-        signing_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ),
-    )
-    openssl_certificate.sign(openssl_key, "sha1")
     certificate = x509.load_der_x509_certificate(
-        crypto.dump_certificate(crypto.FILETYPE_ASN1, openssl_certificate)
+        _resign_with_pyopenssl(
+            provisional.public_bytes(serialization.Encoding.DER),
+            signing_key_pem,
+        )
     )
-    if not isinstance(certificate.signature_hash_algorithm, hashes.SHA1):
+    provisional_parameters = provisional.signature_algorithm_parameters
+    certificate_parameters = certificate.signature_algorithm_parameters
+    if (
+        provisional.signature_algorithm_oid != SignatureAlgorithmOID.RSA_WITH_SHA256
+        or not isinstance(provisional.signature_hash_algorithm, hashes.SHA256)
+        or not isinstance(provisional_parameters, padding.PKCS1v15)
+        or not _has_same_tbs_profile(provisional, certificate)
+        or certificate.signature_algorithm_oid != SignatureAlgorithmOID.RSA_WITH_SHA1
+        or not isinstance(certificate.signature_hash_algorithm, hashes.SHA1)
+        or not isinstance(certificate_parameters, padding.PKCS1v15)
+    ):
         raise _invalid_material()
     signing_key.public_key().verify(
         certificate.signature,
         certificate.tbs_certificate_bytes,
-        padding.PKCS1v15(),
+        certificate_parameters,
         hashes.SHA1(),
     )
     return certificate
@@ -452,19 +548,28 @@ def create_credentials(
     material = validate_bundle(inputs.bundle_bytes, pins=pins)
     identity_uuid = validate_identity_certificate(inputs.identity_der, pins=pins)
     _validate_clock(inputs.server_date, inputs.local_now)
+    failure_category: str | None = None
     try:
         return _mint_credentials(material, identity_uuid, inputs.server_date)
-    except Exception as err:
-        raise _invalid_material() from err
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=ERROR_INVALID_MATERIAL)
+    except Exception:
+        failure_category = ERROR_INVALID_MATERIAL
+    if failure_category is not None:
+        raise BootstrapError(failure_category)
+    raise AssertionError("unreachable")
 
 
 def _parse_http_date(value: str | None) -> datetime:
     if value is None:
         raise _invalid_material()
+    parse_failed = False
     try:
         parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError) as err:
-        raise _invalid_material() from err
+    except TypeError, ValueError:
+        parse_failed = True
+    if parse_failed:
+        raise _invalid_material()
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise _invalid_material()
     return parsed.astimezone(UTC)
@@ -474,10 +579,18 @@ async def async_fetch_bundle(
     session: aiohttp.ClientSession,
 ) -> tuple[bytes, datetime]:
     """Fetch via normal PKI, require HTTP Date, size <= 64 KiB, and status 200."""
+    failure_category: str | None = None
+    result: tuple[bytes, datetime] | None = None
     try:
         async with asyncio.timeout(HTTPS_TIMEOUT):
-            async with session.get(BUNDLE_URL) as response:
-                if response.status != 200:
+            async with session.get(BUNDLE_URL, allow_redirects=False) as response:
+                response_url = URL(response.url)
+                if (
+                    response_url != _BUNDLE_ENDPOINT
+                    or response_url.scheme != "https"
+                    or response_url.host != _BUNDLE_ENDPOINT.host
+                    or response.status != 200
+                ):
                     raise BootstrapError(ERROR_UNAVAILABLE)
                 server_date = _parse_http_date(response.headers.get("Date"))
                 chunks: list[bytes] = []
@@ -487,11 +600,18 @@ async def async_fetch_bundle(
                     if size > _MAX_BUNDLE_SIZE:
                         raise _invalid_material()
                     chunks.append(chunk)
-                return b"".join(chunks), server_date
-    except BootstrapError:
+                result = b"".join(chunks), server_date
+    except asyncio.CancelledError:
         raise
-    except Exception as err:
-        raise BootstrapError(ERROR_UNAVAILABLE) from err
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=ERROR_UNAVAILABLE)
+    except Exception:
+        failure_category = ERROR_UNAVAILABLE
+    if failure_category is not None:
+        raise BootstrapError(failure_category)
+    if result is None:
+        raise BootstrapError(ERROR_UNAVAILABLE)
+    return result
 
 
 def _fetch_identity_der() -> bytes:
@@ -513,27 +633,49 @@ def _fetch_identity_der() -> bytes:
 
 async def async_fetch_identity_der(hass: HomeAssistant) -> bytes:
     """Fetch untrusted TLS leaf in executor; validation happens before use."""
+    failure_category: str | None = None
+    result: bytes | None = None
     try:
         async with asyncio.timeout(HTTPS_TIMEOUT):
-            return await hass.async_add_executor_job(_fetch_identity_der)
-    except Exception as err:
-        raise BootstrapError(ERROR_UNAVAILABLE) from err
+            result = await hass.async_add_executor_job(_fetch_identity_der)
+    except asyncio.CancelledError:
+        raise
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=ERROR_UNAVAILABLE)
+    except Exception:
+        failure_category = ERROR_UNAVAILABLE
+    if failure_category is not None:
+        raise BootstrapError(failure_category)
+    if result is None:
+        raise BootstrapError(ERROR_UNAVAILABLE)
+    return result
 
 
 async def async_bootstrap_credentials(hass: HomeAssistant) -> Credentials:
     """Run both bounded fetches and CPU certificate work in the executor."""
-    session = async_get_clientsession(hass)
-    bundle_bytes, server_date = await async_fetch_bundle(session)
-    identity_der = await async_fetch_identity_der(hass)
-    inputs = BootstrapInputs(
-        bundle_bytes=bundle_bytes,
-        identity_der=identity_der,
-        server_date=server_date,
-        local_now=dt_util.utcnow(),
-    )
+    failure_category: str | None = None
+    failure_fallback = ERROR_UNAVAILABLE
+    result: Credentials | None = None
     try:
-        return await hass.async_add_executor_job(create_credentials, inputs)
-    except BootstrapError:
+        session = async_get_clientsession(hass)
+        bundle_bytes, server_date = await async_fetch_bundle(session)
+        identity_der = await async_fetch_identity_der(hass)
+        failure_fallback = ERROR_INVALID_MATERIAL
+        inputs = BootstrapInputs(
+            bundle_bytes=bundle_bytes,
+            identity_der=identity_der,
+            server_date=server_date,
+            local_now=dt_util.utcnow(),
+        )
+        result = await hass.async_add_executor_job(create_credentials, inputs)
+    except asyncio.CancelledError:
         raise
-    except Exception as err:
-        raise _invalid_material() from err
+    except BootstrapError as error:
+        failure_category = _fixed_error_category(error, fallback=failure_fallback)
+    except Exception:
+        failure_category = failure_fallback
+    if failure_category is not None:
+        raise BootstrapError(failure_category)
+    if result is None:
+        raise BootstrapError(ERROR_INVALID_MATERIAL)
+    return result

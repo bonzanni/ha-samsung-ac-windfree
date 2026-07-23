@@ -1058,14 +1058,19 @@ def create_credentials(
 
 Use `cryptography` loaders, explicit SHA-256 byte comparisons via
 `hmac.compare_digest`, RSA public-number comparison, and signature verification
-for each public chain edge, including the root self-signature. Require exact DN
+for each public chain edge, including the root self-signature. RSA verification
+must use the certificate's declared hash and `signature_algorithm_parameters`;
+accept only `PKCS1v15` or `PSS` padding and reject missing or unsupported
+parameters. Require exact DN
 attributes for the four-certificate chain: `REMOVED_IDENTITY` (including
 `emailAddress=REMOVED_IDENTITY`) -> `RemoteAccessCA(CE)` -> `CECA` ->
 `ROOTCA`, all under `C=KR, O=Samsung Electronics`. Require the identity issuer
 attributes `C=KR, O=Samsung Electronics, OU=OCF Server SubCA,
 CN=Samsung Electronics OCF Server SubCA`; its subject must additionally have
 `C=KR, O=Samsung Electronics, CN=*.REMOVED_HOST.com` and exactly one valid
-`OU=uuid:<UUID>`. Reject extra PEM blocks.
+`OU=uuid:<UUID>`. Accept canonical hyphenated UUID text in either case and
+return its canonical lowercase form, while rejecting braces, missing hyphens,
+duplicate OU values, or extra subject attributes. Reject extra PEM blocks.
 
 Build the leaf with non-critical `BasicConstraints(ca=False)`; non-critical
 `KeyUsage` containing only digital-signature and key-encipherment; non-critical
@@ -1086,9 +1091,17 @@ subject/issuer, validity, public key, and extensions, load its DER into Home
 Assistant's existing pyOpenSSL stack, and call pyOpenSSL signing with the REMOVED_IDENTITY
 key and SHA-1 so it replaces the signature algorithm and value over that TBS
 content. Reload and verify the final SHA-1 certificate with `cryptography`. Do
-not use temporary files, shell commands, or subprocess OpenSSL. Tests must
-compare every intended TBS field after re-signing, prove the SHA-1 signature and
-chain validity, and prove that credential minting writes no files.
+not compare raw TBS bytes because the inner signature AlgorithmIdentifier
+legitimately changes. Instead fail closed unless the final and provisional
+certificates have identical version, serial, subject, issuer, UTC validity
+bounds, public-key SPKI bytes, and complete ordered extension
+OID/critical/value tuples. Require the sole transition from provisional
+SHA256-with-RSA/PKCS1v15 to final SHA1-with-RSA/PKCS1v15, including declared
+parameters, then verify the final signature with the REMOVED_IDENTITY public key. Do not
+use temporary files, shell commands, or subprocess OpenSSL. Tests must mutate
+every protected profile category at the conversion boundary, compare every
+intended TBS field after re-signing, prove the SHA-1 signature and chain
+validity, and prove that credential minting writes no files.
 
 `create_credentials` composes `validate_bundle(inputs.bundle_bytes,
 pins=pins)`, `validate_identity_certificate(inputs.identity_der, pins=pins)`,
@@ -1118,12 +1131,17 @@ async def async_bootstrap_credentials(
     """Run both bounded fetches and CPU certificate work in the executor."""
 ```
 
-The bundle fetch uses `asyncio.timeout(HTTPS_TIMEOUT)`. The identity fetch
-uses a socket timeout of `HTTPS_TIMEOUT`, SNI, `CERT_NONE`, and returns only DER.
+The bundle fetch uses `asyncio.timeout(HTTPS_TIMEOUT)`, calls the fixed URL with
+redirects disabled, and requires the response URL to equal that same parsed
+HTTPS URL and expected host before trusting its status, Date, or body. Cross-host,
+HTTPS-to-HTTP, and same-host redirects all fail closed. The identity fetch uses
+a socket timeout of `HTTPS_TIMEOUT`, SNI, `CERT_NONE`, and returns only DER.
 Neither helper logs URL response bodies, certificate details, UUID, or host
 addresses. Translate all failures into the fixed sanitized categories:
 `bootstrap_unavailable`, `bootstrap_pin_mismatch`, `invalid_clock`, and
-`bootstrap_invalid_material`.
+`bootstrap_invalid_material`. Raise sanitized errors only after leaving the
+handling `except` block, with no cause or context retaining external errors,
+addresses, URLs, payloads, or key objects. Preserve `CancelledError` unchanged.
 
 - [ ] **Step 5: Run focused and full bootstrap tests**
 

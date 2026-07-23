@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
 from custom_components.samsung_ac_windfree.bootstrap import (
@@ -36,6 +36,8 @@ def _ca_certificate(
     issuer: x509.Name,
     public_key: rsa.RSAPublicKey,
     signer_key: rsa.RSAPrivateKey,
+    *,
+    rsa_padding: padding.PSS | padding.PKCS1v15 | None = None,
 ) -> x509.Certificate:
     return (
         x509.CertificateBuilder()
@@ -60,7 +62,7 @@ def _ca_certificate(
             ),
             critical=True,
         )
-        .sign(signer_key, hashes.SHA256())
+        .sign(signer_key, hashes.SHA256(), rsa_padding=rsa_padding)
     )
 
 
@@ -109,16 +111,26 @@ class SyntheticBootstrapMaterial:
         public_key: ec.EllipticCurvePublicKey | None = None,
         country: str = "KR",
         organization: str = "Samsung Electronics",
+        additional_organizational_unit: str | None = None,
+        extra_subject_attribute: x509.NameAttribute | None = None,
     ) -> bytes:
         ou = organizational_unit or f"uuid:{self.identity_uuid}"
-        subject = x509.Name(
-            [
-                x509.NameAttribute(NameOID.COUNTRY_NAME, country),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, organization),
-                x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ou),
-                x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-            ]
-        )
+        subject_attributes = [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, country),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, organization),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ou),
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+        ]
+        if additional_organizational_unit is not None:
+            subject_attributes.append(
+                x509.NameAttribute(
+                    NameOID.ORGANIZATIONAL_UNIT_NAME,
+                    additional_organizational_unit,
+                )
+            )
+        if extra_subject_attribute is not None:
+            subject_attributes.append(extra_subject_attribute)
+        subject = x509.Name(subject_attributes)
         certificate = (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -146,12 +158,14 @@ class SyntheticBootstrapMaterial:
         *,
         subject: x509.Name | None = None,
         issuer: x509.Name | None = None,
+        rsa_padding: padding.PSS | padding.PKCS1v15 | None = None,
     ) -> x509.Certificate:
         return _ca_certificate(
             subject or self.signing_certificate.subject,
             issuer or self.remote_certificate.subject,
             self.signing_key.public_key(),
             self.remote_key,
+            rsa_padding=rsa_padding,
         )
 
 

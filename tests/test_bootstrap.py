@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import traceback
 from dataclasses import fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +13,13 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
+from cryptography.x509.oid import (
+    ExtendedKeyUsageOID,
+    NameOID,
+    ObjectIdentifier,
+    SignatureAlgorithmOID,
+)
+from yarl import URL
 
 from custom_components.samsung_ac_windfree import bootstrap
 from custom_components.samsung_ac_windfree.bootstrap import (
@@ -31,6 +38,97 @@ from custom_components.samsung_ac_windfree.models import BootstrapError
 ROLE_OID = ObjectIdentifier("1.3.6.1.4.1.51414.1.3")
 OCF_CLIENT_OID = ObjectIdentifier("1.3.6.1.4.1.51414.0.1.2")
 ROLE_VALUE = b"\x0c\x10samsung.role.hub"
+
+
+def _legacy_resign(provisional_der: bytes, signing_key_pem: bytes) -> bytes:
+    certificate = bootstrap.crypto.load_certificate(
+        bootstrap.crypto.FILETYPE_ASN1, provisional_der
+    )
+    key = bootstrap.crypto.load_privatekey(
+        bootstrap.crypto.FILETYPE_PEM, signing_key_pem
+    )
+    certificate.sign(key, "sha1")
+    return bootstrap.crypto.dump_certificate(
+        bootstrap.crypto.FILETYPE_ASN1, certificate
+    )
+
+
+def _mutating_resign(
+    provisional_der: bytes,
+    signing_key_pem: bytes,
+    mutation: str,
+) -> bytes:
+    if mutation == "signature_algorithm":
+        return provisional_der
+
+    provisional = x509.load_der_x509_certificate(provisional_der)
+    signing_key = serialization.load_pem_private_key(signing_key_pem, password=None)
+    assert isinstance(signing_key, rsa.RSAPrivateKey)
+
+    serial = provisional.serial_number
+    subject = provisional.subject
+    issuer = provisional.issuer
+    not_before = provisional.not_valid_before_utc
+    not_after = provisional.not_valid_after_utc
+    public_key = provisional.public_key()
+    extensions = [
+        (extension.value, extension.critical) for extension in provisional.extensions
+    ]
+
+    if mutation == "serial":
+        serial += 1
+    elif mutation == "subject":
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "altered")])
+    elif mutation == "issuer":
+        issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "altered")])
+    elif mutation == "not_before":
+        not_before += timedelta(seconds=1)
+    elif mutation == "not_after":
+        not_after -= timedelta(seconds=1)
+    elif mutation == "public_key":
+        public_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        ).public_key()
+    elif mutation == "extension_value":
+        extensions[-1] = (
+            x509.UnrecognizedExtension(ROLE_OID, b"\x0c\x07altered"),
+            extensions[-1][1],
+        )
+    elif mutation == "extension_criticality":
+        extensions[0] = (extensions[0][0], not extensions[0][1])
+    elif mutation == "extension_order":
+        extensions[0], extensions[1] = extensions[1], extensions[0]
+    else:
+        raise AssertionError(f"unknown test mutation: {mutation}")
+
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(public_key)
+        .serial_number(serial)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+    )
+    for value, critical in extensions:
+        builder = builder.add_extension(value, critical)
+    mutated = builder.sign(signing_key, hashes.SHA256())
+    return _legacy_resign(
+        mutated.public_bytes(serialization.Encoding.DER), signing_key_pem
+    )
+
+
+def _assert_clean_error(
+    error: BootstrapError,
+    category: str,
+    *secrets: str,
+) -> None:
+    assert str(error) == category
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    formatted = "".join(traceback.format_exception(error))
+    for secret in secrets:
+        assert secret not in formatted
 
 
 def test_wrong_bundle_digest_fails_before_parsing(
@@ -190,6 +288,49 @@ def test_bundle_rejects_invalid_chain_signature(
         validate_bundle(data, pins=pins)
 
 
+def test_bundle_accepts_declared_rsa_pss_signature_parameters(
+    bootstrap_pins: BootstrapPins,
+    synthetic_bootstrap_material,
+) -> None:
+    signing_certificate = synthetic_bootstrap_material.replacement_signing_certificate(
+        rsa_padding=padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=32,
+        )
+    )
+    data = synthetic_bootstrap_material.bundle(
+        certificates=(
+            signing_certificate,
+            *synthetic_bootstrap_material.certificates[1:],
+        )
+    )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+        signing_sha256=signing_certificate.fingerprint(hashes.SHA256()).hex(),
+    )
+    assert validate_bundle(data, pins=pins).signing_certificate == signing_certificate
+
+
+@pytest.mark.parametrize("parameters", [None, object()])
+def test_rsa_signature_verification_rejects_missing_or_unsupported_parameters(
+    parameters,
+) -> None:
+    certificate = SimpleNamespace(
+        signature_hash_algorithm=hashes.SHA256(),
+        signature_algorithm_parameters=parameters,
+        signature=b"signature",
+        tbs_certificate_bytes=b"tbs",
+    )
+
+    class AcceptingKey:
+        def verify(self, *_args):
+            raise AssertionError("unsupported parameters reached verification")
+
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        bootstrap._verify_rsa_signature(certificate, AcceptingKey())
+
+
 @pytest.mark.parametrize(
     ("replacement", "field"),
     [
@@ -309,6 +450,76 @@ def test_identity_returns_only_canonical_uuid(
     )
 
 
+def test_identity_accepts_uppercase_uuid_and_returns_canonical_lowercase(
+    synthetic_bootstrap_material,
+    pins_for,
+) -> None:
+    uppercase = synthetic_bootstrap_material.identity_uuid.upper()
+    identity_der = synthetic_bootstrap_material.identity_der(
+        organizational_unit=f"uuid:{uppercase}"
+    )
+    pins = pins_for(synthetic_bootstrap_material.bundle(), identity_der)
+    assert validate_identity_certificate(identity_der, pins=pins) == uppercase.lower()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"organizational_unit": "uuid:{00000000-0000-4000-8000-000000000001}"},
+        {"organizational_unit": "uuid:00000000000040008000000000000001"},
+        {
+            "additional_organizational_unit": (
+                "uuid:00000000-0000-4000-8000-000000000002"
+            )
+        },
+        {"extra_subject_attribute": x509.NameAttribute(NameOID.LOCALITY_NAME, "Suwon")},
+    ],
+    ids=["braces", "missing-hyphens", "duplicate-ou", "extra-attribute"],
+)
+def test_identity_rejects_noncanonical_or_ambiguous_uuid_subject(
+    synthetic_bootstrap_material,
+    pins_for,
+    kwargs,
+) -> None:
+    identity_der = synthetic_bootstrap_material.identity_der(**kwargs)
+    pins = pins_for(synthetic_bootstrap_material.bundle(), identity_der)
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        validate_identity_certificate(identity_der, pins=pins)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "serial",
+        "subject",
+        "issuer",
+        "not_before",
+        "not_after",
+        "public_key",
+        "extension_value",
+        "extension_criticality",
+        "extension_order",
+        "signature_algorithm",
+    ],
+)
+def test_pyopenssl_resign_rejects_every_tbs_profile_mutation(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    mutation: str,
+) -> None:
+    monkeypatch.setattr(
+        bootstrap,
+        "_resign_with_pyopenssl",
+        lambda provisional_der, signing_key_pem: _mutating_resign(
+            provisional_der, signing_key_pem, mutation
+        ),
+        raising=False,
+    )
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        create_credentials(bootstrap_inputs, pins=bootstrap_pins)
+
+
 def test_generated_leaf_has_exact_key_signature_subject_and_extensions(
     bootstrap_inputs: BootstrapInputs,
     bootstrap_pins: BootstrapPins,
@@ -334,6 +545,8 @@ def test_generated_leaf_has_exact_key_signature_subject_and_extensions(
     assert leaf_public_key.public_numbers() == key.public_key().public_numbers()
     assert leaf.version is x509.Version.v3
     assert leaf.signature_hash_algorithm.name == "sha1"
+    assert leaf.signature_algorithm_oid == SignatureAlgorithmOID.RSA_WITH_SHA1
+    assert isinstance(leaf.signature_algorithm_parameters, padding.PKCS1v15)
     assert leaf.issuer == synthetic_bootstrap_material.signing_certificate.subject
     assert leaf.subject == x509.Name(
         [
@@ -428,10 +641,12 @@ class _FakeResponse:
         *,
         status: int = 200,
         date: str | None = None,
+        url: str = bootstrap.BUNDLE_URL,
     ) -> None:
         self.status = status
         self.headers = {} if date is None else {"Date": date}
         self.content = _FakeContent(body)
+        self.url = URL(url)
 
 
 class _ResponseContext:
@@ -448,8 +663,10 @@ class _ResponseContext:
 class _FakeSession:
     def __init__(self, response: _FakeResponse) -> None:
         self.response = response
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    def get(self, _url: str) -> _ResponseContext:
+    def get(self, url: str, **kwargs) -> _ResponseContext:
+        self.calls.append((url, kwargs))
         return _ResponseContext(self.response)
 
 
@@ -466,6 +683,29 @@ async def test_bundle_fetch_returns_authenticated_date_and_exact_bytes() -> None
         _FakeResponse(body=b"synthetic bundle", date=format_datetime(server_date))
     )
     assert await async_fetch_bundle(session) == (b"synthetic bundle", server_date)
+    assert session.calls == [(bootstrap.BUNDLE_URL, {"allow_redirects": False})]
+
+
+@pytest.mark.parametrize(
+    ("status", "response_url"),
+    [
+        (200, "https://attacker.invalid/cert.pem"),
+        (200, "http://REMOVED_SOURCE_HOST/REMOVED_SOURCE_OWNER/cert.pem"),
+        (302, bootstrap.BUNDLE_URL),
+    ],
+    ids=["cross-host", "https-to-http", "same-host-redirect"],
+)
+async def test_bundle_fetch_rejects_redirect_or_unexpected_response_url(
+    status: int,
+    response_url: str,
+) -> None:
+    trusted_date = format_datetime(datetime(2026, 7, 23, tzinfo=UTC))
+    session = _FakeSession(
+        _FakeResponse(status=status, date=trusted_date, url=response_url)
+    )
+    with pytest.raises(BootstrapError, match="bootstrap_unavailable"):
+        await async_fetch_bundle(session)
+    assert session.calls == [(bootstrap.BUNDLE_URL, {"allow_redirects": False})]
 
 
 async def test_bundle_fetch_rejects_non_200_and_oversize_response() -> None:
@@ -488,7 +728,7 @@ async def test_bundle_fetch_timeout_is_sanitized(monkeypatch) -> None:
         async def __aexit__(self, *_args):
             return None
 
-    session = SimpleNamespace(get=lambda _url: SlowContext())
+    session = SimpleNamespace(get=lambda _url, **_kwargs: SlowContext())
     monkeypatch.setattr(bootstrap, "HTTPS_TIMEOUT", 0.001)
     with pytest.raises(BootstrapError, match="bootstrap_unavailable"):
         await async_fetch_bundle(session)
@@ -553,14 +793,16 @@ def test_identity_socket_fetch_uses_timeout_sni_and_no_ca_trust(
 
 
 async def test_identity_fetch_runs_in_executor_and_sanitizes_all_failures() -> None:
+    secret = "https://secret.invalid/device?key=PRIVATE-KEY-MATERIAL"
+
     class FakeHass:
         async def async_add_executor_job(self, target, *_args):
             assert target is bootstrap._fetch_identity_der
-            raise RuntimeError("must not escape")
+            raise RuntimeError(secret)
 
-    with pytest.raises(BootstrapError, match="bootstrap_unavailable") as err:
+    with pytest.raises(BootstrapError) as err:
         await async_fetch_identity_der(FakeHass())
-    assert "must not escape" not in str(err.value)
+    _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, secret)
 
 
 async def test_bootstrap_runs_cpu_work_in_executor_and_sanitizes_failure(
@@ -568,6 +810,7 @@ async def test_bootstrap_runs_cpu_work_in_executor_and_sanitizes_failure(
     bootstrap_inputs: BootstrapInputs,
 ) -> None:
     calls: list[Any] = []
+    secret = "REMOVED_IDENTITY_HOST PRIVATE-KEY-MATERIAL"
 
     async def fake_bundle(_session):
         return bootstrap_inputs.bundle_bytes, bootstrap_inputs.server_date
@@ -578,17 +821,118 @@ async def test_bootstrap_runs_cpu_work_in_executor_and_sanitizes_failure(
     class FakeHass:
         async def async_add_executor_job(self, target, *args):
             calls.append((target, args))
-            raise RuntimeError("must not escape")
+            raise RuntimeError(secret)
 
     monkeypatch.setattr(bootstrap, "async_fetch_bundle", fake_bundle)
     monkeypatch.setattr(bootstrap, "async_fetch_identity_der", fake_identity)
     monkeypatch.setattr(bootstrap, "async_get_clientsession", lambda _hass: object())
 
-    with pytest.raises(BootstrapError, match="bootstrap_invalid_material") as err:
+    with pytest.raises(BootstrapError) as err:
         await async_bootstrap_credentials(FakeHass())
-    assert "must not escape" not in str(err.value)
+    _assert_clean_error(err.value, bootstrap.ERROR_INVALID_MATERIAL, secret)
     assert calls[0][0] is create_credentials
     assert isinstance(calls[0][1][0], BootstrapInputs)
+
+
+async def test_bundle_fetch_sanitizes_raw_exception_chain() -> None:
+    secret = "https://secret.invalid/cert.pem PRIVATE-KEY-MATERIAL"
+
+    class FailingSession:
+        def get(self, _url, **_kwargs):
+            raise RuntimeError(secret)
+
+    with pytest.raises(BootstrapError) as err:
+        await async_fetch_bundle(FailingSession())
+    _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, secret)
+
+
+def test_bundle_validation_sanitizes_raw_parser_exception_chain(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+) -> None:
+    secret = "https://secret.invalid/bundle PRIVATE-KEY-MATERIAL"
+
+    def fail_parser(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(bootstrap.serialization, "load_pem_private_key", fail_parser)
+    with pytest.raises(BootstrapError) as err:
+        validate_bundle(bootstrap_inputs.bundle_bytes, pins=bootstrap_pins)
+    _assert_clean_error(err.value, bootstrap.ERROR_INVALID_MATERIAL, secret)
+
+
+async def test_bootstrap_sanitizes_session_acquisition_failure(
+    monkeypatch,
+) -> None:
+    secret = "https://secret.invalid/session PRIVATE-KEY-MATERIAL"
+
+    def fail_session(_hass):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(bootstrap, "async_get_clientsession", fail_session)
+    with pytest.raises(BootstrapError) as err:
+        await async_bootstrap_credentials(SimpleNamespace())
+    _assert_clean_error(err.value, bootstrap.ERROR_UNAVAILABLE, secret)
+
+
+def test_signing_failure_has_no_raw_exception_or_key_in_chain(
+    monkeypatch,
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    synthetic_bootstrap_material,
+) -> None:
+    secret = "https://secret.invalid/sign PRIVATE-KEY-MATERIAL"
+
+    def fail_boundary(*_args):
+        raise RuntimeError(secret, synthetic_bootstrap_material.signing_key)
+
+    monkeypatch.setattr(
+        bootstrap, "_resign_with_pyopenssl", fail_boundary, raising=False
+    )
+    with pytest.raises(BootstrapError) as err:
+        create_credentials(bootstrap_inputs, pins=bootstrap_pins)
+    _assert_clean_error(err.value, bootstrap.ERROR_INVALID_MATERIAL, secret)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["bundle", "identity", "bootstrap"],
+)
+async def test_async_bootstrap_helpers_preserve_cancellation(
+    monkeypatch,
+    helper: str,
+) -> None:
+    cancellation = asyncio.CancelledError()
+
+    if helper == "bundle":
+
+        class CancelSession:
+            def get(self, _url, **_kwargs):
+                raise cancellation
+
+        coroutine = async_fetch_bundle(CancelSession())
+    elif helper == "identity":
+
+        class CancelHass:
+            async def async_add_executor_job(self, _target, *_args):
+                raise cancellation
+
+        coroutine = async_fetch_identity_der(CancelHass())
+    else:
+
+        async def cancel_bundle(_session):
+            raise cancellation
+
+        monkeypatch.setattr(
+            bootstrap, "async_get_clientsession", lambda _hass: object()
+        )
+        monkeypatch.setattr(bootstrap, "async_fetch_bundle", cancel_bundle)
+        coroutine = async_bootstrap_credentials(SimpleNamespace())
+
+    with pytest.raises(asyncio.CancelledError) as err:
+        await coroutine
+    assert err.value is cancellation
 
 
 def test_all_bootstrap_errors_are_sanitized_categories() -> None:
