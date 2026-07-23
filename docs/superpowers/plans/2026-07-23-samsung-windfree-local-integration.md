@@ -17,7 +17,8 @@ state cache, tiered polling, OBSERVE updates, verified writes, capability
 drift detection, and availability. Home Assistant entities read coordinator
 memory only.
 
-**Tech Stack:** Python 3.13+, Home Assistant 2026.5+, `smartthings-local==0.1.0`,
+**Tech Stack:** Python 3.13+, Home Assistant 2026.5.4+,
+`smartthings-local==0.1.0`,
 `cbor2==6.1.3`, Home Assistant's pyOpenSSL/cryptography stack, pytest,
 pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
 
@@ -50,6 +51,11 @@ pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
   remain outside Git.
 - TDD is mandatory: observe the named test fail before adding production code.
 - Each task ends with its own reviewable commit.
+- Immediately before every task commit, run
+  `.venv/bin/ruff format custom_components tests` and
+  `.venv/bin/ruff check custom_components tests` after the focused pytest
+  command. Both Ruff commands must exit `0`; formatting fixes are part of the
+  same task.
 
 ## File and Responsibility Map
 
@@ -86,6 +92,7 @@ tests/
   test_coordinator.py
   test_device.py
   test_diagnostics.py
+  test_dependency_contract.py
   test_init.py
   test_models.py
   test_sensor.py
@@ -99,11 +106,86 @@ README.md
 hacs.json
 pyproject.toml
 requirements_test.txt
+requirements_test_min.txt
 ```
 
 The public interfaces below are fixed for the plan. If implementation proves
 one impossible, stop that task and amend this plan before allowing later tasks
 to invent another name.
+
+## Shared Test Harness Contract
+
+Each task extends `tests/conftest.py` only with the fixtures assigned here:
+
+- `credentials: Credentials` returns a valid ephemeral RSA key plus SHA-1-signed
+  synthetic client chain and validity dates; it is loadable by real pyOpenSSL.
+- `bootstrap_inputs: BootstrapInputs` and `bootstrap_pins: BootstrapPins`
+  generate an ephemeral four-certificate chain and matching fingerprints.
+- `resource_representations: dict[str, dict[str, object]]` loads
+  `device_state.json`.
+- `encoded_resources: dict[str, bytes]` applies `cbor2.dumps` to each
+  representation for low-level session mocks.
+- `ManualClock` exposes `monotonic() -> float`,
+  `async sleep(delay: float) -> None`, and `advance(delay: float) -> None`.
+- `FakeSession` implements the real dependency's blocking
+  `connect/start_reader/get/post/subscribe/close/join` method shapes and records
+  calls. Its GET values are `(69, encoded_resources[path])`; POST returns
+  `(68, b"")`.
+- `TransportFactoryStub.current` is the current `AsyncMock` transport and
+  `TransportFactoryStub.discover` is an `AsyncMock` returning a replacement
+  `(port, transport)` pair.
+- `coordinator` constructs `WindFreeCoordinator` with `ManualClock.monotonic`,
+  `ManualClock.sleep`, `TransportFactoryStub`, synthetic credentials, and the
+  compatibility fixture, then seeds it with the exact identity/state fixtures.
+- `validated_setup` contains the synthetic host, port `49154`, exact supported
+  identity, and synthetic credentials.
+- `config_entry` is `MockConfigEntry` version `1` with `validated_setup` data
+  and the synthetic device UUID as unique ID.
+- `climate_entity` and `energy_entity` are returned after adding `config_entry`,
+  patching coordinator construction to return the shared coordinator, calling
+  `async_setup`, and blocking until all platforms finish.
+
+Use this exact protocol for injected factories:
+
+```python
+class TransportFactory(Protocol):
+    async def __call__(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        port: int,
+        credentials: Credentials,
+        generation: int,
+    ) -> WindFreeTransport: ...
+
+    async def discover(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        credentials: Credentials,
+        generation: int,
+    ) -> tuple[int, WindFreeTransport]: ...
+
+    async def reconnect(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        port: int,
+        credentials: Credentials,
+        generation: int,
+    ) -> WindFreeTransport: ...
+```
+
+`WindFreeCoordinator.__init__` accepts:
+
+```python
+monotonic: Callable[[], float] = time.monotonic,
+sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+transport_factory: TransportFactory = DefaultTransportFactory(),
+```
+
+No test uses wall-clock sleeps, production addresses, raw production CBOR, or
+real credentials.
 
 ---
 
@@ -113,6 +195,7 @@ to invent another name.
 - Create: `.gitignore`
 - Create: `pyproject.toml`
 - Create: `requirements_test.txt`
+- Create: `requirements_test_min.txt`
 - Create: `hacs.json`
 - Create: `custom_components/samsung_ac_windfree/__init__.py`
 - Create: `custom_components/samsung_ac_windfree/const.py`
@@ -165,9 +248,14 @@ def test_manifest_pins_isolated_requirements() -> None:
     ]
 ```
 
-- [ ] **Step 2: Run the tests and confirm the scaffold is absent**
+- [ ] **Step 2: Create the test environment and confirm the scaffold is absent**
 
-Run: `pytest tests/test_init.py -q`
+Run: `python3 -m venv .venv`
+
+Run:
+`.venv/bin/pip install pytest-homeassistant-custom-component==0.13.347`
+
+Run: `.venv/bin/pytest tests/test_init.py -q`
 
 Expected: collection fails with
 `ModuleNotFoundError: custom_components.samsung_ac_windfree`.
@@ -203,12 +291,36 @@ RUNTIME_HANDSHAKE_TIMEOUT = 12.0
 COAP_READ_TIMEOUT = 8.0
 SETUP_TIMEOUT = 150.0
 RATE_LIMIT_RPS = 2.0
+COMMAND_OBSERVE_TIMEOUT = 2.0
+RECONNECT_MIN_SECONDS = 2.0
+RECONNECT_MAX_SECONDS = 60.0
 
 HOT_INTERVAL = timedelta(seconds=5)
 WARM_INTERVAL = timedelta(seconds=30)
 COLD_INTERVAL = timedelta(minutes=5)
 RECONCILE_INTERVAL = timedelta(minutes=5)
 CERT_REPAIR_WINDOW = timedelta(days=90)
+
+HOT_PATHS = (
+    "/power/vs/0",
+    "/mode/vs/0",
+    "/temperatures/vs/0",
+    "/wind/strength/vs/0",
+    "/wind/direction/vs/0",
+    "/mode/convenient/vs/0",
+)
+WARM_PATHS = (
+    "/humidity/vs/0",
+    "/energy/consumption/vs/0",
+    "/alarms/vs/0",
+    "/light/vs/0",
+    "/option/autoclean/vs/0",
+)
+COLD_PATHS = (
+    "/filter/airdustfilter/vs/0",
+    "/electriccurrent/vs/0",
+)
+RECONCILE_PATHS = ("/oic/d", "/oic/p", "/device/0")
 
 BUNDLE_URL = (
     "https://REMOVED_SOURCE_HOST/REMOVED_SOURCE_OWNER/"
@@ -275,7 +387,7 @@ Create `tests/__init__.py` as an empty file. Set `hacs.json` to:
 ```json
 {
   "name": "Samsung WindFree AC",
-  "homeassistant": "2026.5.0",
+  "homeassistant": "2026.5.4",
   "render_readme": true
 }
 ```
@@ -299,17 +411,26 @@ target-version = "py313"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["ALL"]
-ignore = ["ANN401", "D203", "D213", "COM812"]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "SLF001"]
 ```
 
 Set `requirements_test.txt` to:
 
 ```text
-pytest==9.0.3
-pytest-cov==7.0.0
-pytest-homeassistant-custom-component==0.13.343
+pytest-homeassistant-custom-component==0.13.347
 ruff==0.15.21
+smartthings-local==0.1.0
+cbor2==6.1.3
+```
+
+Set `requirements_test_min.txt` to the independently verified mapping where
+PHACC `0.13.333` requires Home Assistant `2026.5.4`:
+
+```text
+pytest-homeassistant-custom-component==0.13.333
 smartthings-local==0.1.0
 cbor2==6.1.3
 ```
@@ -326,9 +447,7 @@ htmlcov/
 *.py[cod]
 ```
 
-- [ ] **Step 4: Install the test environment and run the scaffold tests**
-
-Run: `python3 -m venv .venv`
+- [ ] **Step 4: Install the declared requirements and run scaffold tests**
 
 Run: `.venv/bin/pip install -r requirements_test.txt`
 
@@ -336,10 +455,17 @@ Run: `.venv/bin/pytest tests/test_init.py -q`
 
 Expected: `2 passed`.
 
-- [ ] **Step 5: Commit the scaffold**
+- [ ] **Step 5: Run Ruff and commit the scaffold**
+
+Run: `.venv/bin/ruff format custom_components tests`
+
+Run: `.venv/bin/ruff check custom_components tests`
+
+Expected: both commands exit `0`.
 
 ```bash
-git add .gitignore pyproject.toml requirements_test.txt hacs.json \
+git add .gitignore pyproject.toml requirements_test.txt \
+  requirements_test_min.txt hacs.json \
   custom_components tests
 git commit -m "chore: scaffold Samsung WindFree integration"
 ```
@@ -695,20 +821,24 @@ already proven during research:
 
 ```json
 {
-  "Auto": ["hvac_mode"],
-  "Cool": [
-    "hvac_mode", "temperature", "fan", "swing", "preset",
-    "display_light", "auto_clean"
+  "always_allowed": [
+    "power", "hvac_mode", "display_light", "auto_clean"
   ],
-  "Dry": ["hvac_mode"],
-  "Fan": ["hvac_mode"],
-  "Heat": ["hvac_mode"]
+  "by_mode": {
+    "Auto": [],
+    "Cool": ["temperature", "fan", "swing", "preset"],
+    "Dry": [],
+    "Fan": [],
+    "Heat": []
+  }
 }
 ```
 
 Task 12 expands this fixture only with combinations that pass the authorized
 reversible live matrix. Until then, the coordinator rejects every absent
-combination without device I/O.
+combination without device I/O. Matrix lookup uses the device's remembered
+non-Off HVAC mode even while power is Off. The four `always_allowed` commands
+are never mode-gated.
 
 - [ ] **Step 4: Run the model tests**
 
@@ -746,13 +876,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
-import hashlib
-from unittest.mock import AsyncMock
 
 import pytest
 
 from custom_components.samsung_ac_windfree.bootstrap import (
     BootstrapInputs,
+    BootstrapPins,
+    PRODUCTION_PINS,
     create_credentials,
 )
 from custom_components.samsung_ac_windfree.models import BootstrapError
@@ -760,6 +890,7 @@ from custom_components.samsung_ac_windfree.models import BootstrapError
 
 def test_wrong_bundle_digest_fails_before_parsing(
     bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
 ) -> None:
     with pytest.raises(BootstrapError, match="bootstrap material changed"):
         create_credentials(
@@ -767,12 +898,13 @@ def test_wrong_bundle_digest_fails_before_parsing(
                 bootstrap_inputs,
                 bundle_bytes=b"not-the-pinned-bundle",
             ),
-            expected_bundle_digest="00" * 32,
+            pins=replace(bootstrap_pins, bundle_sha256="00" * 32),
         )
 
 
 def test_clock_is_checked_but_server_date_anchors_validity(
     bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
 ) -> None:
     inputs = replace(
         bootstrap_inputs,
@@ -781,9 +913,7 @@ def test_clock_is_checked_but_server_date_anchors_validity(
     )
     credentials = create_credentials(
         inputs,
-        expected_bundle_digest=hashlib.sha256(
-            inputs.bundle_bytes
-        ).hexdigest(),
+        pins=bootstrap_pins,
     )
     assert credentials.not_before == "2026-07-22T23:55:00+00:00"
     assert credentials.not_after == "2036-07-23T00:00:00+00:00"
@@ -791,6 +921,7 @@ def test_clock_is_checked_but_server_date_anchors_validity(
 
 def test_clock_outside_24_hours_is_rejected(
     bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
 ) -> None:
     inputs = replace(
         bootstrap_inputs,
@@ -800,29 +931,37 @@ def test_clock_outside_24_hours_is_rejected(
     with pytest.raises(BootstrapError, match="system clock"):
         create_credentials(
             inputs,
-            expected_bundle_digest=hashlib.sha256(
-                inputs.bundle_bytes
-            ).hexdigest(),
+            pins=bootstrap_pins,
         )
 
 
 def test_result_contains_no_universal_private_key(
     bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
 ) -> None:
     credentials = create_credentials(
         bootstrap_inputs,
-        expected_bundle_digest=hashlib.sha256(
-            bootstrap_inputs.bundle_bytes
-        ).hexdigest(),
+        pins=bootstrap_pins,
     )
     assert "UNIVERSAL TEST KEY" not in credentials.client_key_pem
     assert "UNIVERSAL TEST KEY" not in credentials.client_chain_pem
+
+
+def test_production_pins_are_the_approved_constants() -> None:
+    assert PRODUCTION_PINS == BootstrapPins.from_constants()
 ```
 
-The `bootstrap_inputs` fixture in `tests/conftest.py` generates an ephemeral
-four-certificate RSA chain, a matching universal test key, and a pinned
-synthetic identity leaf at test time. It returns `BootstrapInputs`; no Samsung
-certificate, shared UUID, or universal production key is committed.
+The `bootstrap_inputs` and `bootstrap_pins` fixtures in `tests/conftest.py`
+generate an ephemeral four-certificate RSA chain, a matching universal test
+key, and a pinned synthetic identity leaf at test time. They return
+`BootstrapInputs` and the exact SHA-256 values for those synthetic objects; no
+Samsung certificate, shared UUID, or universal production key is committed.
+
+In this same red step, add parametrized tests for malformed PEM, extra/missing
+blocks, wrong RSA modulus, invalid chain signature, wrong signing fingerprint,
+wrong identity leaf/SPKI, issuer/CN/OU mismatch, missing/malformed HTTP Date,
+invalid SHA-1 leaf extensions, and absence of the universal key from every
+serialized return value.
 
 - [ ] **Step 2: Run the bootstrap tests and observe the missing implementation**
 
@@ -850,10 +989,30 @@ class BootstrapInputs:
     local_now: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class BootstrapPins:
+    bundle_sha256: str
+    signing_sha256: str
+    identity_leaf_sha256: str
+    identity_spki_sha256: str
+
+    @classmethod
+    def from_constants(cls) -> BootstrapPins:
+        return cls(
+            bundle_sha256=BUNDLE_SHA256,
+            signing_sha256=REMOVED_SIGNING_DIGEST_NAME,
+            identity_leaf_sha256=SAMSUNG_IDENTITY_LEAF_SHA256,
+            identity_spki_sha256=SAMSUNG_IDENTITY_SPKI_SHA256,
+        )
+
+
+PRODUCTION_PINS = BootstrapPins.from_constants()
+
+
 def validate_bundle(
     data: bytes,
     *,
-    expected_digest: str = BUNDLE_SHA256,
+    pins: BootstrapPins = PRODUCTION_PINS,
 ) -> BundleMaterial:
     """Validate exact bytes, one key, four certs, key pair, chain, and REMOVED_IDENTITY."""
 
@@ -861,8 +1020,7 @@ def validate_bundle(
 def validate_identity_certificate(
     der: bytes,
     *,
-    expected_leaf: str = SAMSUNG_IDENTITY_LEAF_SHA256,
-    expected_spki: str = SAMSUNG_IDENTITY_SPKI_SHA256,
+    pins: BootstrapPins = PRODUCTION_PINS,
 ) -> str:
     """Validate leaf/SPKI/issuer/CN and return UUID from the subject OU."""
 
@@ -870,7 +1028,7 @@ def validate_identity_certificate(
 def create_credentials(
     inputs: BootstrapInputs,
     *,
-    expected_bundle_digest: str = BUNDLE_SHA256,
+    pins: BootstrapPins = PRODUCTION_PINS,
 ) -> Credentials:
     """Mint RSA-2048/SHA-1 leaf anchored to authenticated server Date."""
 ```
@@ -882,6 +1040,11 @@ for each public chain edge. Reject extra PEM blocks. Build the leaf with
 UUID subject/SAN values, `not_before = server_date - 5 minutes`, and
 `not_after = server_date + 10 years`. Serialize only the generated key, leaf,
 and required public chain.
+
+`create_credentials` composes `validate_bundle(inputs.bundle_bytes,
+pins=pins)`, `validate_identity_certificate(inputs.identity_der, pins=pins)`,
+clock validation, and leaf minting in that order. Production callers never pass
+the `pins` argument; only synthetic tests inject `bootstrap_pins`.
 
 - [ ] **Step 4: Implement bounded asynchronous fetches**
 
@@ -935,12 +1098,13 @@ git commit -m "feat: add pinned WindFree certificate bootstrap"
 
 **Files:**
 - Create: `custom_components/samsung_ac_windfree/transport.py`
+- Create: `tests/test_dependency_contract.py`
 - Create: `tests/test_transport.py`
 
 **Interfaces:**
 - Consumes: `Credentials`, port/rate/timeout constants.
 - Produces:
-  `WindFreeTransport.connect()`,
+  `WindFreeTransport.async_connect()`,
   `async_get(path)`,
   `async_post(path, payload)`,
   `async_observe(paths, callback)`,
@@ -956,6 +1120,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock
 
+import cbor2
 import pytest
 
 from custom_components.samsung_ac_windfree.transport import WindFreeTransport
@@ -965,7 +1130,7 @@ async def test_get_runs_blocking_session_in_executor(
     hass, credentials
 ) -> None:
     session = MagicMock()
-    session.get.return_value = (69, b"payload")
+    session.get.return_value = (69, cbor2.dumps({"value": "payload"}))
     transport = WindFreeTransport(
         hass,
         host="192.0.2.10",
@@ -974,14 +1139,14 @@ async def test_get_runs_blocking_session_in_executor(
         session_factory=lambda **_: session,
     )
     await transport.async_connect()
-    assert await transport.async_get("/oic/d") == b"payload"
-    session.get.assert_called_once_with(["oic", "d"])
+    assert await transport.async_get("/oic/d") == {"value": "payload"}
+    session.get.assert_called_once_with(("oic", "d"))
 
 
 async def test_old_generation_notification_is_ignored(
     hass, credentials
 ) -> None:
-    received: list[tuple[str, bytes]] = []
+    received: list[tuple[str, dict[str, object]]] = []
     transport = WindFreeTransport(
         hass,
         host="192.0.2.10",
@@ -994,7 +1159,7 @@ async def test_old_generation_notification_is_ignored(
         generation=1,
         target=lambda path, body: received.append((path, body)),
     )
-    callback("/power/vs/0", b"old")
+    callback("/power/vs/0", cbor2.dumps({"value": "old"}))
     await asyncio.sleep(0)
     assert received == []
 
@@ -1020,6 +1185,12 @@ async def test_error_does_not_expose_host_or_payload(
     assert "secret-payload" not in str(err.value)
 ```
 
+In this same red step, add tests for real in-memory PEM constructor arguments,
+two-RPS delegation, Block2 GET passthrough, OBSERVE registration/deregistration,
+all allowed fatal-alert codes, unknown-alert transience, sequential nine-port
+sweep, successful-session reuse, close/join deadlines, and no callback after
+close.
+
 - [ ] **Step 2: Run the tests and observe the missing transport**
 
 Run: `.venv/bin/pytest tests/test_transport.py -q`
@@ -1031,7 +1202,8 @@ Expected: collection fails because `transport.py` is absent.
 Implement:
 
 ```python
-NotificationCallback = Callable[[int, str, bytes], None]
+Representation = Mapping[str, object]
+NotificationCallback = Callable[[int, str, Representation], None]
 SessionFactory = Callable[..., DtlsCoapSession]
 
 
@@ -1049,8 +1221,12 @@ class WindFreeTransport:
     ) -> None: ...
 
     async def async_connect(self) -> None: ...
-    async def async_get(self, path: str) -> bytes: ...
-    async def async_post(self, path: str, payload: bytes) -> None: ...
+    async def async_get(self, path: str) -> Representation: ...
+    async def async_post(
+        self,
+        path: str,
+        payload: Representation,
+    ) -> None: ...
     async def async_observe(
         self,
         paths: tuple[str, ...],
@@ -1060,7 +1236,7 @@ class WindFreeTransport:
         self,
         *,
         generation: int,
-        target: Callable[[str, bytes], None],
+        target: Callable[[str, Representation], None],
     ) -> Callable[[str, bytes], None]: ...
     async def async_close(self) -> None: ...
 ```
@@ -1072,6 +1248,15 @@ Construct `DtlsCoapSession` with `cert_pem`, `key_pem`, the exact port, and
 bounded executor calls. Store the loop captured from Home Assistant and use
 `loop.call_soon_threadsafe`; drop callbacks whose generation does not equal the
 active generation or after close.
+
+`async_observe` wraps the dependency's raw two-argument `(path, payload_bytes)`
+callback with `threadsafe_callback`; only the wrapped event-loop callback adds
+the transport generation and calls the three-argument `NotificationCallback`.
+
+`WindFreeTransport` exclusively owns CBOR conversion: `async_get` and OBSERVE
+decode dependency-returned bytes with `cbor2.loads`, while `async_post` encodes
+the supplied representation with `cbor2.dumps`. Parser, coordinator, and entity
+layers never exchange raw CBOR bytes.
 
 - [ ] **Step 4: Implement exact-range discovery**
 
@@ -1092,17 +1277,74 @@ without host or port payload details.
 
 - [ ] **Step 5: Run transport tests**
 
-Run: `.venv/bin/pytest tests/test_transport.py -q`
+Add real-dependency tests in `tests/test_dependency_contract.py`:
+
+```python
+from __future__ import annotations
+
+import ssl
+
+from OpenSSL import SSL
+from smartthings_local.protocol.coap import (
+    ACCEPT,
+    BLOCK2,
+    CF_CBOR,
+    OBSERVE,
+    OBSERVE_REGISTER,
+    build_coap,
+    parse_coap,
+)
+from smartthings_local.protocol.dtls_session import _load_pem_chain
+
+
+def test_real_dependency_loads_sha1_chain_without_global_tls_change(
+    credentials,
+) -> None:
+    before = ssl.create_default_context().security_level
+    ctx = SSL.Context(SSL.DTLS_METHOD)
+    ctx.set_cipher_list(
+        b"ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0"
+    )
+    _load_pem_chain(
+        ctx,
+        credentials.client_chain_pem,
+        credentials.client_key_pem,
+    )
+    assert ssl.create_default_context().security_level == before
+
+
+def test_real_codec_preserves_observe_and_block2_options() -> None:
+    packet = build_coap(
+        0,
+        1,
+        0x1234,
+        b"\x41",
+        [
+            (OBSERVE, OBSERVE_REGISTER),
+            (ACCEPT, CF_CBOR),
+            (BLOCK2, b""),
+        ],
+    )
+    _, _, _, token, options, _ = parse_coap(packet)
+    assert token == b"\x41"
+    assert (OBSERVE, OBSERVE_REGISTER) in options
+    assert (BLOCK2, b"") in options
+```
+
+Run:
+`.venv/bin/pytest tests/test_transport.py
+tests/test_dependency_contract.py -q`
 
 Expected: lifecycle, in-memory PEM, two-RPS pacing delegation, Block2 passthrough,
 generation isolation, sequential sweep, cleanup, fatal-alert extraction, and
-redaction tests pass.
+redaction tests pass. The real dependency loads the synthetic SHA-1 chain and
+its codec contract passes without changing a fresh stdlib TLS context.
 
 - [ ] **Step 6: Commit transport**
 
 ```bash
 git add custom_components/samsung_ac_windfree/transport.py \
-  tests/test_transport.py
+  tests/test_transport.py tests/test_dependency_contract.py
 git commit -m "feat: add local DTLS CoAP transport"
 ```
 
@@ -1212,8 +1454,8 @@ class DeviceCommand:
 
 def parse_identity(
     oic_d: Mapping[str, object],
-    oic_p: Mapping[str, object] | None = None,
-    device_0: Mapping[str, object] | None = None,
+    oic_p: Mapping[str, object],
+    device_0: Mapping[str, object],
 ) -> DeviceIdentity: ...
 
 
@@ -1312,7 +1554,23 @@ async def test_three_failures_trigger_resweep(
     await coordinator.async_run_hot_cycle()
     await coordinator.async_run_hot_cycle()
     await coordinator.async_run_hot_cycle()
+    transport_factory.discover.assert_not_awaited()
+    transport_factory.reconnect.side_effect = ConnectionError
+    await coordinator.async_run_reconnect_attempt()
+    await coordinator.async_run_reconnect_attempt()
+    transport_factory.discover.assert_not_awaited()
+    await coordinator.async_run_reconnect_attempt()
     transport_factory.discover.assert_awaited_once()
+
+
+async def test_hot_failures_alone_never_resweep(
+    coordinator, transport_factory
+) -> None:
+    transport_factory.current.async_get.side_effect = TimeoutError
+    await coordinator.async_run_hot_cycle()
+    await coordinator.async_run_hot_cycle()
+    await coordinator.async_run_hot_cycle()
+    transport_factory.discover.assert_not_awaited()
 
 
 async def test_old_generation_observe_is_ignored(coordinator) -> None:
@@ -1320,7 +1578,7 @@ async def test_old_generation_observe_is_ignored(coordinator) -> None:
     coordinator.handle_observe(
         generation=coordinator.generation - 1,
         path="/power/vs/0",
-        payload=b"old",
+        representation={"x.com.samsung.da.power": "On"},
     )
     assert coordinator.data is before
 
@@ -1339,7 +1597,9 @@ async def test_changed_without_matching_readback_is_rejected(
     coordinator,
 ) -> None:
     coordinator.transport.async_post = AsyncMock(return_value=None)
-    coordinator.transport.async_get = AsyncMock(return_value=b"unchanged")
+    coordinator.transport.async_get = AsyncMock(
+        return_value={"x.com.samsung.da.power": "Off"}
+    )
     with pytest.raises(CommandRejected):
         await coordinator.async_command(CommandKind.POWER, True)
 ```
@@ -1364,17 +1624,33 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         port: int,
         credentials: Credentials,
         compatibility: Mapping[str, object],
-        transport_factory: TransportFactory = WindFreeTransport,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        transport_factory: TransportFactory = DefaultTransportFactory(),
     ) -> None: ...
 
     async def async_start(self) -> None: ...
     async def async_shutdown(self) -> None: ...
     async def async_reconcile(self) -> None: ...
+    async def async_run_hot_cycle(self) -> None: ...
+    async def async_run_reconnect_attempt(self) -> None: ...
     async def async_command(
         self,
         kind: CommandKind,
         value: object,
     ) -> None: ...
+    def handle_observe(
+        self,
+        generation: int,
+        path: str,
+        representation: Mapping[str, object],
+    ) -> None: ...
+
+    @property
+    def generation(self) -> int: ...
+
+    @property
+    def transport(self) -> WindFreeTransport: ...
 ```
 
 Start one transport generation, seed `/oic/d`, `/oic/p`, and `/device/0`,
@@ -1399,6 +1675,12 @@ and reconnect with 2–60 second exponential backoff. After three stored-port
 connection failures, call exact-range discovery. Require an allowed fatal DTLS
 alert or allowed CoAP authorization code to repeat on a fresh generation before
 raising `AuthenticationRejected`; all other errors remain transient.
+
+If three fresh generations authenticate successfully but each dies within ten
+seconds without an allowed fatal-auth signal, set the sanitized diagnostic
+reason `possible_competing_session`; continue normal backoff and never start
+reauth from that heuristic alone. Add a fake-clock test for this transition and
+for clearing the reason after a stable generation.
 
 - [ ] **Step 6: Implement serialized authoritative commands**
 
@@ -1452,6 +1734,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 from homeassistant import config_entries
+from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.samsung_ac_windfree.const import DOMAIN
 
@@ -1461,8 +1744,12 @@ async def test_user_flow_requires_only_host(hass) -> None:
         DOMAIN,
         context={"source": config_entries.SOURCE_USER},
     )
-    assert result["type"] is config_entries.FlowResultType.FORM
-    assert tuple(result["data_schema"].schema) == ("host",)
+    assert result["type"] is FlowResultType.FORM
+    schema_keys = {
+        marker.schema
+        for marker in result["data_schema"].schema
+    }
+    assert schema_keys == {"host"}
 
 
 async def test_success_uses_progress_then_creates_entry(
@@ -1478,15 +1765,22 @@ async def test_success_uses_progress_then_creates_entry(
             context={"source": config_entries.SOURCE_USER},
             data={"host": "ac.example.test"},
         )
-        assert result["type"] is config_entries.FlowResultType.PROGRESS
+        assert result["type"] is FlowResultType.PROGRESS
         await hass.async_block_till_done()
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"]
         )
-    assert result["type"] is config_entries.FlowResultType.CREATE_ENTRY
+    assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["host"] == "ac.example.test"
     assert "client_key_pem" in result["data"]
 ```
+
+In this same red step, add tests for DNS/fetch/sweep/read/overall timeouts,
+progress cancellation cleanup, duplicate abort, exact-model and capability
+rejection, reconfigure unique-ID mismatch, failed reauth preserving old
+credentials, successful atomic reauth, offline startup proving bootstrap is not
+called, certificate-expiry Repairs, expired-certificate reauth, setup/unload,
+reload, and version-1 migration.
 
 - [ ] **Step 2: Run config flow tests and observe missing flow**
 
@@ -1546,6 +1840,11 @@ Construct credentials and coordinator from entry data without bootstrap or
 internet. On repeated fatal auth, initiate reauth. Forward `PLATFORMS`; unload
 platforms then shut down coordinator. Add update listener for reload. Add
 versioned migration support starting at config-entry version `1`.
+
+Before constructing transport, parse the stored certificate validity dates.
+Create the expiry Repairs issue at 90 days; an already expired certificate
+starts reauth without attempting an infinite reconnect. This startup check uses
+stored data only and performs no device or internet I/O.
 
 - [ ] **Step 5: Run flow and lifecycle tests**
 
@@ -1631,6 +1930,10 @@ Expected: climate platform is absent.
 model, manufacturer Samsung, firmware, and platform. Never include UUID as
 serial or identifier beyond the required HA device identifier tuple.
 
+Unique IDs are fixed: the climate entity uses the bare OCF `device_id`; every
+additional entity uses `f"{device_id}_{entity_key}"`. The same OCF `device_id`
+is the HA device identifier value under the integration domain.
+
 `WindFreeClimate` implements:
 
 - `HVACMode.OFF/AUTO/COOL/DRY/FAN_ONLY/HEAT`
@@ -1690,19 +1993,30 @@ async def test_enabled_entity_inventory(hass, entity_registry) -> None:
         if not entry.disabled
     }
     assert enabled == {
-        "synthetic-device-auto_clean",
-        "synthetic-device-display_light",
-        "synthetic-device-filter_usage",
-        "synthetic-device-filter_status",
-        "synthetic-device-filter_attention",
-        "synthetic-device-energy_consumption",
-        "synthetic-device-problem",
-        "synthetic-device-active_alarm",
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000001_auto_clean",
+        "00000000-0000-4000-8000-000000000001_display_light",
+        "00000000-0000-4000-8000-000000000001_filter_usage",
+        "00000000-0000-4000-8000-000000000001_filter_status",
+        "00000000-0000-4000-8000-000000000001_filter_attention",
+        "00000000-0000-4000-8000-000000000001_energy_consumption",
+        "00000000-0000-4000-8000-000000000001_problem",
+        "00000000-0000-4000-8000-000000000001_active_alarm",
+    }
+    disabled = {
+        entry.unique_id
+        for entry in entity_registry.entities.values()
+        if entry.disabled
+    }
+    assert disabled == {
+        "00000000-0000-4000-8000-000000000001_current_limit_enabled",
+        "00000000-0000-4000-8000-000000000001_current_limit_level",
     }
 
 
 async def test_energy_is_total_increasing_kwh(hass, energy_entity) -> None:
-    state = hass.states[energy_entity]
+    state = hass.states.get(energy_entity)
+    assert state is not None
     assert state.state == "12.345"
     assert state.attributes["device_class"] == "energy"
     assert state.attributes["state_class"] == "total_increasing"
@@ -1938,6 +2252,12 @@ unofficial shared-identity warning, backup-key disclosure, entities and
 presets, polling/OBSERVE behavior, limitations, troubleshooting, reauth,
 certificate expiry, competing clients, and automation examples.
 
+Add a maintainer-only "Bootstrap source and pin maintenance" section describing
+how to move the unchanged digest-pinned bytes to a project-controlled HTTPS
+mirror, verify `BUNDLE_SHA256`, update only `BUNDLE_URL`, run bootstrap tests,
+and issue a release. It must forbid unpinned fallback mirrors and publishing the
+maintainer archive in Git.
+
 Use MIT license. Start changelog at `0.1.0` with all supported and explicitly
 excluded features. Fill `quality_scale.yaml` with every Bronze/Silver rule
 marked `done` or a specific justified exemption; do not claim an unimplemented
@@ -1966,8 +2286,8 @@ git commit -m "docs: document Samsung WindFree local integration"
 
 **Files:**
 - Create: `.github/workflows/ci.yml`
-- Modify: `requirements_test.txt`
 - Modify: `CHANGELOG.md`
+- Modify: `tests/fixtures/mode_compatibility.json`
 - Modify only if a verified defect is found: integration/test files from prior
   tasks.
 
@@ -1979,13 +2299,24 @@ git commit -m "docs: document Samsung WindFree local integration"
 
 Create jobs for:
 
-1. pytest on minimum HA `2026.5.0` and current stable
-2. pytest with next HA beta on a non-blocking scheduled canary
-3. resolved dependency closure capture
-4. Ruff format/check
-5. hassfest
-6. HACS integration validation
-7. scheduled Samsung leaf/SPKI pin canary that reports mismatch without
+1. Minimum pytest on x86-64 using `requirements_test_min.txt`, whose
+   `pytest-homeassistant-custom-component==0.13.333` pins HA `2026.5.4`
+2. Stable pytest on both `ubuntu-latest` x86-64 and
+   `ubuntu-24.04-arm` arm64 using `requirements_test.txt`, whose
+   `pytest-homeassistant-custom-component==0.13.347` pins HA `2026.7.3`
+3. A non-blocking scheduled beta canary that creates an isolated environment,
+   runs `pip install --pre --upgrade pytest-homeassistant-custom-component
+   smartthings-local==0.1.0 cbor2==6.1.3`, records the resolved HA version, and
+   runs the complete suite
+4. Resolved dependency closure capture in every pytest leg
+5. The real dependency contract test in every pytest leg
+6. A QEMU/buildx dependency-install and import smoke matrix for
+   `linux/amd64`, `linux/arm64`, and `linux/arm/v7`, the supported HA
+   architecture set for this release
+7. Ruff format/check
+8. hassfest
+9. HACS integration validation
+10. Scheduled Samsung leaf/SPKI pin canary that reports mismatch without
    committing or accepting new material
 
 Use Python 3.13, `actions/checkout@v4`, `actions/setup-python@v5`,
@@ -2037,7 +2368,15 @@ and HA-owned pyOpenSSL/cryptography versions matching the selected HA
 environment. Record hashes in the release artifact/check log, not in runtime
 diagnostics.
 
-- [ ] **Step 5: Complete the authorized live compatibility matrix**
+- [ ] **Step 5: Retain the bootstrap recovery artifact outside Git**
+
+Download the public bundle into the maintainer-controlled encrypted release
+archive, compute SHA-256, and require exact equality with `BUNDLE_SHA256`.
+Record only the digest and archive backup confirmation in the release check
+log. Run `git status --short` and verify the bundle bytes and universal key are
+not present anywhere in the worktree.
+
+- [ ] **Step 6: Complete the authorized live compatibility matrix**
 
 Using temporary credentials and probe files outside Git, capture original
 power, mode, target, fan, swing, preset, light, and auto-clean. Under `try/finally`
@@ -2047,7 +2386,7 @@ sanitized fixture to combinations that persist. Restore the exact captured
 state in `finally` and perform authoritative final reads. Stop and report if any
 original state cannot be restored.
 
-- [ ] **Step 6: Complete the Home Assistant live smoke gate**
+- [ ] **Step 7: Complete the Home Assistant live smoke gate**
 
 On the configured test HA instance:
 
@@ -2062,17 +2401,21 @@ On the configured test HA instance:
 9. Verify diagnostics contain no production identifiers.
 10. Restore exact AC state and firewall state.
 
-- [ ] **Step 7: Record release evidence and commit CI**
+- [ ] **Step 8: Record release evidence and commit CI**
 
 Add a `0.1.0` changelog verification note containing only counts and pass/fail
 results—no host, UUID, serial, payload, certificate, or alarm details.
 
 ```bash
-git add .github/workflows/ci.yml requirements_test.txt CHANGELOG.md
+git add .github/workflows/ci.yml CHANGELOG.md \
+  tests/fixtures/mode_compatibility.json
 git commit -m "ci: verify WindFree integration release"
 ```
 
-- [ ] **Step 8: Run final clean-tree verification**
+If the live matrix or a verified defect changed any additional tracked file,
+stage that exact file in this commit and list it in the commit body.
+
+- [ ] **Step 9: Run final clean-tree verification**
 
 Run:
 
