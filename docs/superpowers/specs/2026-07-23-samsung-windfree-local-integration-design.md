@@ -124,10 +124,12 @@ On the first setup:
    clock to be within 24 hours of it. The Samsung identity endpoint itself does
    not provide an HTTP response and is not used as a clock source. A missing or
    malformed bundle-response `Date` is a bootstrap failure rather than a reason
-   to mint a potentially invalid certificate. Backdate `notBefore` by five
-   minutes from the validated local time and mint a ten-year client leaf
-   certificate containing that UUID in the subject and SAN. Sign it with REMOVED_IDENTITY
-   using the legacy SHA-1 signature required by the device trust chain.
+   to mint a potentially invalid certificate. Set `notBefore` to the
+   authenticated bundle-response time minus five minutes and `notAfter` to that
+   same authenticated time plus ten years; the local clock is only a sanity
+   check and never anchors certificate validity. Mint the client leaf containing
+   that UUID in the subject and SAN, then sign it with REMOVED_IDENTITY using the legacy
+   SHA-1 signature required by the device trust chain.
 9. Sweep UDP ports `49152` through `49160`, establish authenticated DTLS, and
    require successful reads of `/oic/d`, `/oic/p`, and `/device/0`.
 10. Verify the device type, model, firmware family, and live capability
@@ -135,9 +137,13 @@ On the first setup:
 11. Only after local authentication and identity validation succeed, atomically
     persist the generated client private key, client certificate chain,
     discovered port, host, and sanitized identity metadata.
-12. Retain no universal CA key or downloaded bundle in configuration, files,
-    diagnostics, or backups. Python cannot promise secure zeroization of
-    transient in-memory buffers; the guarantee is non-persistence.
+12. Retain no universal CA private key and no bundle members except the public
+    intermediate certificates required in the presented client chain. Those
+    public chain certificates are intentionally persisted with the generated
+    leaf; the original combined bundle and unused members are absent from
+    configuration, files, diagnostics, and backups. Python cannot promise
+    secure zeroization of transient in-memory buffers; the private-key
+    guarantee is non-persistence.
 
 The bundle digest and Samsung identity-certificate pins are release-time
 security pins. Supporting changed bootstrap material requires a reviewed
@@ -348,7 +354,8 @@ Polling tiers:
 - Warm, every 30 seconds: humidity, energy, alarms, display light, and
   auto-clean
 - Cold, every 5 minutes: filter and current-limit diagnostics
-- Full `/device/0` reconciliation every 5 minutes
+- Full identity and capability reconciliation every 5 minutes:
+  `/oic/d`, `/oic/p`, and `/device/0`
 
 Polling requests are distributed through the two-request-per-second limiter
 rather than sent as a burst.
@@ -356,8 +363,8 @@ rather than sent as a burst.
 The steady-state polling budget is approximately 1.4 logical requests per
 second before OBSERVE deadline resets: six hot resources per five seconds,
 five warm resources per 30 seconds, two cold resources per five minutes, and
-one full reconciliation per five minutes. Block2 continuation datagrams,
-retries, and command verification consume the remaining headroom.
+three full-reconciliation resources per five minutes. Block2 continuation
+datagrams, retries, and command verification consume the remaining headroom.
 
 The scheduler staggers resource deadlines and uses this priority order:
 
@@ -487,6 +494,11 @@ HVAC mappings:
 | Fan | `HVACMode.FAN_ONLY` |
 | Heat | `HVACMode.HEAT` |
 
+`HVACMode.AUTO` writes the live-verified Samsung value `Auto`. Read-back
+verification treats Samsung `Auto` and `AI Auto` as one equivalent HA mode, so
+firmware normalization between those aliases is success rather than coercion.
+Other returned values still fail verification.
+
 The integration must use `HVACMode.AUTO`, not `HEAT_COOL`, because the official
 manual defines Auto as learned AI behavior rather than a user-controlled
 heating/cooling range.
@@ -596,7 +608,8 @@ User step:
 
 Validation:
 
-- Resolve and reach host
+- Resolve the host within five seconds; the authenticated DTLS sweep is the
+  reachability test
 - Show a cancellable progress step while performing the pinned one-time
   bootstrap, certificate generation, port sweep, and local validation
 - Sweep OCF ports
@@ -606,20 +619,20 @@ Validation:
   `AR60F12C1AWNEU`, and unsupported firmware/platform combinations
 - Set the OCF device identifier as the unique ID
 
-Every network operation has its own bounded timeout: 15 seconds for each HTTPS
-bootstrap fetch, 6 seconds for each of the nine DTLS sweep attempts, and
-8 seconds for an authenticated CoAP read. The successful swept session is
-reused for validation rather than handshaken twice; ordinary reconnects use the
-transport's 12-second handshake timeout. Port attempts are sequential and
-cancelled before the next begins. The setup worst-case base budget is therefore
-30 seconds for fetches, 54 seconds for the complete sweep, and 24 seconds for
-the three required identity reads, leaving 42 seconds inside the 150-second
-overall deadline for capability validation and cleanup. Cancellation closes
-sockets, stops executor work at its next bounded operation, retains no
-universal signing material, and returns no partial config entry. Failures are
-classified as bootstrap unavailable, pin mismatch, invalid clock, device
-unreachable, local authentication rejected, unsupported exact model, or
-capability mismatch.
+Every network operation has its own bounded timeout: 5 seconds for host
+resolution, 15 seconds for each HTTPS bootstrap fetch, 6 seconds for each of the
+nine DTLS sweep attempts, and 8 seconds for an authenticated CoAP read. The
+successful swept session is reused for validation rather than handshaken twice;
+ordinary reconnects use the transport's 12-second handshake timeout. Port
+attempts are sequential and cancelled before the next begins. The setup
+worst-case base budget is therefore 5 seconds for resolution, 30 seconds for
+fetches, 54 seconds for the complete sweep, and 24 seconds for the three
+required identity reads, leaving 37 seconds inside the 150-second overall
+deadline for capability validation and cleanup. Cancellation closes sockets,
+stops executor work at its next bounded operation, retains no universal signing
+material, and returns no partial config entry. Failures are classified as
+bootstrap unavailable, pin mismatch, invalid clock, device unreachable, local
+authentication rejected, unsupported exact model, or capability mismatch.
 
 Reconfigure:
 
@@ -724,17 +737,19 @@ Required test groups:
 
 - Bootstrap download pin, source outage, malformed bundles, wrong key, wrong
   chain, subject-OU UUID extraction, bundle HTTPS Date clock validation,
-  backdated in-memory leaf generation, non-persistence of the universal key,
-  atomic credential replacement, periodic pin canary, and certificate-expiry
-  Repairs
+  server-time-anchored leaf validity, persistence of only required public
+  intermediates, non-persistence of the universal private key, atomic
+  credential replacement, periodic pin canary, and certificate-expiry Repairs
 - Config flow success and all failure branches
-- Config-flow progress, per-operation/overall timeout arithmetic, reuse of the
-  successful swept session, and cancellation cleanup
+- Config-flow progress, DNS/fetch/sweep/read and overall timeout arithmetic,
+  reuse of the successful swept session, and cancellation cleanup
 - Unsupported device, exact-model, and firmware-family rejection
 - Exact consumer-model rejection even when the firmware prefix matches
 - Duplicate detection, reconfigure, and reauthentication
 - Coordinator polling tiers, OBSERVE merges, generation isolation, reconnects,
   cancellation, and unload
+- Five-minute `/oic/d`, `/oic/p`, and `/device/0` identity/capability
+  reconciliation
 - Stored-port failure followed by automatic verified-range rediscovery
 - Transient DTLS failure versus repeatable post-handshake authorization failure
 - Poll-budget, priority, staggering, Block2 admission bounds, and hot-resource
@@ -744,6 +759,7 @@ Required test groups:
 - Off-to-mode sequencing and partial-failure reconciliation
 - Mode write and authoritative read-back while power is Off
 - All HVAC, fan, airflow, and preset mappings
+- Canonical `Auto` write and `Auto`/`AI Auto` read-back equivalence
 - The live-verified HVAC-mode/control compatibility matrix and rejection of
   unverified combinations without device I/O
 - Verified command success, coercion, timeout, and related-resource refresh
