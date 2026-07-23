@@ -131,19 +131,27 @@ Each task extends `tests/conftest.py` only with the fixtures assigned here:
   `connect/start_reader/get/post/subscribe/close/join` method shapes and records
   calls. Its GET values are `(69, encoded_resources[path])`; POST returns
   `(68, b"")`.
-- `TransportFactoryStub.current` is the current `AsyncMock` transport and
+- `TransportFactoryStub.current` is the current `AsyncMock` transport,
   `TransportFactoryStub.discover` is an `AsyncMock` returning a replacement
-  `(port, transport)` pair.
+  `(port, transport)` pair, and `TransportFactoryStub.reconnect` is an
+  `AsyncMock` returning a replacement transport on the existing port.
+- `transport_factory` is the pytest fixture that returns the shared
+  `TransportFactoryStub`.
 - `coordinator` constructs `WindFreeCoordinator` with `ManualClock.monotonic`,
   `ManualClock.sleep`, `TransportFactoryStub`, synthetic credentials, and the
   compatibility fixture, then seeds it with the exact identity/state fixtures.
+- `command_mock: AsyncMock` replaces `coordinator.async_command` in platform
+  setup so command assertions do not depend on a real transport round trip.
 - `validated_setup` contains the synthetic host, port `49154`, exact supported
   identity, and synthetic credentials.
 - `config_entry` is `MockConfigEntry` version `1` with `validated_setup` data
   and the synthetic device UUID as unique ID.
-- `climate_entity` and `energy_entity` are returned after adding `config_entry`,
-  patching coordinator construction to return the shared coordinator, calling
-  `async_setup`, and blocking until all platforms finish.
+- `setup_integration` adds `config_entry`, assigns the shared coordinator to
+  `config_entry.runtime_data`, patches coordinator construction to return that
+  coordinator, calls `async_setup`, and blocks until every forwarded platform
+  finishes.
+- `climate_entity` and `energy_entity` depend on `setup_integration` and return
+  the resulting entity IDs.
 
 Use this exact protocol for injected factories:
 
@@ -374,8 +382,6 @@ from __future__ import annotations
 
 import pytest
 
-pytest_plugins = ["pytest_homeassistant_custom_component"]
-
 
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations):
@@ -544,10 +550,10 @@ Expected: collection fails because `models.py` is absent.
 # custom_components/samsung_ac_windfree/models.py
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Mapping
 
 
 class WindFreeError(Exception):
@@ -1069,7 +1075,7 @@ async def async_bootstrap_credentials(
     """Run both bounded fetches and CPU certificate work in the executor."""
 ```
 
-The bundle fetch uses `async_timeout.timeout(HTTPS_TIMEOUT)`. The identity fetch
+The bundle fetch uses `asyncio.timeout(HTTPS_TIMEOUT)`. The identity fetch
 uses a socket timeout of `HTTPS_TIMEOUT`, SNI, `CERT_NONE`, and returns only DER.
 Neither helper logs URL response bodies, certificate details, UUID, or host
 addresses. Translate all failures into the fixed sanitized categories:
@@ -1808,7 +1814,7 @@ async def async_validate_setup(
     """Resolve in 5 s, bootstrap, sweep, read identity, validate contract."""
 ```
 
-Wrap the complete coroutine in `async_timeout.timeout(SETUP_TIMEOUT)`. Use an
+Wrap the complete coroutine in `asyncio.timeout(SETUP_TIMEOUT)`. Use an
 HA progress step and cancellation flag. Budget DNS 5, HTTPS 30, sweep 54, and
 identity reads 24 seconds; reuse the successful swept session. Map only the
 specified sanitized error keys.
@@ -1891,7 +1897,7 @@ from custom_components.samsung_ac_windfree.models import HvacMode
 
 async def test_climate_exposes_local_state(hass, climate_entity) -> None:
     state = hass.states.get(climate_entity)
-    assert state.state == HVACMode.COOL
+    assert state.state == HVACMode.OFF
     assert state.attributes["current_temperature"] == 26
     assert state.attributes["temperature"] == 26
     assert state.attributes["current_humidity"] == 36
@@ -1904,7 +1910,7 @@ async def test_climate_exposes_local_state(hass, climate_entity) -> None:
 
 
 async def test_setting_heat_while_off_uses_one_logical_command(
-    hass, climate_entity, coordinator
+    hass, climate_entity, command_mock
 ) -> None:
     await hass.services.async_call(
         "climate",
@@ -1912,7 +1918,7 @@ async def test_setting_heat_while_off_uses_one_logical_command(
         {"entity_id": climate_entity, "hvac_mode": HVACMode.HEAT},
         blocking=True,
     )
-    coordinator.async_command.assert_awaited_once_with(
+    command_mock.assert_awaited_once_with(
         CommandKind.HVAC_MODE,
         HvacMode.HEAT,
     )
@@ -1986,7 +1992,9 @@ git commit -m "feat: expose WindFree climate controls"
 - [ ] **Step 1: Add failing entity inventory and semantics tests**
 
 ```python
-async def test_enabled_entity_inventory(hass, entity_registry) -> None:
+async def test_enabled_entity_inventory(
+    hass, entity_registry, setup_integration
+) -> None:
     enabled = {
         entry.unique_id
         for entry in entity_registry.entities.values()
@@ -2106,7 +2114,7 @@ from custom_components.samsung_ac_windfree.diagnostics import (
 
 
 async def test_diagnostics_are_allowlisted_and_zero_io(
-    hass, config_entry, coordinator
+    hass, config_entry, coordinator, setup_integration
 ) -> None:
     coordinator.transport.async_get.reset_mock()
     result = await async_get_config_entry_diagnostics(hass, config_entry)
@@ -2124,7 +2132,7 @@ async def test_diagnostics_are_allowlisted_and_zero_io(
 
 
 async def test_adversarial_secrets_do_not_escape(
-    hass, config_entry, coordinator
+    hass, config_entry, coordinator, setup_integration
 ) -> None:
     secrets = (
         "192.0.2.10",
@@ -2311,8 +2319,8 @@ Create jobs for:
 4. Resolved dependency closure capture in every pytest leg
 5. The real dependency contract test in every pytest leg
 6. A QEMU/buildx dependency-install and import smoke matrix for
-   `linux/amd64`, `linux/arm64`, and `linux/arm/v7`, the supported HA
-   architecture set for this release
+   `linux/amd64` and `linux/arm64`, the supported HA architecture set for this
+   release
 7. Ruff format/check
 8. hassfest
 9. HACS integration validation
