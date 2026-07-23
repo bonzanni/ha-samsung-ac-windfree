@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import cbor2
 from homeassistant.core import HomeAssistant
+from OpenSSL import SSL
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 from .const import (
@@ -23,14 +23,13 @@ from .const import (
 from .models import Credentials
 
 _LOGGER = logging.getLogger(__name__)
+_DEPENDENCY_LOGGER = "smartthings_local.protocol.dtls_session"
 
 _GET_CONTENT = 69
 _POST_CHANGED = 68
 _CLOSE_TIMEOUT = COAP_READ_TIMEOUT
 _REQUEST_INTERVAL = 1.0 / RATE_LIMIT_RPS
-_ALERT_CODE_PATTERN = re.compile(
-    r"\balert(?:\s+(?:number|code|description))?[\s:=_-]+(\d{1,3})\b"
-)
+_MAX_CBOR_PAYLOAD = 64 * 1024
 _FATAL_ALERTS_BY_CODE = {
     42: "bad_certificate",
     43: "unsupported_certificate",
@@ -38,6 +37,16 @@ _FATAL_ALERTS_BY_CODE = {
     46: "certificate_unknown",
     48: "unknown_ca",
     49: "access_denied",
+}
+_FATAL_ALERT_REASONS = {
+    reason: alert
+    for code, alert in _FATAL_ALERTS_BY_CODE.items()
+    for reason in (
+        f"tlsv1 alert {alert.replace('_', ' ')}",
+        f"sslv3 alert {alert.replace('_', ' ')}",
+        f"tlsv1 alert number {code}",
+        f"sslv3 alert number {code}",
+    )
 }
 
 Representation = Mapping[str, object]
@@ -61,75 +70,104 @@ class TransportError(ConnectionError):
         super().__init__(f"{operation}: local transport operation failed")
 
 
+class _DependencyLogFilter(logging.Filter):
+    """Replace exact dependency records before manifest-enabled propagation."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = f"WindFree DTLS dependency {record.levelname.lower()}"
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        return True
+
+
+def _install_dependency_log_filter() -> None:
+    logger = logging.getLogger(_DEPENDENCY_LOGGER)
+    if not any(isinstance(item, _DependencyLogFilter) for item in logger.filters):
+        logger.addFilter(_DependencyLogFilter())
+
+
+_install_dependency_log_filter()
+
+
 @dataclass(frozen=True, slots=True)
 class _CallFailure:
     fatal_alert: str | None
 
 
-def _error_texts(error: BaseException) -> tuple[str, ...]:
-    texts: list[str] = []
-    pending: list[object] = [error]
-    seen: set[int] = set()
-    while pending:
-        item = pending.pop()
-        identity = id(item)
-        if identity in seen:
+def _extract_ssl_alert(error: SSL.Error) -> str | None:
+    if len(error.args) != 1 or not isinstance(error.args[0], list):
+        return None
+    for record in error.args[0]:
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 3
+            or not all(isinstance(item, str) for item in record)
+        ):
             continue
-        seen.add(identity)
-        if isinstance(item, BaseException):
-            pending.extend(item.args)
-            if item.__cause__ is not None:
-                pending.append(item.__cause__)
-            if item.__context__ is not None:
-                pending.append(item.__context__)
-        elif isinstance(item, tuple | list):
-            pending.extend(item)
-        elif isinstance(item, str):
-            texts.append(item.lower())
-    return tuple(texts)
+        reason = record[2].lower()
+        alert = _FATAL_ALERT_REASONS.get(reason)
+        if alert is not None:
+            return alert
+    return None
 
 
 def _extract_fatal_alert(error: BaseException) -> str | None:
-    for text in _error_texts(error):
-        match = _ALERT_CODE_PATTERN.search(text)
-        if match is not None:
-            alert = _FATAL_ALERTS_BY_CODE.get(int(match.group(1)))
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, SSL.Error):
+            alert = _extract_ssl_alert(current)
             if alert is not None:
                 return alert
-        for alert in _FATAL_ALERTS_BY_CODE.values():
-            phrase = alert.replace("_", r"[\s_-]+")
-            if re.search(rf"\balert\b[^,\])]*\b{phrase}\b", text):
-                return alert
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
     return None
 
 
 def _build_session(
     factory: SessionFactory,
-    *,
     host: str,
     port: int,
     credentials: Credentials,
+    handshake_timeout: float,
 ) -> DtlsCoapSession | _CallFailure:
     try:
-        return factory(
+        session = factory(
             host=host,
             port=port,
             cert_pem=credentials.client_chain_pem,
             key_pem=credentials.client_key_pem,
             rate_limit_rps=RATE_LIMIT_RPS,
         )
+        session.HANDSHAKE_TIMEOUT_S = handshake_timeout
+        return session
     except Exception as error:
         fatal_alert = _extract_fatal_alert(error)
         error = None
         return _CallFailure(fatal_alert)
 
 
+def _is_representation(value: object) -> bool:
+    return isinstance(value, Mapping) and all(isinstance(key, str) for key in value)
+
+
 def _decode_representation(payload: bytes) -> Representation | _CallFailure:
+    if len(payload) > _MAX_CBOR_PAYLOAD:
+        return _CallFailure(None)
     try:
         decoded = cbor2.loads(payload)
     except Exception:
         return _CallFailure(None)
-    if not isinstance(decoded, Mapping):
+    if not _is_representation(decoded):
         return _CallFailure(None)
     return decoded
 
@@ -137,61 +175,69 @@ def _decode_representation(payload: bytes) -> Representation | _CallFailure:
 def _encode_representation(
     representation: Representation,
 ) -> bytes | _CallFailure:
+    if not _is_representation(representation):
+        return _CallFailure(None)
     try:
-        return cbor2.dumps(representation)
+        encoded = cbor2.dumps(representation)
     except Exception:
         return _CallFailure(None)
+    if len(encoded) > _MAX_CBOR_PAYLOAD:
+        return _CallFailure(None)
+    return encoded
 
 
-def _consume_executor_result(future: asyncio.Future[object]) -> None:
-    if future.cancelled():
-        return
-    try:
-        future.exception()
-    except asyncio.CancelledError:
-        return
+def _redacted_target() -> None:
+    """Replace sensitive callable locals before cancellation escapes."""
 
 
 async def _await_executor[T](
     hass: HomeAssistant,
     target: Callable[..., T],
     *args: object,
-    deadline: float | None = None,
 ) -> T:
     job = asyncio.ensure_future(hass.async_add_executor_job(target, *args))
     try:
-        if deadline is None:
-            return await asyncio.shield(job)
-        return await asyncio.wait_for(asyncio.shield(job), deadline)
+        return await asyncio.shield(job)
     except asyncio.CancelledError:
         try:
-            if deadline is None:
-                await asyncio.shield(job)
-            else:
-                async with asyncio.timeout(deadline):
-                    await asyncio.shield(job)
+            await asyncio.shield(job)
         except Exception:
             pass
+        target = _redacted_target
+        args = ()
         raise
-    finally:
-        if not job.done():
-            job.add_done_callback(_consume_executor_result)
 
 
 async def _executor_outcome[T](
     hass: HomeAssistant,
     target: Callable[..., T],
     *args: object,
-    deadline: float | None = None,
 ) -> T | _CallFailure:
     try:
-        return await _await_executor(hass, target, *args, deadline=deadline)
+        return await _await_executor(hass, target, *args)
     except asyncio.CancelledError:
+        target = _redacted_target
+        args = ()
         raise
     except Exception as error:
         fatal_alert = _extract_fatal_alert(error)
         error = None
         return _CallFailure(fatal_alert)
+
+
+def _close_and_join(session: DtlsCoapSession) -> _CallFailure | None:
+    failed = False
+    try:
+        session.close()
+    except Exception:
+        failed = True
+    try:
+        session.join()
+    except Exception:
+        failed = True
+    if failed:
+        return _CallFailure(None)
+    return None
 
 
 class WindFreeTransport:
@@ -217,63 +263,87 @@ class WindFreeTransport:
         self._handshake_timeout = handshake_timeout
         self._session_factory = session_factory
         self._session: DtlsCoapSession | None = None
+        self._cleanup_task: asyncio.Task[_CallFailure | None] | None = None
         self._connected = False
         self._closed = False
         self._last_request_at: float | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
 
+    async def _async_build_session(self) -> DtlsCoapSession | _CallFailure:
+        credentials = self._credentials
+        self._credentials = None
+        if credentials is None:
+            return _CallFailure(None)
+        try:
+            return await _executor_outcome(
+                self._hass,
+                _build_session,
+                self._session_factory,
+                self._host,
+                self._port,
+                credentials,
+                self._handshake_timeout,
+            )
+        finally:
+            credentials = None
+
     async def async_connect(self) -> None:
         """Construct, connect, and start exactly one blocking session."""
-        async with self._lifecycle_lock:
-            if self._closed:
-                raise TransportError("transport_closed")
-            if self._connected:
-                return
-            credentials = self._credentials
-            if credentials is None:
-                raise TransportError("transport_connect_failed")
-            built = _build_session(
-                self._session_factory,
-                host=self._host,
-                port=self._port,
-                credentials=credentials,
-            )
-            self._credentials = None
-            if isinstance(built, _CallFailure):
-                raise TransportError(
-                    "transport_connect_failed",
-                    fatal_alert=built.fatal_alert,
-                )
-            session = built
-            self._session = session
-            session.HANDSHAKE_TIMEOUT_S = self._handshake_timeout
-            try:
-                connected = await _executor_outcome(self._hass, session.connect)
-                if isinstance(connected, _CallFailure):
-                    await self._cleanup_session(session)
-                    self._session = None
-                    raise TransportError(
-                        "transport_connect_failed",
-                        fatal_alert=connected.fatal_alert,
-                    )
+        failure: TransportError | None = None
+        try:
+            async with self._lifecycle_lock:
                 if self._closed:
-                    await self._cleanup_session(session)
-                    self._session = None
                     raise TransportError("transport_closed")
-                reader = await _executor_outcome(self._hass, session.start_reader)
-                if isinstance(reader, _CallFailure):
-                    await self._cleanup_session(session)
-                    self._session = None
-                    raise TransportError(
+                if self._connected:
+                    return
+                built = await self._async_build_session()
+                if isinstance(built, _CallFailure):
+                    failure = TransportError(
                         "transport_connect_failed",
-                        fatal_alert=reader.fatal_alert,
+                        fatal_alert=built.fatal_alert,
                     )
-            except asyncio.CancelledError:
-                await self._cleanup_session(session)
-                self._session = None
-                raise
-            self._connected = True
+                else:
+                    session = built
+                    self._session = session
+                    connected = await _executor_outcome(
+                        self._hass,
+                        session.connect,
+                    )
+                    if isinstance(connected, _CallFailure):
+                        failure = TransportError(
+                            "transport_connect_failed",
+                            fatal_alert=connected.fatal_alert,
+                        )
+                    elif self._closed:
+                        failure = TransportError("transport_closed")
+                    else:
+                        reader = await _executor_outcome(
+                            self._hass,
+                            session.start_reader,
+                        )
+                        if isinstance(reader, _CallFailure):
+                            failure = TransportError(
+                                "transport_connect_failed",
+                                fatal_alert=reader.fatal_alert,
+                            )
+                        else:
+                            self._connected = True
+                            return
+        except asyncio.CancelledError:
+            self._closed = True
+            cleanup = self._ensure_cleanup_task()
+            if cleanup is not None:
+                await self._wait_for_cleanup(cleanup)
+            raise
+
+        if failure is None:
+            failure = TransportError("transport_connect_failed")
+        self._closed = True
+        cleanup = self._ensure_cleanup_task()
+        if cleanup is not None:
+            await self._wait_for_cleanup(cleanup)
+        raise failure
 
     async def _pace_request(self) -> None:
         now = time.monotonic()
@@ -281,45 +351,46 @@ class WindFreeTransport:
             delay = _REQUEST_INTERVAL - (now - self._last_request_at)
             if delay > 0:
                 await asyncio.sleep(delay)
-                now = time.monotonic()
-        self._last_request_at = now
 
     def _require_session(self) -> DtlsCoapSession:
         if self._closed or not self._connected or self._session is None:
             raise TransportError("transport_not_connected")
         return self._session
 
-    async def _request[T](
+    async def _request_outcome[T](
         self,
-        operation: str,
         target: Callable[..., T],
         *args: object,
-    ) -> T:
+    ) -> T | _CallFailure:
         async with self._request_lock:
-            self._require_session()
-            await self._pace_request()
-            outcome = await _executor_outcome(self._hass, target, *args)
-        if isinstance(outcome, _CallFailure):
-            raise TransportError(
-                operation,
-                fatal_alert=outcome.fatal_alert,
-            )
-        return outcome
+            try:
+                self._require_session()
+                await self._pace_request()
+                return await _executor_outcome(self._hass, target, *args)
+            finally:
+                self._last_request_at = time.monotonic()
 
     async def async_get(self, path: str) -> Representation:
         """Read and decode one complete dependency-owned Block2 response."""
+        segments = _path_segments(path)
+        path = ""
         session = self._require_session()
-        code, payload = await self._request(
-            "transport_get_failed",
-            session.get,
-            _path_segments(path),
-        )
+        outcome = await self._request_outcome(session.get, segments)
+        if isinstance(outcome, _CallFailure):
+            raise TransportError(
+                "transport_get_failed",
+                fatal_alert=outcome.fatal_alert,
+            )
+        code, payload = outcome
+        outcome = None
         if code != _GET_CONTENT:
+            payload = b""
             raise TransportError(
                 "transport_get_rejected",
                 coap_code=code,
             )
         representation = _decode_representation(payload)
+        payload = b""
         if isinstance(representation, _CallFailure):
             raise TransportError("transport_get_invalid_response")
         return representation
@@ -330,16 +401,27 @@ class WindFreeTransport:
         payload: Representation,
     ) -> None:
         """Encode and post one representation, requiring CoAP 2.04."""
+        segments = _path_segments(path)
+        path = ""
         encoded = _encode_representation(payload)
+        payload = {}
         if isinstance(encoded, _CallFailure):
             raise TransportError("transport_post_invalid_payload")
         session = self._require_session()
-        code, _response = await self._request(
-            "transport_post_failed",
+        outcome = await self._request_outcome(
             session.post,
-            _path_segments(path),
+            segments,
             encoded,
         )
+        encoded = b""
+        if isinstance(outcome, _CallFailure):
+            raise TransportError(
+                "transport_post_failed",
+                fatal_alert=outcome.fatal_alert,
+            )
+        code, response = outcome
+        outcome = None
+        del response
         if code != _POST_CHANGED:
             raise TransportError(
                 "transport_post_rejected",
@@ -362,11 +444,14 @@ class WindFreeTransport:
             target=deliver,
         )
         for path in paths:
-            await self._request(
-                "transport_observe_failed",
-                session.subscribe,
-                _path_segments(path),
-            )
+            segments = _path_segments(path)
+            path = ""
+            outcome = await self._request_outcome(session.subscribe, segments)
+            if isinstance(outcome, _CallFailure):
+                raise TransportError(
+                    "transport_observe_failed",
+                    fatal_alert=outcome.fatal_alert,
+                )
 
     def threadsafe_callback(
         self,
@@ -379,13 +464,18 @@ class WindFreeTransport:
         def callback(path: str, payload: bytes) -> None:
             if self._closed or generation != self._generation:
                 return
+            representation = _decode_representation(payload)
+            payload = b""
+            if isinstance(representation, _CallFailure):
+                _LOGGER.warning("Dropped invalid WindFree notification")
+                return
             try:
                 self._loop.call_soon_threadsafe(
                     self._deliver_notification,
                     generation,
                     target,
                     path,
-                    payload,
+                    representation,
                 )
             except RuntimeError:
                 return
@@ -397,61 +487,99 @@ class WindFreeTransport:
         generation: int,
         target: Callable[[str, Representation], None],
         path: str,
-        payload: bytes,
+        representation: Representation,
     ) -> None:
         if self._closed or generation != self._generation:
-            return
-        representation = _decode_representation(payload)
-        if isinstance(representation, _CallFailure):
-            _LOGGER.warning("Dropped invalid WindFree notification")
             return
         try:
             target(path, representation)
         except Exception:
             _LOGGER.warning("Dropped failed WindFree notification callback")
 
-    async def _cleanup_session(self, session: DtlsCoapSession) -> None:
-        try:
-            close = await _executor_outcome(
-                self._hass,
-                session.close,
-                deadline=_CLOSE_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            joined = await _executor_outcome(
-                self._hass,
-                session.join,
-                deadline=_CLOSE_TIMEOUT,
-            )
-            if isinstance(joined, _CallFailure):
-                _LOGGER.warning("WindFree transport reader did not stop cleanly")
-            raise
-        if isinstance(close, _CallFailure):
-            _LOGGER.warning("WindFree transport close did not complete cleanly")
-        joined = await _executor_outcome(
-            self._hass,
-            session.join,
-            deadline=_CLOSE_TIMEOUT,
-        )
-        if isinstance(joined, _CallFailure):
-            _LOGGER.warning("WindFree transport reader did not stop cleanly")
-
-    async def async_close(self) -> None:
-        """Deregister observations and tear down the blocking session."""
-        self._closed = True
+    async def _run_cleanup(
+        self,
+        session: DtlsCoapSession,
+    ) -> _CallFailure | None:
         async with self._lifecycle_lock:
             async with self._request_lock:
-                session = self._session
-                self._session = None
-                self._connected = False
-                if session is None:
-                    return
-                session.on_notification = None
-                await self._cleanup_session(session)
+                outcome = await _executor_outcome(
+                    self._hass,
+                    _close_and_join,
+                    session,
+                )
+                if isinstance(outcome, _CallFailure):
+                    _LOGGER.warning(
+                        "WindFree transport cleanup did not complete cleanly"
+                    )
+                    return outcome
+                return None
+
+    def _cleanup_done(
+        self,
+        task: asyncio.Task[_CallFailure | None],
+        session: DtlsCoapSession,
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            _LOGGER.warning("WindFree transport cleanup was interrupted")
+        except Exception:
+            _LOGGER.warning("WindFree transport cleanup did not complete")
+        if self._session is session:
+            self._session = None
+        self._connected = False
+        if self._cleanup_task is task:
+            self._cleanup_task = None
+
+    def _ensure_cleanup_task(
+        self,
+    ) -> asyncio.Task[_CallFailure | None] | None:
+        if self._cleanup_task is not None:
+            return self._cleanup_task
+        session = self._session
+        if session is None:
+            return None
+        session.on_notification = None
+        task = self._loop.create_task(self._run_cleanup(session))
+        self._cleanup_task = task
+        task.add_done_callback(lambda completed: self._cleanup_done(completed, session))
+        return task
+
+    async def _wait_for_cleanup(
+        self,
+        task: asyncio.Task[_CallFailure | None],
+    ) -> None:
+        deadline = self._loop.time() + _CLOSE_TIMEOUT
+        try:
+            async with asyncio.timeout_at(deadline):
+                await asyncio.shield(task)
+        except TimeoutError:
+            return
+        except asyncio.CancelledError:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.shield(task)
+            except TimeoutError:
+                pass
+            raise
+
+    async def async_close(self) -> None:
+        """Start or observe one retained, bounded session cleanup."""
+        self._closed = True
+        cleanup = self._ensure_cleanup_task()
+        if cleanup is not None:
+            await self._wait_for_cleanup(cleanup)
 
 
 def _path_segments(path: str) -> tuple[str, ...]:
     return tuple(segment for segment in path.split("/") if segment)
+
+
+def _validate_probe_ports(ports: tuple[int, ...]) -> None:
+    if any(type(port) is not int or port not in PROBE_PORTS for port in ports):
+        raise ValueError(
+            "transport_discovery_invalid_ports: ports are outside the safe range"
+        )
 
 
 async def async_discover_transport(
@@ -461,7 +589,8 @@ async def async_discover_transport(
     *,
     ports: tuple[int, ...] = PROBE_PORTS,
 ) -> tuple[int, WindFreeTransport]:
-    """Sequentially probe nine ports and return the first authenticated one."""
+    """Sequentially probe a safe-range subset and return the first session."""
+    _validate_probe_ports(ports)
     for port in ports:
         candidate = WindFreeTransport(
             hass,
@@ -475,6 +604,11 @@ async def async_discover_transport(
         except asyncio.CancelledError:
             await candidate.async_close()
             raise
+        except TransportError as error:
+            await candidate.async_close()
+            if error.fatal_alert is not None:
+                raise
+            continue
         except Exception:
             await candidate.async_close()
             continue

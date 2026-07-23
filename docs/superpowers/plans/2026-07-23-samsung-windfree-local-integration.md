@@ -1280,8 +1280,9 @@ async def test_error_does_not_expose_host_or_payload(
 In this same red step, add tests for real in-memory PEM constructor arguments,
 two-RPS delegation, Block2 GET passthrough, OBSERVE registration/deregistration,
 all allowed fatal-alert codes, unknown-alert transience, sequential nine-port
-sweep, successful-session reuse, close/join deadlines, and no callback after
-close.
+sweep, successful-session reuse, retained close/join cleanup across timeout and
+cancellation, exact dependency-log redaction, bounded CBOR validation, safe port
+subsets, and no callback after close.
 
 - [ ] **Step 2: Run the tests and observe the missing transport**
 
@@ -1336,19 +1337,34 @@ class WindFreeTransport:
 Construct `DtlsCoapSession` with `cert_pem`, `key_pem`, the exact port, and
 `rate_limit_rps=RATE_LIMIT_RPS`. Convert paths with
 `tuple(segment for segment in path.split("/") if segment)`. Treat only CoAP
-`2.05` as GET success and `2.04` as POST acknowledgement. Close and join with
-bounded executor calls. Store the loop captured from Home Assistant and use
-`loop.call_soon_threadsafe`; drop callbacks whose generation does not equal the
-active generation or after close.
+`2.05` as GET success and `2.04` as POST acknowledgement. Run the constructor
+and every blocking method in Home Assistant's executor. Close and join
+sequentially in one retained cleanup task per session; `async_close()` shields
+that task under one total deadline, while timeout and cancellation leave the
+task and session owned until cleanup really completes. Store the loop captured
+from Home Assistant and use `loop.call_soon_threadsafe`; drop callbacks whose
+generation does not equal the active generation or after close.
 
 `async_observe` wraps the dependency's raw two-argument `(path, payload_bytes)`
-callback with `threadsafe_callback`; only the wrapped event-loop callback adds
-the transport generation and calls the three-argument `NotificationCallback`.
+callback with `threadsafe_callback`. Validate size, decode CBOR, and require a
+top-level string-keyed mapping on the reader thread before scheduling; no raw
+bytes cross into the event loop. Only the wrapped event-loop callback adds the
+transport generation and calls the three-argument `NotificationCallback`.
 
 `WindFreeTransport` exclusively owns CBOR conversion: `async_get` and OBSERVE
 decode dependency-returned bytes with `cbor2.loads`, while `async_post` encodes
 the supplied representation with `cbor2.dumps`. Parser, coordinator, and entity
-layers never exchange raw CBOR bytes.
+layers never exchange raw CBOR bytes. GET, OBSERVE, and encoded POST payloads
+have a fixed byte bound and all representations require a top-level mapping
+whose keys are strings.
+
+Install one idempotent filter on the exact pinned DTLS-session dependency
+logger before any session runs. Preserve record severity but replace message,
+arguments, exception information, and stack information with a fixed category
+so manifest-enabled dependency logs cannot expose host, path, payload, UUID, or
+raw protocol errors. Treat a fatal credential alert only when an exact allowed
+description/code appears in a structured `OpenSSL.SSL.Error` record; arbitrary
+exception text remains transient.
 
 - [ ] **Step 4: Implement exact-range discovery**
 
@@ -1365,7 +1381,11 @@ async def async_discover_transport(
 
 Each attempt uses `PROBE_HANDSHAKE_TIMEOUT`, closes before the next attempt, and
 reuses the successful session. Exhaustion raises sanitized `ConnectionError`
-without host or port payload details.
+without host or port payload details. A caller may supply a subset/reordering
+of `PROBE_PORTS`, but every value must be a non-boolean integer in that exact
+range and validation happens before session construction. After bounded
+cleanup, discovery immediately preserves and raises a structured classified
+fatal `TransportError`; transient candidates continue through the subset.
 
 - [ ] **Step 5: Run transport tests**
 
@@ -1428,9 +1448,11 @@ Run:
 tests/test_dependency_contract.py -q`
 
 Expected: lifecycle, in-memory PEM, two-RPS pacing delegation, Block2 passthrough,
-generation isolation, sequential sweep, cleanup, fatal-alert extraction, and
-redaction tests pass. The real dependency loads the synthetic SHA-1 chain and
-its codec contract passes without changing a fresh stdlib TLS context.
+generation isolation, sequential sweep, retained cleanup, structured
+fatal-alert extraction, bounded CBOR, exact dependency-log filtering, and
+redaction tests pass. The real dependency loads the synthetic SHA-1 chain, the
+adapter's default constructor/lifecycle runs in executor threads, and its codec
+contract passes without changing a fresh stdlib TLS context.
 
 - [ ] **Step 6: Commit transport**
 

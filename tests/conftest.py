@@ -327,6 +327,7 @@ class FakeSession:
         self.join_error: Exception | None = None
         self.get_code = 69
         self.post_code = 68
+        self.post_response = b""
         self.active_observations: set[tuple[str, ...]] = set()
 
     def _record(self, name: str, *args: object) -> None:
@@ -354,7 +355,7 @@ class FakeSession:
         self._record("post", path, payload)
         if self.post_error is not None:
             raise self.post_error
-        return self.post_code, b""
+        return self.post_code, self.post_response
 
     def subscribe(self, path: tuple[str, ...]) -> bytes:
         self._record("subscribe", path)
