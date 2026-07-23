@@ -1058,12 +1058,37 @@ def create_credentials(
 
 Use `cryptography` loaders, explicit SHA-256 byte comparisons via
 `hmac.compare_digest`, RSA public-number comparison, and signature verification
-for each public chain edge. Reject extra PEM blocks. Build the leaf with
-`BasicConstraints(ca=False)`, client-auth EKU, required Samsung role extension,
-UUID subject/SAN values, `not_before = server_date - 5 minutes`, and
+for each public chain edge, including the root self-signature. Require exact DN
+attributes for the four-certificate chain: `REMOVED_IDENTITY` (including
+`emailAddress=REMOVED_IDENTITY`) -> `RemoteAccessCA(CE)` -> `CECA` ->
+`ROOTCA`, all under `C=KR, O=Samsung Electronics`. Require the identity issuer
+attributes `C=KR, O=Samsung Electronics, OU=OCF Server SubCA,
+CN=Samsung Electronics OCF Server SubCA`; its subject must additionally have
+`C=KR, O=Samsung Electronics, CN=*.REMOVED_HOST.com` and exactly one valid
+`OU=uuid:<UUID>`. Reject extra PEM blocks.
+
+Build the leaf with non-critical `BasicConstraints(ca=False)`; non-critical
+`KeyUsage` containing only digital-signature and key-encipherment; non-critical
+EKU containing client auth, server auth, and `1.3.6.1.4.1.51414.0.1.2`; and the
+non-critical `1.3.6.1.4.1.51414.1.3` extension whose raw DER UTF8String value is
+`b"\x0c\x10samsung.role.hub"`. Use subject `C=KR, O=Samsung Electronics,
+OU=uuid:<UUID>, CN=urn:uuid:<UUID>` and SAN URI values `urn:uuid:<UUID>`,
+`uri:uuid:<UUID>`, `uuid:<UUID>`, plus DNS `<UUID>`. Set
+`not_before = server_date - 5 minutes`, and
 `not_after = server_date.replace(year=server_date.year + 10)`. Handle a
 February 29 anchor by clamping to February 28 in the target year. Serialize only
 the generated key, leaf, and required public chain.
+
+`cryptography` 48 loaders and builders perform validation and certificate
+construction, but that release intentionally refuses SHA-1 certificate signing.
+Build an in-memory provisional certificate containing the final TBS
+subject/issuer, validity, public key, and extensions, load its DER into Home
+Assistant's existing pyOpenSSL stack, and call pyOpenSSL signing with the REMOVED_IDENTITY
+key and SHA-1 so it replaces the signature algorithm and value over that TBS
+content. Reload and verify the final SHA-1 certificate with `cryptography`. Do
+not use temporary files, shell commands, or subprocess OpenSSL. Tests must
+compare every intended TBS field after re-signing, prove the SHA-1 signature and
+chain validity, and prove that credential minting writes no files.
 
 `create_credentials` composes `validate_bundle(inputs.bundle_bytes,
 pins=pins)`, `validate_identity_certificate(inputs.identity_der, pins=pins)`,
