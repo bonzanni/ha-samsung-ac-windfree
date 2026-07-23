@@ -112,13 +112,22 @@ On the first setup:
    `REMOVED_IDENTITY_SPKI_DIGEST`.
    Also require the expected Samsung issuer and a
    `CN=*.REMOVED_HOST.com` subject before extracting the `uuid:<UUID>`
-   identity. The pinned leaf is valid through 2035-04-09. Keeping both the leaf
-   and SPKI pins is intentional fail-closed policy, not ordinary Web PKI.
+   identity from the subject's `OU=uuid:<UUID>` relative distinguished name.
+   The pinned leaf is valid through 2035-04-09. Keeping both the leaf and SPKI
+   pins is intentional fail-closed policy, not ordinary Web PKI. Fetching the
+   exact pinned certificate avoids embedding the literal shared UUID in the
+   integration artifact; it is not expected to produce installation-specific
+   information.
 7. Generate a fresh RSA-2048 private key in memory.
-8. Require a plausibly synchronized system clock, backdate `notBefore` by five
-   minutes for device clock skew, and mint a ten-year client leaf certificate
-   containing that UUID in the subject and SAN. Sign it with REMOVED_IDENTITY using the
-   legacy SHA-1 signature required by the device trust chain.
+8. Capture the authenticated HTTP `Date` header from the successful,
+   system-trusted HTTPS bundle response in step 1 and require the local UTC
+   clock to be within 24 hours of it. The Samsung identity endpoint itself does
+   not provide an HTTP response and is not used as a clock source. A missing or
+   malformed bundle-response `Date` is a bootstrap failure rather than a reason
+   to mint a potentially invalid certificate. Backdate `notBefore` by five
+   minutes from the validated local time and mint a ten-year client leaf
+   certificate containing that UUID in the subject and SAN. Sign it with REMOVED_IDENTITY
+   using the legacy SHA-1 signature required by the device trust chain.
 9. Sweep UDP ports `49152` through `49160`, establish authenticated DTLS, and
    require successful reads of `/oic/d`, `/oic/p`, and `/device/0`.
 10. Verify the device type, model, firmware family, and live capability
@@ -141,10 +150,12 @@ new integration release can move the unchanged pin to a project-controlled
 mirror. The integration does not silently try unpinned mirrors. Vendoring the
 universal signing key requires a separate legal and governance decision.
 
-Maintainers must monitor the Samsung identity certificate before its 2035
-expiry and publish a reviewed pin update with adequate lead time. A bootstrap
-failure caused by an unavailable source or changed pin is reported distinctly
-from a local device or credential failure.
+Scheduled CI must periodically fetch the Samsung identity endpoint and compare
+its leaf and SPKI with the release pins. Any rotation is reviewed immediately;
+maintainers must also publish a planned pin update with adequate lead time
+before the current certificate's 2035 expiry. A bootstrap failure caused by an
+unavailable source or changed pin is reported distinctly from a local device or
+credential failure.
 
 The integration must not download or regenerate certificate material during
 ordinary startup. A stored client-certificate authentication failure starts a
@@ -182,6 +193,28 @@ enforce those hashes, and documentation must not claim otherwise. Because the
 package is pre-1.0 and its DTLS stack is load-bearing, upgrades require the same
 transport contract tests and an authorized live smoke test.
 
+The package's runtime dependency closure is `cbor2>=5.6` and
+`pyOpenSSL>=23.0`, with pyOpenSSL in turn using Home Assistant's
+process-global cryptography, cffi, and typing stack. The integration must not
+pin a different pyOpenSSL or cryptography version over Home Assistant's own
+constraints. Instead:
+
+- The manifest pins `smartthings-local==0.1.0` and the live-verified
+  `cbor2==6.1.3`.
+- CI records the complete resolved dependency closure and tests it inside every
+  supported Home Assistant release environment, including the minimum version
+  declared in `hacs.json` and the current stable release.
+- Scheduled dependency CI tests the next Home Assistant beta so a changed
+  Home Assistant crypto constraint is found before users upgrade.
+- A release is blocked unless the resolved closure passes DTLS context,
+  certificate loading, Block2, and OBSERVE contract tests.
+
+Explicitly pinning a conflicting process-global pyOpenSSL or cryptography in a
+custom integration could break Home Assistant and is prohibited. If a future
+Home Assistant-owned version falls outside the proven transport contract, the
+supported Home Assistant range is held and documented until a reviewed
+transport release restores compatibility.
+
 The integration owns:
 
 - Certificate-bootstrap policy and security validation
@@ -216,6 +249,10 @@ chain requires SHA-1. It must not change Python, OpenSSL, Home Assistant, or
 process-global TLS policy. CI and the release smoke test verify certificate
 generation and handshake on the supported Home Assistant OS/container
 OpenSSL build.
+
+Version `0.1.0` accepts the generated certificate chain and private key as
+in-memory PEM strings. The integration uses that path exclusively and never
+writes credentials to temporary transport files.
 
 ### `WindFreeSessionSupervisor`
 
@@ -268,13 +305,18 @@ Responsibilities:
 - Publish immutable, typed `WindFreeData`
 - Track availability, latency, update source, failure counts, and resource
   coverage
-- Revalidate the exact model, firmware prefix, and required safe-write resource
-  contract during startup and every full reconciliation
+- Revalidate all four identity gates—exact model, device type, firmware prefix,
+  and platform—and the required safe-write resource contract during startup and
+  every full reconciliation
 
 If firmware drift removes or changes a required resource, the coordinator
 disables only the affected controls, retains safe readable entities, and
 creates a Repairs issue describing a sanitized capability-contract mismatch.
 It never attempts a legacy or guessed write shape.
+
+If any identity gate changes, the entire model-specific write contract is no
+longer trusted: all write surfaces become unavailable, safe readable entities
+remain available, and a distinct unsupported-identity Repairs issue is created.
 
 Entity properties read only coordinator memory and perform no I/O.
 
@@ -321,10 +363,12 @@ The scheduler staggers resource deadlines and uses this priority order:
 
 1. User command and its authoritative verification
 2. Overdue hot resource
-3. Connection/authentication health check
-4. Warm resource
-5. Cold resource
-6. Full reconciliation
+3. Warm resource
+4. Cold resource
+5. Full reconciliation
+
+There is no separate health-check request: successful hot polling proves
+session health, while the hot-tier failure counter drives reconnect supervision.
 
 Priority applies when admitting a logical request. A token-stable Block2
 transaction is not preempted between blocks, so full reconciliation begins only
@@ -408,7 +452,7 @@ and raw production payloads are intentionally omitted.
 | Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact consumer model, device type, and firmware family confirmed |
 | Standard power path | POST `/power/0` with `{"value": false}` | `4.04`; must not be used |
 | Power | POST `/power/vs/0` with `{"x.com.samsung.da.power": "On"}` | `2.04`, OBSERVE, authoritative read-back `On`; restored `Off` |
-| HVAC mode | POST `/mode/vs/0` with `{"x.com.samsung.da.modes": ["<mode>"]}` | Auto, Cool, Dry, Fan, and Heat each persisted; restored Cool |
+| HVAC mode | POST `/mode/vs/0` with `{"x.com.samsung.da.modes": ["<mode>"]}` | With power Off, Auto, Cool, Dry, Fan, and Heat each persisted and read back; restored Cool |
 | Temperatures | GET `/temperatures/vs/0` aggregate `items` | Current, desired, min 16, max 30, step 1, Celsius |
 | Target temperature | Read/modify/write the aggregate `items` list with desired changed | 26 to 27 °C persisted, notified, and restored to 26 °C |
 | Fan | POST `/wind/strength/vs/0` with scalar mode code | Auto to Low persisted and restored; supported codes 0 through 4 map to Auto through Turbo |
@@ -480,10 +524,12 @@ The integration does not expose `hvac_action`. The firmware reports selected
 mode but no authoritative compressor/action state.
 
 Despite its vendor name, `fivepercentHumidity` is parsed as the directly
-reported integer percentage; it is not multiplied by five. Values outside
-0 through 100, booleans, non-numeric strings, and missing fields produce
-unknown humidity without failing the climate entity. Parser fixtures cover
-valid numeric strings and invalid boundaries.
+reported integer percentage; it is not multiplied by five. Zero is treated as
+the firmware family's unset sentinel unless future live evidence proves a real
+zero-percent reading. Values outside 1 through 100, booleans, non-numeric
+strings, and missing fields produce unknown humidity without failing the
+climate entity. Parser fixtures cover valid numeric strings, zero, and invalid
+boundaries.
 
 ### Additional entities
 
@@ -533,8 +579,9 @@ instantaneous power, and malformed input.
   published as current while unavailable.
 - Recovery logs once, performs a complete refresh, and restores entities
   together.
-- Only the repeatable post-handshake CoAP authorization failure defined by the
-  supervisor starts reauthentication. Transport and handshake failures remain
+- Only the supervisor's repeated explicit fatal-certificate DTLS alert or
+  repeated post-handshake CoAP authorization signal starts reauthentication.
+  Timeouts, socket errors, and unclassified handshake failures remain
   reconnectable.
 - Unsupported/coerced writes raise a translated action error containing only
   the requested feature, never payload or identity data.
@@ -560,10 +607,15 @@ Validation:
 - Set the OCF device identifier as the unique ID
 
 Every network operation has its own bounded timeout: 15 seconds for each HTTPS
-bootstrap fetch, 12 seconds for an individual DTLS handshake, and 8 seconds for
-an authenticated CoAP read. Port attempts are sequential and cancelled before
-the next begins. The complete flow has a 150-second deadline. Cancellation
-closes sockets, stops executor work at its next bounded operation, retains no
+bootstrap fetch, 6 seconds for each of the nine DTLS sweep attempts, and
+8 seconds for an authenticated CoAP read. The successful swept session is
+reused for validation rather than handshaken twice; ordinary reconnects use the
+transport's 12-second handshake timeout. Port attempts are sequential and
+cancelled before the next begins. The setup worst-case base budget is therefore
+30 seconds for fetches, 54 seconds for the complete sweep, and 24 seconds for
+the three required identity reads, leaving 42 seconds inside the 150-second
+overall deadline for capability validation and cleanup. Cancellation closes
+sockets, stops executor work at its next bounded operation, retains no
 universal signing material, and returns no partial config entry. Failures are
 classified as bootstrap unavailable, pin mismatch, invalid clock, device
 unreachable, local authentication rejected, unsupported exact model, or
@@ -671,11 +723,13 @@ fixtures.
 Required test groups:
 
 - Bootstrap download pin, source outage, malformed bundles, wrong key, wrong
-  chain, UUID extraction, clock validation, backdated in-memory leaf
-  generation, non-persistence of the universal key, atomic credential
-  replacement, and certificate-expiry Repairs
+  chain, subject-OU UUID extraction, bundle HTTPS Date clock validation,
+  backdated in-memory leaf generation, non-persistence of the universal key,
+  atomic credential replacement, periodic pin canary, and certificate-expiry
+  Repairs
 - Config flow success and all failure branches
-- Config-flow progress, per-operation/overall timeout, and cancellation cleanup
+- Config-flow progress, per-operation/overall timeout arithmetic, reuse of the
+  successful swept session, and cancellation cleanup
 - Unsupported device, exact-model, and firmware-family rejection
 - Exact consumer-model rejection even when the firmware prefix matches
 - Duplicate detection, reconfigure, and reauthentication
@@ -688,18 +742,23 @@ Required test groups:
 - Correct vendor power path and fresh aggregate-temperature
   read/modify/write under the operation lock
 - Off-to-mode sequencing and partial-failure reconciliation
+- Mode write and authoritative read-back while power is Off
 - All HVAC, fan, airflow, and preset mappings
 - The live-verified HVAC-mode/control compatibility matrix and rejection of
   unverified combinations without device I/O
 - Verified command success, coercion, timeout, and related-resource refresh
-- Startup/full-reconciliation capability drift and affected-control disabling
+- Startup/full-reconciliation capability drift, affected-control disabling,
+  and complete write disabling after any identity-gate change
 - Entity availability and disabled-by-default diagnostics
-- Direct-percentage humidity parsing plus filter, energy reset, and alarm
-  parsers
+- Direct-percentage humidity parsing including the zero sentinel, plus filter,
+  energy reset, and alarm parsers
 - Diagnostics privacy with adversarial secret-like values
 - No I/O from entity properties
 - Config-entry setup, unload, and reload
 - Scoped OpenSSL security-level behavior on the supported HA runtime
+- In-memory PEM credential handoff with no transport temporary files
+- Full resolved dependency-closure tests across the minimum, stable, and beta
+  Home Assistant environments
 
 CI runs:
 
