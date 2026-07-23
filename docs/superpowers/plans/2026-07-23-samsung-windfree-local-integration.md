@@ -121,20 +121,31 @@ Each task extends `tests/conftest.py` only with the fixtures assigned here:
   synthetic client chain and validity dates; it is loadable by real pyOpenSSL.
 - `bootstrap_inputs: BootstrapInputs` and `bootstrap_pins: BootstrapPins`
   generate an ephemeral four-certificate chain and matching fingerprints.
-- `resource_representations: dict[str, dict[str, object]]` loads
-  `device_state.json`.
+- `resource_representations: dict[str, dict[str, object]]` combines the
+  `/oic/d`, `/oic/p`, `/device/0`, and state-path representations from
+  `device_identity.json` and `device_state.json`.
 - `encoded_resources: dict[str, bytes]` applies `cbor2.dumps` to each
   representation for low-level session mocks.
 - `ManualClock` exposes `monotonic() -> float`,
   `async sleep(delay: float) -> None`, and `advance(delay: float) -> None`.
+  `sleep` records the delay, advances the monotonic value by that delay, yields
+  to the event loop once with `await asyncio.sleep(0)`, and returns; `advance`
+  changes the same value synchronously for tests that have no active sleeper.
 - `FakeSession` implements the real dependency's blocking
   `connect/start_reader/get/post/subscribe/close/join` method shapes and records
   calls. Its GET values are `(69, encoded_resources[path])`; POST returns
   `(68, b"")`.
-- `TransportFactoryStub.current` is the current `AsyncMock` transport,
+- `TransportFactoryStub.__call__` is an `AsyncMock` returning `current`.
+  `TransportFactoryStub.current` is a stateful `AsyncMock` transport:
+  `async_get` deep-copies the representation for its path from
+  `resource_representations`, while `async_post` replaces that path's
+  representation with a deep copy of the posted mapping before returning.
+  This echo behavior makes the normal authoritative read-back succeed; tests
+  override it explicitly to exercise rejection.
   `TransportFactoryStub.discover` is an `AsyncMock` returning a replacement
   `(port, transport)` pair, and `TransportFactoryStub.reconnect` is an
-  `AsyncMock` returning a replacement transport on the existing port.
+  `AsyncMock` returning a replacement transport on the existing port; every
+  replacement uses the same stateful GET/POST helper.
 - `transport_factory` is the pytest fixture that returns the shared
   `TransportFactoryStub`.
 - `coordinator` constructs `WindFreeCoordinator` with `ManualClock.monotonic`,
@@ -149,7 +160,9 @@ Each task extends `tests/conftest.py` only with the fixtures assigned here:
 - `setup_integration` adds `config_entry`, assigns the shared coordinator to
   `config_entry.runtime_data`, patches coordinator construction to return that
   coordinator, calls `async_setup`, and blocks until every forwarded platform
-  finishes.
+  finishes. It lets `coordinator.async_start` run against the stateful stub,
+  proving setup parses identity and state before platforms load; only after
+  startup does it replace `coordinator.async_command` with `command_mock`.
 - `climate_entity` and `energy_entity` depend on `setup_integration` and return
   the resulting entity IDs.
 
@@ -189,8 +202,12 @@ class TransportFactory(Protocol):
 ```python
 monotonic: Callable[[], float] = time.monotonic,
 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-transport_factory: TransportFactory = DefaultTransportFactory(),
+transport_factory: TransportFactory | None = None,
 ```
+
+The constructor assigns `DefaultTransportFactory()` only when
+`transport_factory is None`, in its body, avoiding a Ruff B008 call in the
+default expression.
 
 No test uses wall-clock sleeps, production addresses, raw production CBOR, or
 real credentials.
@@ -265,8 +282,8 @@ Run:
 
 Run: `.venv/bin/pytest tests/test_init.py -q`
 
-Expected: collection fails with
-`ModuleNotFoundError: custom_components.samsung_ac_windfree`.
+Expected: collection fails with a `ModuleNotFoundError` for
+`custom_components`.
 
 - [ ] **Step 3: Create the minimal package and metadata**
 
@@ -1044,8 +1061,9 @@ Use `cryptography` loaders, explicit SHA-256 byte comparisons via
 for each public chain edge. Reject extra PEM blocks. Build the leaf with
 `BasicConstraints(ca=False)`, client-auth EKU, required Samsung role extension,
 UUID subject/SAN values, `not_before = server_date - 5 minutes`, and
-`not_after = server_date + 10 years`. Serialize only the generated key, leaf,
-and required public chain.
+`not_after = server_date.replace(year=server_date.year + 10)`. Handle a
+February 29 anchor by clamping to February 28 in the target year. Serialize only
+the generated key, leaf, and required public chain.
 
 `create_credentials` composes `validate_bundle(inputs.bundle_bytes,
 pins=pins)`, `validate_identity_certificate(inputs.identity_der, pins=pins)`,
@@ -1367,6 +1385,7 @@ git commit -m "feat: add local DTLS CoAP transport"
 - Produces:
   `parse_identity(...)`,
   `parse_device_state(...)`,
+  `parse_humidity(...)`,
   `validate_contract(...)`,
   `build_command(...)`, and
   `verify_command(...)`.
@@ -1453,7 +1472,7 @@ class CommandKind(StrEnum):
 class DeviceCommand:
     kind: CommandKind
     path: str
-    payload: Mapping[str, object] | list[object] | str | int
+    payload: Mapping[str, object]
     requested: object
     related_paths: tuple[str, ...]
 
@@ -1632,7 +1651,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         compatibility: Mapping[str, object],
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        transport_factory: TransportFactory = DefaultTransportFactory(),
+        transport_factory: TransportFactory | None = None,
     ) -> None: ...
 
     async def async_start(self) -> None: ...
