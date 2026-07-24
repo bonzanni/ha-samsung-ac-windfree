@@ -202,6 +202,36 @@ async def test_setup_cleanup_failure_does_not_replace_sanitized_error(
     assert credentials.client_chain_pem not in traceback_locals
 
 
+async def test_delayed_setup_cleanup_failure_is_sanitized(hass, credentials) -> None:
+    from custom_components.samsung_ac_windfree import async_setup_entry
+
+    entry = _entry(credentials)
+    coordinator = MagicMock()
+    coordinator.async_start = AsyncMock(side_effect=RuntimeError("private startup"))
+
+    async def delayed_shutdown_failure():
+        await asyncio.sleep(0)
+        raise RuntimeError(f"{HOST} {credentials.client_key_pem}")
+
+    coordinator.async_shutdown.side_effect = delayed_shutdown_failure
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=coordinator,
+        ),
+        pytest.raises(ConfigEntryNotReady, match="setup_failed") as caught,
+    ):
+        await async_setup_entry(hass, entry)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    traceback_locals = _integration_traceback_locals(caught.value)
+    assert HOST not in traceback_locals
+    assert credentials.client_key_pem not in traceback_locals
+    assert credentials.client_chain_pem not in traceback_locals
+
+
 async def test_setup_cancellation_shuts_down_and_scrubs_traceback(
     hass, credentials
 ) -> None:
@@ -527,6 +557,37 @@ async def test_unload_shutdown_failure_is_sanitized(hass, credentials) -> None:
     assert credentials.client_key_pem not in traceback_locals
 
 
+async def test_delayed_unload_shutdown_failure_is_sanitized(hass, credentials) -> None:
+    from custom_components.samsung_ac_windfree import async_unload_entry
+
+    entry = _entry(credentials)
+    coordinator = MagicMock()
+
+    async def delayed_shutdown_failure():
+        await asyncio.sleep(0)
+        raise RuntimeError(f"{HOST} {credentials.client_key_pem}")
+
+    coordinator.async_shutdown.side_effect = delayed_shutdown_failure
+    entry.runtime_data = coordinator
+
+    with (
+        patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new=AsyncMock(return_value=True),
+        ),
+        pytest.raises(ConfigEntryError, match="unload_failed") as caught,
+    ):
+        await async_unload_entry(hass, entry)
+
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    traceback_locals = _integration_traceback_locals(caught.value)
+    assert HOST not in traceback_locals
+    assert credentials.client_key_pem not in traceback_locals
+    assert credentials.client_chain_pem not in traceback_locals
+
+
 async def test_unload_repeated_cancellation_retains_shutdown_and_latest_args(
     hass, credentials
 ) -> None:
@@ -626,7 +687,7 @@ async def test_auth_listener_is_suppressed_during_unload_and_restored_once_on_fa
     unsubscribes[0].assert_called_once_with()
     assert len(listeners) == 2
     assert len(unsubscribes) == 2
-    entry.async_start_reauth.assert_not_called()
+    entry.async_start_reauth.assert_called_once_with(hass)
     listeners[-1]()
     entry.async_start_reauth.assert_called_once_with(hass)
 
@@ -763,6 +824,112 @@ async def test_update_reload_suppresses_auth_listener_and_does_not_start_reauth(
 
     unsubscribe.assert_called_once_with()
     entry.async_start_reauth.assert_not_called()
+
+
+async def test_failed_reload_after_successful_unload_does_not_restore_old_lifecycle(
+    hass, credentials
+) -> None:
+    from custom_components.samsung_ac_windfree import (
+        _async_reload_entry,
+        _lifecycles,
+        async_setup_entry,
+    )
+
+    entry = _entry(credentials)
+    entry.async_start_reauth = MagicMock()
+    coordinator = MagicMock()
+    coordinator.async_start = AsyncMock()
+    coordinator.authentication_rejected = False
+    listeners = []
+    unsubscribes = []
+
+    def add_listener(listener):
+        listeners.append(listener)
+        unsubscribe = MagicMock()
+        unsubscribes.append(unsubscribe)
+        return unsubscribe
+
+    coordinator.async_add_listener.side_effect = add_listener
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)
+
+    async def reload(_entry_id):
+        _lifecycles(hass).pop(entry.entry_id)
+        coordinator.authentication_rejected = True
+        return False
+
+    with (
+        patch.object(hass.config_entries, "async_reload", side_effect=reload),
+        pytest.raises(ConfigEntryError, match="reload_failed"),
+    ):
+        await _async_reload_entry(hass, entry)
+
+    unsubscribes[0].assert_called_once_with()
+    assert len(listeners) == 1
+    assert entry.entry_id not in _lifecycles(hass)
+    listeners[0]()
+    entry.async_start_reauth.assert_not_called()
+
+
+async def test_failed_reload_unload_restores_and_reconciles_auth_once(
+    hass, credentials
+) -> None:
+    from custom_components.samsung_ac_windfree import (
+        _async_reload_entry,
+        async_setup_entry,
+    )
+
+    entry = _entry(credentials)
+    entry.async_start_reauth = MagicMock()
+    coordinator = MagicMock()
+    coordinator.async_start = AsyncMock()
+    coordinator.authentication_rejected = False
+    listeners = []
+
+    def add_listener(listener):
+        listeners.append(listener)
+        return MagicMock()
+
+    coordinator.async_add_listener.side_effect = add_listener
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)
+
+    async def reload(_entry_id):
+        coordinator.authentication_rejected = True
+        return False
+
+    with (
+        patch.object(hass.config_entries, "async_reload", side_effect=reload),
+        pytest.raises(ConfigEntryError, match="reload_failed"),
+    ):
+        await _async_reload_entry(hass, entry)
+
+    assert len(listeners) == 2
+    entry.async_start_reauth.assert_called_once_with(hass)
+    listeners[-1]()
+    entry.async_start_reauth.assert_called_once_with(hass)
 
 
 @pytest.mark.parametrize("version", [1])

@@ -8,6 +8,7 @@ from datetime import datetime
 import voluptuous as vol
 from homeassistant.components.repairs import RepairsFlow, RepairsFlowResult
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from .const import CERT_REPAIR_WINDOW, DOMAIN
@@ -46,12 +47,8 @@ class CertificateExpiryRepairFlow(RepairsFlow):
     ) -> RepairsFlowResult:
         """Show the explicit renewal confirmation."""
 
-        if user_input is not None:
-            return await self.async_step_confirm(user_input)
-        return self.async_show_form(
-            step_id="confirm",
-            data_schema=vol.Schema({}),
-        )
+        del user_input
+        return await self.async_step_confirm()
 
     async def async_step_confirm(
         self,
@@ -71,6 +68,11 @@ class CertificateExpiryRepairFlow(RepairsFlow):
             if _is_expiring(entry.data, now)
         ]
         if not entries:
+            ir.async_delete_issue(
+                self.hass,
+                DOMAIN,
+                _CERTIFICATE_EXPIRING,
+            )
             return self.async_abort(reason="issue_resolved")
         for entry in entries:
             entry.async_start_reauth(self.hass)

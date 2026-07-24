@@ -76,6 +76,7 @@ class _EntryLifecycle:
             return
         self.unsubscribe = self.coordinator.async_add_listener(self.handle_update)
         self.suppressed = False
+        self.handle_update()
 
     def suspend(self) -> None:
         """Suppress first, then detach to close callback races."""
@@ -168,6 +169,9 @@ async def _async_shutdown_cancellation_safe(
             cancellation_args = cancelled.args
             cancelled.__traceback__ = None
             cancelled = None
+        except Exception as error:
+            error.__traceback__ = None
+            error = None
 
     completed = True
     try:
@@ -208,7 +212,11 @@ async def _async_reload_entry(
         error.__traceback__ = None
         error = None
         reload_failed = True
-    if reload_failed and lifecycle is not None:
+    if (
+        reload_failed
+        and lifecycle is not None
+        and _lifecycles(hass).get(entry.entry_id) is lifecycle
+    ):
         lifecycle.attach()
     lifecycle = None
     entry = None
@@ -296,7 +304,6 @@ async def async_setup_entry(
         lifecycle.attach()
         _lifecycles(hass)[entry.entry_id] = lifecycle
         entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
-        lifecycle.handle_update()
     except asyncio.CancelledError as cancelled:
         cancellation_args = cancelled.args
         cancelled.__traceback__ = None
