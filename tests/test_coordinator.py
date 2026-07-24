@@ -58,6 +58,7 @@ class FakeTransportFactory:
         )
         self.transports: list[AsyncMock] = []
         self.observe_error: BaseException | None = None
+        self.next_close_side_effect: BaseException | list[object] | None = None
         self.block_generation: int | None = None
         self.seed_started = asyncio.Event()
         self.seed_release = asyncio.Event()
@@ -79,6 +80,9 @@ class FakeTransportFactory:
         transport.async_post.side_effect = self._post
         if self.observe_error is not None:
             transport.async_observe.side_effect = self.observe_error
+        if self.next_close_side_effect is not None:
+            transport.async_close.side_effect = self.next_close_side_effect
+            self.next_close_side_effect = None
         self.transports.append(transport)
         return transport
 
@@ -199,9 +203,32 @@ async def test_scheduler_prunes_superseded_heap_revisions(
 ) -> None:
     for revision in range(100):
         coordinator.force_due(HOT_PATHS[0], due=float(revision))
-    assert len(coordinator._heap) > 100
+    assert len(coordinator._heap) <= len(coordinator._deadlines) * 2
     coordinator.next_due()
     assert len(coordinator._heap) < len(coordinator._deadlines) * 2
+
+
+async def test_scheduler_compacts_thousands_of_future_revisions(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    latest: dict[str, float] = {}
+    for revision in range(3000):
+        path = HOT_PATHS[revision % len(HOT_PATHS)]
+        deadline = 10_000.0 + revision
+        latest[path] = deadline
+        coordinator.force_due(path, due=deadline)
+
+    coordinator.force_due(COLD_PATHS[0], due=0)
+    coordinator.force_due(WARM_PATHS[0], due=0)
+    coordinator.force_due(HOT_PATHS[0], due=0)
+    latest[HOT_PATHS[0]] = 0
+    assert len(coordinator._heap) <= len(coordinator._deadlines) * 2
+    for path, deadline in latest.items():
+        assert coordinator.deadline_for(path) == deadline
+    selected = coordinator.next_due()
+    assert selected.path == HOT_PATHS[0]
+    assert selected.tier is PollTier.HOT
+    assert selected.deadline == 0
 
 
 async def test_run_scheduled_once_admits_atomic_device_tree_read(
@@ -582,6 +609,23 @@ async def test_shutdown_closes_exact_generation_rejects_commands_and_no_resurrec
     assert coordinator.generation == old_generation
 
 
+async def test_completed_shutdown_is_terminal_and_start_cannot_resurrect(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    generation = coordinator.generation
+    transports = len(coordinator.transport_factory.transports)
+    await coordinator.async_shutdown()
+
+    with pytest.raises(RuntimeError, match="coordinator_shutdown") as caught:
+        await coordinator.async_start()
+
+    assert caught.value.__cause__ is None
+    assert coordinator.generation == generation
+    assert len(coordinator.transport_factory.transports) == transports
+    await coordinator.async_shutdown()
+    assert not coordinator.data.available
+
+
 async def test_command_cancellation_propagates_without_speculative_publication(
     coordinator: WindFreeCoordinator,
 ) -> None:
@@ -590,6 +634,69 @@ async def test_command_cancellation_propagates_without_speculative_publication(
     with pytest.raises(asyncio.CancelledError):
         await coordinator.async_command(CommandKind.POWER, True)
     assert coordinator.data is before
+
+
+@pytest.mark.parametrize("operation_name", ["simple", "off_to_mode", "turn_on"])
+@pytest.mark.parametrize("blocked_stage", ["post", "observe"])
+async def test_shutdown_joins_every_inflight_command_without_resurrection(
+    coordinator: WindFreeCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_name: str,
+    blocked_stage: str,
+) -> None:
+    blocked = asyncio.Event()
+    never = asyncio.Event()
+    publications: list[bool] = []
+    coordinator.async_add_listener(
+        lambda: publications.append(coordinator.data.available)
+    )
+
+    if blocked_stage == "post":
+
+        async def post(_path: str, _payload: object) -> None:
+            blocked.set()
+            await never.wait()
+
+        coordinator.transport.async_post.side_effect = post
+    else:
+        coordinator.transport.async_post.side_effect = (
+            coordinator.transport_factory._post
+        )
+
+        async def wait_for_observe(*_args: object) -> bool:
+            blocked.set()
+            await never.wait()
+            return False
+
+        monkeypatch.setattr(coordinator, "_wait_for_observe", wait_for_observe)
+
+    if operation_name == "simple":
+        operation = asyncio.create_task(
+            coordinator.async_command(CommandKind.POWER, True)
+        )
+    elif operation_name == "off_to_mode":
+        operation = asyncio.create_task(coordinator.async_set_hvac_mode(HvacMode.HEAT))
+    else:
+        operation = asyncio.create_task(coordinator.async_turn_on())
+
+    try:
+        await blocked.wait()
+        await coordinator.async_shutdown()
+
+        assert operation.done()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert not coordinator.data.available
+        assert True not in publications
+        assert not coordinator._command_tasks
+        assert not coordinator._command_completions
+        await asyncio.sleep(0)
+        assert not coordinator.data.available
+    finally:
+        never.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 async def test_start_observe_failure_never_publishes_available(
@@ -777,7 +884,13 @@ async def test_background_fatal_auth_confirmation_is_exposed(
     )
     coordinator.force_due(HOT_PATHS[0], due=0)
     await coordinator.async_run_scheduled_once()
-    coordinator._generation += 1
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if coordinator.generation == 2 and coordinator.data.available:
+            break
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed", fatal_alert="unknown_ca"
+    )
     coordinator.force_due(HOT_PATHS[0], due=0)
     await coordinator.async_run_scheduled_once()
     assert coordinator.authentication_rejected
@@ -898,6 +1011,186 @@ async def test_shutdown_retries_only_the_exact_transport_that_failed_to_close(
     assert pending.async_close.await_count == 2
     assert coordinator._transport is None
     assert coordinator._pending_transport is None
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [
+        TransportError("transport_close_failed"),
+        asyncio.CancelledError("transport_close_cancelled"),
+    ],
+)
+async def test_disconnect_retains_failed_close_and_still_schedules_reconnect(
+    coordinator: WindFreeCoordinator,
+    close_error: BaseException,
+) -> None:
+    active = coordinator.transport
+    active.async_close.side_effect = [close_error, None]
+    coordinator.transport_factory.reconnect.side_effect = ConnectionError
+    coordinator.transport_factory.discover.side_effect = ConnectionError
+    coordinator.transport.async_get.side_effect = TimeoutError
+
+    for path in HOT_PATHS[:3]:
+        coordinator.force_due(path, due=0)
+        await coordinator.async_run_scheduled_once()
+
+    assert not coordinator.data.available
+    assert active.async_close.await_count == 1
+    assert coordinator._reconnect_task is not None
+    await coordinator.async_shutdown()
+    assert active.async_close.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [
+        TransportError("transport_close_failed"),
+        asyncio.CancelledError("transport_close_cancelled"),
+    ],
+)
+async def test_startup_retains_candidate_when_failure_cleanup_cannot_close(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+    close_error: BaseException,
+) -> None:
+    factory = FakeTransportFactory(resource_representations)
+    factory.observe_error = TransportError("transport_observe_failed")
+    factory.next_close_side_effect = [close_error, None]
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        transport_factory=factory,
+        start_scheduler=False,
+    )
+
+    with pytest.raises(TransportError, match="transport_observe_failed"):
+        await instance.async_start()
+
+    candidate = factory.current
+    assert candidate.async_close.await_count == 1
+    await instance.async_shutdown()
+    assert candidate.async_close.await_count == 2
+
+
+async def test_repeated_startup_failures_retain_every_unclosed_candidate(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    factory = FakeTransportFactory(resource_representations)
+    factory.observe_error = TransportError("transport_observe_failed")
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        transport_factory=factory,
+        start_scheduler=False,
+    )
+    candidates = []
+    for _ in range(2):
+        factory.next_close_side_effect = [
+            TransportError("transport_close_failed"),
+            None,
+        ]
+        with pytest.raises(TransportError, match="transport_observe_failed"):
+            await instance.async_start()
+        candidates.append(factory.current)
+
+    await instance.async_shutdown()
+    assert [candidate.async_close.await_count for candidate in candidates] == [2, 2]
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [
+        TransportError("transport_close_failed"),
+        asyncio.CancelledError("transport_close_cancelled"),
+    ],
+)
+async def test_reconnect_retains_candidate_when_failure_cleanup_cannot_close(
+    coordinator: WindFreeCoordinator,
+    close_error: BaseException,
+) -> None:
+    factory = coordinator.transport_factory
+    factory.observe_error = TransportError("transport_observe_failed")
+    factory.next_close_side_effect = [close_error, None]
+
+    await coordinator.async_run_reconnect_attempt()
+
+    candidate = factory.current
+    assert candidate is not coordinator.transport
+    assert candidate.async_close.await_count == 1
+    await coordinator.async_shutdown()
+    assert candidate.async_close.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "close_error",
+    [
+        TransportError("transport_close_failed"),
+        asyncio.CancelledError("transport_close_cancelled"),
+    ],
+)
+async def test_activation_never_exposes_candidate_before_old_close_succeeds(
+    coordinator: WindFreeCoordinator,
+    close_error: BaseException,
+) -> None:
+    old = coordinator.transport
+    generation = coordinator.generation
+    old.async_close.side_effect = [close_error, None]
+
+    await coordinator.async_run_reconnect_attempt()
+
+    candidate = coordinator.transport_factory.current
+    assert candidate is not old
+    with pytest.raises(RuntimeError, match="coordinator_not_started"):
+        _ = coordinator.transport
+    assert coordinator.generation == generation
+    assert coordinator.data.generation == generation
+    candidate.async_close.assert_awaited_once()
+    await coordinator.async_shutdown()
+    assert old.async_close.await_count == 2
+
+
+async def test_priority_handoff_survives_cancel_after_grant(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    admission = coordinator._admission
+    await admission.acquire(0)
+    first_entered = asyncio.Event()
+    successor_entered = asyncio.Event()
+
+    async def waiter(entered: asyncio.Event) -> None:
+        async with admission.hold(0):
+            entered.set()
+
+    first = asyncio.create_task(waiter(first_entered))
+    successor = asyncio.create_task(waiter(successor_entered))
+    try:
+        await asyncio.sleep(0)
+        admission.release()
+        first.cancel("cancel-after-grant")
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await first
+        assert caught.value.args == ("cancel-after-grant",)
+        await asyncio.wait_for(successor_entered.wait(), timeout=0.1)
+        await successor
+        assert not admission._held
+        assert not admission._waiters
+    finally:
+        for task in (first, successor):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(first, successor, return_exceptions=True)
 
 
 async def test_priority_admission_reorders_waiters_command_hot_then_reconcile(
@@ -1160,7 +1453,14 @@ async def test_reconcile_fatal_auth_confirmation_is_exposed(
         fatal_alert="access_denied",
     )
     await coordinator.async_reconcile()
-    coordinator._generation += 1
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if coordinator.generation == 2 and coordinator.data.available:
+            break
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed",
+        fatal_alert="access_denied",
+    )
     await coordinator.async_reconcile()
     assert coordinator.authentication_rejected
     assert not coordinator.last_update_success
@@ -1175,11 +1475,88 @@ async def test_command_fatal_auth_confirmation_is_exposed(
     )
     with pytest.raises(CommandRejected):
         await coordinator.async_command(CommandKind.POWER, True)
-    coordinator._generation += 1
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if coordinator.generation == 2 and coordinator.data.available:
+            break
+    coordinator.transport.async_post.side_effect = TransportError(
+        "transport_post_rejected",
+        coap_code=131,
+    )
     with pytest.raises(CommandRejected):
         await coordinator.async_command(CommandKind.POWER, True)
     assert coordinator.authentication_rejected
     assert not coordinator.last_update_success
+
+
+async def test_reconcile_fatal_auth_forces_fresh_generation_before_confirmation(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed",
+        fatal_alert="access_denied",
+    )
+
+    await coordinator.async_reconcile()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if coordinator.generation == 2 and coordinator.data.available:
+            break
+
+    assert coordinator.generation == 2
+    assert coordinator.data.available
+    assert not coordinator.authentication_rejected
+    await coordinator.async_poll_path(HOT_PATHS[0])
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed",
+        fatal_alert="access_denied",
+    )
+    await coordinator.async_reconcile()
+    assert coordinator.authentication_rejected
+    assert not coordinator.data.available
+
+
+async def test_command_fatal_auth_forces_fresh_generation_before_confirmation(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_post.side_effect = TransportError(
+        "transport_post_rejected",
+        coap_code=131,
+    )
+
+    with pytest.raises(CommandRejected):
+        await coordinator.async_command(CommandKind.POWER, True)
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if coordinator.generation == 2 and coordinator.data.available:
+            break
+
+    assert coordinator.generation == 2
+    assert coordinator.data.available
+    assert not coordinator.authentication_rejected
+    await coordinator.async_poll_path(HOT_PATHS[0])
+    coordinator.transport.async_post.side_effect = TransportError(
+        "transport_post_rejected",
+        coap_code=131,
+    )
+    with pytest.raises(CommandRejected):
+        await coordinator.async_command(CommandKind.POWER, True)
+    assert coordinator.authentication_rejected
+    assert not coordinator.data.available
+
+
+async def test_nonfatal_reconcile_error_keeps_current_generation_connected(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    active = coordinator.transport
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed",
+        fatal_alert="handshake_failure",
+    )
+    await coordinator.async_reconcile()
+    assert coordinator.transport is active
+    assert coordinator.generation == 1
+    assert not coordinator.authentication_rejected
 
 
 @pytest.mark.parametrize("stage", ["post", "wait", "get", "related"])
