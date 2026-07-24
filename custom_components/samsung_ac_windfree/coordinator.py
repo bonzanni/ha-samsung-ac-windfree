@@ -131,6 +131,51 @@ class ScheduledResource:
     deadline: float
 
 
+@dataclass(frozen=True, slots=True)
+class CoordinatorHealth:
+    """Fixed, privacy-safe runtime health projection."""
+
+    available: bool
+    generation: int
+    connection_reason: str | None
+    failure_count: int
+    reconnect_attempts: int
+    reconnect_delay_seconds: int
+    authentication_rejected: bool
+    port_range_exhausted: bool
+    resource_contract_changed: bool
+    unsupported_identity_after_update: bool
+    source: UpdateSource
+    hot_age_seconds: float
+    poll_count: int
+    observe_count: int
+    reconcile_count: int
+    command_count: int
+    latency_under_100ms: int
+    latency_under_500ms: int
+    latency_under_1s: int
+    latency_at_least_1s: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceCoverage:
+    """Fixed resource-presence flags with no resource names or payloads."""
+
+    power: bool
+    hvac_mode: bool
+    temperature: bool
+    fan: bool
+    swing: bool
+    preset: bool
+    humidity: bool
+    energy: bool
+    alarms: bool
+    display_light: bool
+    auto_clean: bool
+    filter: bool
+    current_limit: bool
+
+
 @dataclass(order=True, frozen=True, slots=True)
 class _HeapItem:
     deadline: float
@@ -354,6 +399,14 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._connection_reason: str | None = None
         self._identity_drift = False
         self._disabled_write_paths: set[str] = set()
+        self._reconnect_attempts = 0
+        self._port_range_exhausted = False
+        self._update_counts = {
+            UpdateSource.POLL: 0,
+            UpdateSource.OBSERVE: 0,
+            UpdateSource.RECONCILE: 0,
+            UpdateSource.COMMAND: 0,
+        }
         self._latency_buckets = {
             "under_100ms": 0,
             "under_500ms": 0,
@@ -412,7 +465,67 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             max(0.0, now - self._last_updates.get(path, now)) for path in HOT_PATHS
         )
 
+    @property
+    def health(self) -> CoordinatorHealth:
+        """Return only fixed scalar health fields without performing I/O."""
+
+        reason = (
+            self._connection_reason
+            if self._connection_reason
+            in {
+                "authentication_rejected",
+                "possible_competing_session",
+            }
+            else None
+        )
+        return CoordinatorHealth(
+            available=bool(self.data.available),
+            generation=max(0, int(self._generation)),
+            connection_reason=reason,
+            failure_count=max(0, int(self._hot_failures)),
+            reconnect_attempts=max(0, int(self._reconnect_attempts)),
+            reconnect_delay_seconds=max(0, int(self._reconnect_delay)),
+            authentication_rejected=bool(self._authentication_rejected),
+            port_range_exhausted=bool(self._port_range_exhausted),
+            resource_contract_changed=bool(self._disabled_write_paths)
+            and not self._identity_drift,
+            unsupported_identity_after_update=bool(self._identity_drift),
+            source=self.data.update_source,
+            hot_age_seconds=round(max(0.0, self.stalest_hot_age), 3),
+            poll_count=self._update_counts[UpdateSource.POLL],
+            observe_count=self._update_counts[UpdateSource.OBSERVE],
+            reconcile_count=self._update_counts[UpdateSource.RECONCILE],
+            command_count=self._update_counts[UpdateSource.COMMAND],
+            latency_under_100ms=self._latency_buckets["under_100ms"],
+            latency_under_500ms=self._latency_buckets["under_500ms"],
+            latency_under_1s=self._latency_buckets["under_1s"],
+            latency_at_least_1s=self._latency_buckets["at_least_1s"],
+        )
+
+    @property
+    def resource_coverage(self) -> ResourceCoverage:
+        """Return only fixed resource-presence booleans without I/O."""
+
+        resources = self._resources
+        return ResourceCoverage(
+            power=POWER_PATH in resources,
+            hvac_mode=HVAC_MODE_PATH in resources,
+            temperature=TEMPERATURE_PATH in resources,
+            fan=FAN_PATH in resources,
+            swing=SWING_PATH in resources,
+            preset=PRESET_PATH in resources,
+            humidity=HUMIDITY_PATH in resources,
+            energy=ENERGY_PATH in resources,
+            alarms=ALARMS_PATH in resources,
+            display_light=DISPLAY_LIGHT_PATH in resources,
+            auto_clean=AUTO_CLEAN_PATH in resources,
+            filter=FILTER_PATH in resources,
+            current_limit=CURRENT_LIMIT_PATH in resources,
+        )
+
     def _publish(self, data: WindFreeData) -> None:
+        if data.update_source in self._update_counts:
+            self._update_counts[data.update_source] += 1
         self.async_set_updated_data(data)
 
     def _publish_unavailable(self, reason: str) -> None:
@@ -685,6 +798,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._hot_failures = 0
         self._stored_port_failures = 0
         self._reconnect_delay = 0
+        self._port_range_exhausted = False
         self._started = True
         self._publish(seeded.data)
 
@@ -1412,6 +1526,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
     async def _async_run_reconnect_attempt_locked(self) -> None:
         if self._shutting_down or self._authentication_rejected:
             return
+        self._reconnect_attempts += 1
         if not await self._async_drain_inactive_transports():
             await self._async_reconnect_failure(
                 max(self._generation_attempt, self._generation),
@@ -1454,6 +1569,10 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             except asyncio.CancelledError:
                 raise
             except Exception as discovery_error:
+                if isinstance(discovery_error, ConnectionError) and not isinstance(
+                    discovery_error, TransportError
+                ):
+                    self._port_range_exhausted = True
                 await self._async_reconnect_failure(
                     generation,
                     discovery_error,

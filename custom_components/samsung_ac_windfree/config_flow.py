@@ -24,6 +24,7 @@ from .models import (
     UnsupportedDevice,
     WindFreeError,
 )
+from .repairs import async_sync_bootstrap_issue
 from .transport import TransportError, WindFreeTransport, async_discover_transport
 
 BOOTSTRAP_TIMEOUT = 30.0
@@ -448,6 +449,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             error = None
         finally:
             self._validation_task = None
+        if self._error in {"bootstrap_pin_mismatch", "bootstrap_unavailable"}:
+            async_sync_bootstrap_issue(self.hass, self._error)
+        elif self._validated is not None or self._error in {
+            "bootstrap_invalid_material",
+            "cannot_connect",
+            "unsupported_device",
+            "capability_mismatch",
+        }:
+            async_sync_bootstrap_issue(self.hass, None)
         return self.async_show_progress_done(next_step_id="finish")
 
     async def async_step_finish(

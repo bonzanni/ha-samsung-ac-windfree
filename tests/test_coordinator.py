@@ -160,6 +160,50 @@ async def test_start_seeds_identity_contract_observe_and_immutable_data(
         coordinator.data.available = False
 
 
+async def test_health_snapshot_is_fixed_safe_and_counts_update_sources(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    initial = coordinator.health
+    assert initial.generation == 1
+    assert initial.reconcile_count >= 1
+    assert initial.observe_count == 0
+    assert not hasattr(initial, "host")
+    assert not hasattr(initial, "resources")
+
+    coordinator.handle_observe(
+        generation=coordinator.generation,
+        path=POWER_PATH,
+        representation={"x.com.samsung.da.power": "On"},
+    )
+
+    health = coordinator.health
+    assert health.observe_count == 1
+    assert health.source is UpdateSource.OBSERVE
+    assert health.hot_age_seconds >= 0
+    assert health.latency_under_100ms >= 0
+
+
+async def test_failed_exact_range_discovery_sets_and_recovery_clears_health(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    coordinator._stored_port_failures = 2
+    factory.reconnect.side_effect = TransportError("connect")
+    factory.discover.side_effect = ConnectionError(
+        "transport_discovery_failed: private details"
+    )
+
+    await coordinator.async_run_reconnect_attempt()
+
+    assert coordinator.health.port_range_exhausted
+    assert coordinator.health.reconnect_attempts == 1
+
+    factory.reconnect.side_effect = factory._reconnect
+    await coordinator.async_run_reconnect_attempt()
+
+    assert not coordinator.health.port_range_exhausted
+
+
 async def test_old_generation_observe_is_ignored(
     coordinator: WindFreeCoordinator,
 ) -> None:
@@ -582,6 +626,8 @@ async def test_identity_drift_disables_all_writes(
     coordinator.transport_factory.resources["/oic/d"]["mnmo"] = "other"
     await coordinator.async_reconcile()
     assert coordinator.identity_drift
+    assert coordinator.health.unsupported_identity_after_update
+    assert not coordinator.health.resource_contract_changed
     with pytest.raises(CommandRejected):
         await coordinator.async_command(CommandKind.POWER, True)
 
@@ -592,6 +638,8 @@ async def test_resource_drift_disables_only_affected_path(
     coordinator.transport_factory.resources["/device/0"][POWER_PATH] = {}
     await coordinator.async_reconcile()
     assert POWER_PATH in coordinator.disabled_write_paths
+    assert coordinator.health.resource_contract_changed
+    assert not coordinator.health.unsupported_identity_after_update
     with pytest.raises(CommandRejected):
         await coordinator.async_command(CommandKind.POWER, True)
 

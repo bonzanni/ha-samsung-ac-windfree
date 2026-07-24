@@ -130,3 +130,32 @@ async def test_unknown_repair_aborts_without_action(hass) -> None:
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "unknown_issue"
+
+
+async def test_authentication_repair_confirms_reauth_without_private_data(
+    hass,
+) -> None:
+    from custom_components.samsung_ac_windfree.repairs import async_create_fix_flow
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "host": "192.0.2.10",
+            "device_id": "00000000-0000-4000-8000-000000000001",
+            "client_key_pem": "PRIVATE KEY",
+        },
+    )
+    entry.add_to_hass(hass)
+    entry.async_start_reauth = MagicMock()
+    flow = await async_create_fix_flow(hass, "authentication_rejected", None)
+    flow.hass = hass
+
+    result = await flow.async_step_init()
+    assert result["type"] is FlowResultType.FORM
+    result = await flow.async_step_confirm({})
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    entry.async_start_reauth.assert_called_once_with(hass)
+    assert "192.0.2.10" not in repr(result)
+    assert "00000000-0000-4000-8000-000000000001" not in repr(result)
+    assert "PRIVATE KEY" not in repr(result)

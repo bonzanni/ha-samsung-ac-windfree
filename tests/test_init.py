@@ -381,6 +381,56 @@ async def test_expired_certificate_starts_reauth_without_constructing_coordinato
     constructor.assert_not_called()
 
 
+async def test_fresh_certificate_deletes_stale_expiry_issue(
+    hass,
+    credentials,
+) -> None:
+    from custom_components.samsung_ac_windfree import async_setup_entry
+
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = _entry(
+        credentials,
+        not_after=(now + timedelta(days=91)).isoformat(),
+    )
+    coordinator = MagicMock()
+    coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
+    coordinator.async_add_listener.return_value = MagicMock()
+    coordinator.authentication_rejected = False
+    coordinator.health.authentication_rejected = False
+    coordinator.health.resource_contract_changed = False
+    coordinator.health.unsupported_identity_after_update = False
+    coordinator.health.port_range_exhausted = False
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "certificate_expiring",
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="certificate_expiring",
+    )
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.dt_util.utcnow",
+            return_value=now,
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)
+
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "certificate_expiring") is None
+
+
 async def test_not_yet_valid_certificate_starts_reauth_offline(
     hass, credentials
 ) -> None:

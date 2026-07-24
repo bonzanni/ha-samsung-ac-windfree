@@ -16,16 +16,19 @@ from homeassistant.config_entries import (
     ConfigEntryNotReady,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
-from .const import CERT_REPAIR_WINDOW, DOMAIN, PLATFORMS
+from .const import DOMAIN, PLATFORMS
 from .coordinator import WindFreeCoordinator
 from .models import (
     AuthenticationRejected,
     CapabilityMismatch,
     Credentials,
     UnsupportedDevice,
+)
+from .repairs import (
+    async_sync_certificate_issue,
+    async_sync_runtime_issues,
 )
 
 type WindFreeConfigEntry = ConfigEntry[WindFreeCoordinator]
@@ -61,6 +64,10 @@ class _EntryLifecycle:
     def handle_update(self) -> None:
         """Start reauth once, only while the entry is fully active."""
 
+        async_sync_runtime_issues(
+            self.coordinator.hass,
+            self.coordinator.health,
+        )
         if (
             not self.suppressed
             and self.coordinator.authentication_rejected
@@ -271,16 +278,7 @@ async def async_setup_entry(
         del host, credentials, starts, expires, now, entry
         raise ConfigEntryAuthFailed("credentials_expired") from None
 
-    if expires - now <= CERT_REPAIR_WINDOW:
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            "certificate_expiring",
-            is_fixable=True,
-            is_persistent=True,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="certificate_expiring",
-        )
+    async_sync_certificate_issue(hass, expires, now=now)
 
     coordinator = WindFreeCoordinator(
         hass,
@@ -293,6 +291,7 @@ async def async_setup_entry(
     cancellation_args: tuple[object, ...] | None = None
     try:
         await coordinator.async_start()
+        async_sync_runtime_issues(hass, coordinator.health)
         if coordinator.authentication_rejected:
             raise AuthenticationRejected("authentication_rejected")
         entry.runtime_data = coordinator

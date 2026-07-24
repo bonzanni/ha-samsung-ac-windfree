@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.samsung_ac_windfree.const import DOMAIN
@@ -161,6 +162,60 @@ async def test_flow_maps_only_sanitized_validation_errors(
     assert result["step_id"] == "user"
     assert result["errors"] == {"base": error_key}
     assert HOST not in repr(result["errors"])
+
+
+async def test_bootstrap_flow_issue_transitions_and_success_recovery(
+    hass,
+    validated_setup,
+) -> None:
+    registry = ir.async_get(hass)
+    validate = AsyncMock(
+        side_effect=[
+            BootstrapError("bootstrap_pin_mismatch: changed"),
+            BootstrapError("bootstrap_unavailable: unavailable"),
+            validated_setup,
+        ]
+    )
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_validate_setup",
+            validate,
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.async_setup_entry",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        result = await _finish_progress(hass, result)
+        assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
+        assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+        hass.config_entries.flow.async_abort(result["flow_id"])
+
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        result = await _finish_progress(hass, result)
+        assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
+        assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is not None
+        hass.config_entries.flow.async_abort(result["flow_id"])
+
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await _finish_progress(hass, result)
+
+    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
+    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
 
 
 async def test_duplicate_device_aborts_after_local_validation(
