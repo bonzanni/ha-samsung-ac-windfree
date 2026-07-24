@@ -1767,6 +1767,8 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         if publish:
             self._require_command_epoch(epoch)
             self._publish(result)
+        if kind is CommandKind.HVAC_MODE:
+            self._mode_settle_until = self._monotonic() + MODE_SETTLE_SECONDS
         return result
 
     async def _async_set_hvac_mode_locked(self, mode: HvacMode, epoch: int) -> None:

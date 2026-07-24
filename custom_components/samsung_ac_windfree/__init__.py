@@ -15,7 +15,8 @@ from homeassistant.config_entries import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import COMPATIBILITY, DOMAIN, PLATFORMS
@@ -246,6 +247,15 @@ async def _async_reload_entry(
         raise _translated_entry_error(ConfigEntryError, "reload_failed") from None
 
 
+async def _async_shutdown_on_home_assistant_stop(
+    coordinator: WindFreeCoordinator,
+    _event: Event,
+) -> None:
+    """Stop background work before Home Assistant reaches final writes."""
+
+    await coordinator.async_shutdown()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: WindFreeConfigEntry,
@@ -332,6 +342,12 @@ async def async_setup_entry(
         lifecycle.attach()
         _lifecycles(hass)[entry.entry_id] = lifecycle
         entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+        entry.async_on_unload(
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP,
+                partial(_async_shutdown_on_home_assistant_stop, coordinator),
+            )
+        )
     except asyncio.CancelledError as cancelled:
         cancellation_args = cancelled.args
         cancelled.__traceback__ = None

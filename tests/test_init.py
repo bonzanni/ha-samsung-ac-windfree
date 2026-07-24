@@ -18,6 +18,7 @@ from homeassistant.config_entries import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -160,6 +161,38 @@ async def test_setup_is_offline_and_forwards_only_after_coordinator_start(
     assert supplied["port"] == 49154
     assert supplied["credentials"] == credentials
     assert credentials.client_key_pem not in repr(constructor.call_args)
+
+
+async def test_setup_shuts_down_coordinator_on_home_assistant_stop(
+    hass, credentials
+) -> None:
+    from custom_components.samsung_ac_windfree import async_setup_entry
+
+    entry = _entry(credentials)
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
+    coordinator.async_add_listener.return_value = MagicMock()
+    coordinator.authentication_rejected = False
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+
+    coordinator.async_shutdown.assert_awaited_once_with()
 
 
 async def test_setup_failure_shuts_down_coordinator_before_reraising(
@@ -792,6 +825,7 @@ async def test_auth_listener_stays_suppressed_during_successful_shutdown(
     entry.async_start_reauth = MagicMock()
     coordinator = MagicMock()
     coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
     coordinator.authentication_rejected = False
     listener = None
     unsubscribe = MagicMock()
@@ -1086,6 +1120,7 @@ async def test_update_reload_suppresses_auth_listener_and_does_not_start_reauth(
     entry.async_start_reauth = MagicMock()
     coordinator = MagicMock()
     coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
     coordinator.authentication_rejected = False
     listener = None
     unsubscribe = MagicMock()
@@ -1136,6 +1171,7 @@ async def test_failed_reload_after_successful_unload_does_not_restore_old_lifecy
     entry.async_start_reauth = MagicMock()
     coordinator = MagicMock()
     coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
     coordinator.authentication_rejected = False
     listeners = []
     unsubscribes = []
@@ -1192,6 +1228,7 @@ async def test_failed_reload_unload_restores_and_reconciles_auth_once(
     entry.async_start_reauth = MagicMock()
     coordinator = MagicMock()
     coordinator.async_start = AsyncMock()
+    coordinator.async_shutdown = AsyncMock()
     coordinator.authentication_rejected = False
     listeners = []
 

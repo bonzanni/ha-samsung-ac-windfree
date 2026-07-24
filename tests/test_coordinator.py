@@ -660,6 +660,43 @@ async def test_mode_settle_applies_before_temperature_write(
     assert post_times[1][1] - post_times[0][1] == 2.0
 
 
+async def test_mode_settle_restarts_after_mode_verification(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    post_times: list[tuple[str, float]] = []
+    original_get = coordinator.transport_factory._get
+    original_post = coordinator.transport_factory._post
+    mode_posted = False
+    verification_delayed = False
+
+    async def get(path: str) -> dict[str, object]:
+        nonlocal verification_delayed
+        if path == HVAC_MODE_PATH and mode_posted and not verification_delayed:
+            verification_delayed = True
+            await coordinator._sleep(1.0)
+        return await original_get(path)
+
+    async def post(path: str, payload: object) -> None:
+        nonlocal mode_posted
+        post_times.append((path, coordinator._monotonic()))
+        await original_post(path, payload)
+        if path == HVAC_MODE_PATH:
+            mode_posted = True
+
+    coordinator.transport.async_get.side_effect = get
+    coordinator.transport.async_post.side_effect = post
+
+    await coordinator.async_command(CommandKind.HVAC_MODE, HvacMode.HEAT)
+    await coordinator.async_command(CommandKind.TEMPERATURE, 27.0)
+
+    assert verification_delayed
+    assert [path for path, _time in post_times] == [
+        HVAC_MODE_PATH,
+        TEMPERATURE_PATH,
+    ]
+    assert post_times[1][1] - post_times[0][1] == 3.0
+
+
 async def test_power_failure_retains_verified_remembered_mode(
     coordinator: WindFreeCoordinator,
 ) -> None:
