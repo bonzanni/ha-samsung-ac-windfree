@@ -2440,6 +2440,9 @@ the claimed Silver rules truthful on Home Assistant 2026.7:
   admission gate owns outbound serialization;
 - coordinator recovery emits one fixed, sanitized info log only on each
   unavailable-to-available transition;
+- clean shutdown publishes terminal entity unavailability as lifecycle state,
+  without converting an intentional unload/reload into a connection ERROR or
+  recovery transition;
 - all config-entry lifecycle exceptions use Home Assistant translation metadata
   with no placeholders, backed by an exhaustive English exception-key set;
 - the cool/warm example uses one conditional `choose` action driven by an input

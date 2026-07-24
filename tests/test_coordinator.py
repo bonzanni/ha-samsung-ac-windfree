@@ -847,7 +847,7 @@ async def test_shutdown_joins_every_inflight_public_io_without_resurrection(
         await asyncio.sleep(0)
         assert coordinator._resources == resources
         assert not coordinator.data.available
-        assert not coordinator.last_update_success
+        assert coordinator.last_update_success
     finally:
         never.set()
         if not operation.done():
@@ -915,7 +915,7 @@ async def test_registered_child_can_request_shutdown_without_join_cycle(
     assert not coordinator._operation_tasks
     assert not coordinator._operation_completions
     assert not coordinator.data.available
-    assert not coordinator.last_update_success
+    assert coordinator.last_update_success
     assert True not in publications
     await coordinator.async_shutdown()
 
@@ -1032,13 +1032,32 @@ async def test_turn_on_rejects_and_publishes_authoritative_mode_coercion(
     assert coordinator.data.climate.mode is HvacMode.COOL
 
 
-async def test_shutdown_uses_coordinator_failure_semantics(
+async def test_clean_shutdown_publishes_lifecycle_unavailable_without_logs(
     coordinator: WindFreeCoordinator,
+    caplog,
 ) -> None:
     assert coordinator.last_update_success
-    await coordinator.async_shutdown()
-    assert not coordinator.last_update_success
+    caplog.clear()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_components.samsung_ac_windfree.coordinator",
+    ):
+        await coordinator.async_shutdown()
+        coordinator.handle_observe(
+            coordinator.generation,
+            POWER_PATH,
+            {"x.com.samsung.da.power": "On"},
+        )
+        await coordinator.async_shutdown()
+
+    assert coordinator.last_update_success
     assert not coordinator.data.available
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+    assert not any(
+        record.message == "Samsung WindFree connection recovered"
+        for record in caplog.records
+    )
 
 
 def test_unavailable_recovery_logging_is_once_per_transition_and_private(
@@ -1230,7 +1249,7 @@ async def test_shutdown_close_failure_retains_transport_for_retry(
     await coordinator.async_shutdown()
     assert active.async_close.await_count == 2
     assert not coordinator.data.available
-    assert not coordinator.last_update_success
+    assert coordinator.last_update_success
 
 
 async def test_shutdown_close_cancellation_retains_transport_for_retry(
@@ -1248,7 +1267,7 @@ async def test_shutdown_close_cancellation_retains_transport_for_retry(
 
     assert active.async_close.await_count == 2
     assert not coordinator.data.available
-    assert not coordinator.last_update_success
+    assert coordinator.last_update_success
 
 
 async def test_shutdown_retries_only_the_exact_transport_that_failed_to_close(

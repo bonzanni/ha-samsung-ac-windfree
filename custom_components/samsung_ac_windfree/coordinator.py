@@ -536,6 +536,11 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self.data = replace(self.data, available=False)
         self.async_set_update_error(UpdateFailed(reason))
 
+    def _publish_lifecycle_unavailable(self) -> None:
+        """Publish a clean terminal state without reporting a connection error."""
+
+        self.async_set_updated_data(replace(self.data, available=False))
+
     def _finish_command_task(
         self,
         task: asyncio.Task[_CommandOutcome],
@@ -1001,7 +1006,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._scheduler_task = None
         self._reconnect_task = None
         self._started = False
-        self._publish_unavailable("coordinator_shutdown")
+        self._publish_lifecycle_unavailable()
         owned: list[WindFreeTransport] = []
         for transport in (
             self._transport,
