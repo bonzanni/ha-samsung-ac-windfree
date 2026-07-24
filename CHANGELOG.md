@@ -28,3 +28,13 @@ All notable changes to this project are documented in this file.
   conditioner by host.
 - Undocumented command combinations. Temperature, fan, swing, and preset writes
   are rejected outside the verified Cool-mode contract.
+
+### Verification
+
+- local automated tests: 744 passed
+- coverage: 95.21%, passed
+- local dependency contract: 3 passed
+- architecture import smoke: 2 of 2 passed
+- hassfest: 1 integration checked, 0 invalid
+- HACS: pending CI
+- live AC gate: pending authorized production-console run

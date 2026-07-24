@@ -485,6 +485,8 @@ async def async_migrate_entry(
 
     if entry.version != 1:
         return False
+    if entry.minor_version > _ENTRY_MINOR_VERSION:
+        return False
     if entry.minor_version < _ENTRY_MINOR_VERSION:
         hass.config_entries.async_update_entry(
             entry,

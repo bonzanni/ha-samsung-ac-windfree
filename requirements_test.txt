@@ -1,4 +1,6 @@
 pytest-homeassistant-custom-component==0.13.347
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
 ruff==0.15.21
 smartthings-local==0.1.0
 cbor2==6.1.3

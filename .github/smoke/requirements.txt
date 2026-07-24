@@ -1,0 +1,2 @@
+smartthings-local==0.1.0
+cbor2==6.1.3

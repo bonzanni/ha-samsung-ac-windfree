@@ -108,30 +108,31 @@ async def _async_close_validation_transport(
         transport.async_close(),
         "windfree setup transport cleanup",
     )
+    cancellation_args: tuple[object, ...] | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as cancelled:
+            cancellation_args = cancelled.args
+            cancelled.__traceback__ = None
+            cancelled = None
+    closed = True
     try:
-        await asyncio.shield(task)
+        task.result()
     except asyncio.CancelledError as cancelled:
-        cancellation_args = cancelled.args
         cancelled.__traceback__ = None
         cancelled = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as repeated:
-                cancellation_args = repeated.args
-                repeated.__traceback__ = None
-                repeated = None
-        try:
-            task.result()
-        except Exception:
-            pass
-        del transport, task
-        raise asyncio.CancelledError(*cancellation_args) from None
+        closed = False
     except Exception as error:
         error.__traceback__ = None
         error = None
-        return False
-    return True
+        closed = False
+    if cancellation_args is not None:
+        args = cancellation_args
+        cancellation_args = None
+        del transport, task
+        raise asyncio.CancelledError(*args) from None
+    return closed
 
 
 async def _async_validate_pipeline(

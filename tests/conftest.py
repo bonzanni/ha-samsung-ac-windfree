@@ -21,6 +21,11 @@ from custom_components.samsung_ac_windfree.bootstrap import (
     create_credentials,
 )
 from custom_components.samsung_ac_windfree.models import Credentials
+from tests.resource_limits import apply_address_space_limit
+
+# Protect every Linux test invocation, including local runs outside CI.
+# Set PYTEST_RLIMIT_AS_GB=0 only for deliberate memory profiling.
+apply_address_space_limit()
 
 _NOT_BEFORE = datetime(2020, 1, 1, tzinfo=UTC)
 _NOT_AFTER = datetime(2040, 1, 1, tzinfo=UTC)

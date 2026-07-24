@@ -149,7 +149,6 @@
   },
   "issues": {
     "authentication_rejected": {
-      "description": "The air conditioner rejected the stored local client certificate. Renew the credentials while Home Assistant has temporary internet access.",
       "fix_flow": {
         "abort": {
           "issue_resolved": "The authentication issue is no longer active",
@@ -173,7 +172,6 @@
       "title": "Samsung WindFree bootstrap is unavailable"
     },
     "certificate_expiring": {
-      "description": "The locally stored client certificate is approaching expiry. Renew it before expiry while Home Assistant has temporary internet access.",
       "fix_flow": {
         "abort": {
           "issue_resolved": "The certificate expiry issue is no longer active",

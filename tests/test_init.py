@@ -1246,6 +1246,27 @@ async def test_version_one_minor_zero_migrates_once(hass, credentials) -> None:
     update.assert_not_called()
 
 
+async def test_future_minor_version_is_rejected_without_downgrade(
+    hass, credentials
+) -> None:
+    from custom_components.samsung_ac_windfree import async_migrate_entry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=DEVICE_ID,
+        data=_entry_data(credentials),
+        version=1,
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+
+    with patch.object(hass.config_entries, "async_update_entry") as update:
+        assert not await async_migrate_entry(hass, entry)
+
+    assert entry.minor_version == 2
+    update.assert_not_called()
+
+
 async def test_invalid_stored_validity_is_sanitized_and_offline(
     hass, credentials
 ) -> None:
@@ -1528,13 +1549,14 @@ def test_all_repair_issue_and_fix_flow_keys_are_defined() -> None:
 
     assert set(issues) == _ISSUE_KEYS
     for issue_id, issue in issues.items():
-        assert {"title", "description"} <= set(issue)
         if issue_id in {"authentication_rejected", "certificate_expiring"}:
+            assert set(issue) == {"title", "fix_flow"}
             fix_flow = issue["fix_flow"]
             assert set(fix_flow["step"]) == {"confirm"}
             assert {"title", "description"} == set(fix_flow["step"]["confirm"])
             assert {"issue_resolved", "unknown_issue"} <= set(fix_flow["abort"])
         else:
+            assert {"title", "description"} <= set(issue)
             assert "fix_flow" not in issue
 
 

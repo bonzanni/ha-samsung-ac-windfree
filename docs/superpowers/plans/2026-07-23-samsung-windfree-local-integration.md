@@ -2470,25 +2470,28 @@ separately as `fix: complete WindFree quality metadata`.
 
 Create jobs for:
 
-1. Minimum pytest on x86-64 using `requirements_test_min.txt`, whose
-   `pytest-homeassistant-custom-component==0.13.333` pins HA `2026.5.4`
-2. Stable pytest on both `ubuntu-latest` x86-64 and
+1. Stable pytest on both `ubuntu-latest` x86-64 and
    `ubuntu-24.04-arm` arm64 using `requirements_test.txt`, whose
    `pytest-homeassistant-custom-component==0.13.347` pins HA `2026.7.3`
-3. A non-blocking scheduled beta canary that creates an isolated environment,
+2. A non-blocking scheduled beta canary that creates an isolated environment,
    runs `pip install --pre --upgrade pytest-homeassistant-custom-component
    smartthings-local==0.1.0 cbor2==6.1.3`, records the resolved HA version, and
    runs the complete suite
-4. Resolved dependency closure capture in every pytest leg
-5. The real dependency contract test in every pytest leg
-6. A QEMU/buildx dependency-install and import smoke matrix for
+3. Resolved dependency closure capture in every pytest leg
+4. The real dependency contract test in every pytest leg
+5. A QEMU/buildx dependency-install and import smoke matrix for
    `linux/amd64` and `linux/arm64`, the supported HA architecture set for this
    release
-7. Ruff format/check
-8. hassfest
-9. HACS integration validation
-10. Scheduled Samsung leaf/SPKI pin canary that reports mismatch without
+6. Ruff format/check
+7. hassfest
+8. HACS integration validation
+9. Scheduled Samsung leaf/SPKI pin canary that reports mismatch without
    committing or accepting new material
+
+The previously planned HA `2026.5.4` minimum leg was removed after its isolated
+Task 12 run failed at collection: that release does not export
+`RepairsFlowResult`, which this HA `2026.7` integration requires. The truthful
+minimum supported version and HACS metadata are therefore `2026.7.3`.
 
 Use Python 3.14, `actions/checkout@v4`, `actions/setup-python@v5`,
 `home-assistant/actions/hassfest@master`, and `hacs/action@main`.

@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Hangs must die with a stack dump, not spin for an hour (2026-07-24 OOM):
+# the thread method fires even when the asyncio event loop is blocked.
+addopts = "--timeout=120 --timeout-method=thread"
 
 [tool.coverage.run]
 source = ["custom_components/samsung_ac_windfree"]
