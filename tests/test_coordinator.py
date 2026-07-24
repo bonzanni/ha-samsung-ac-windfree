@@ -632,10 +632,32 @@ async def test_mode_settle_rechecks_deadline_after_an_early_wakeup(
     coordinator._sleep = early_once_sleep
     coordinator._mode_settle_until = 102.0
 
-    await coordinator._async_wait_for_mode_settle(CommandKind.POWER)
+    await coordinator._async_wait_for_mode_settle()
 
     assert sleeps == [2.0, 0.25]
     assert now == 102.0
+
+
+async def test_mode_settle_applies_before_temperature_write(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    post_times: list[tuple[str, float]] = []
+    original_post = coordinator.transport_factory._post
+
+    async def post(path: str, payload: object) -> None:
+        post_times.append((path, coordinator._monotonic()))
+        await original_post(path, payload)
+
+    coordinator.transport.async_post.side_effect = post
+
+    await coordinator.async_command(CommandKind.HVAC_MODE, HvacMode.HEAT)
+    await coordinator.async_command(CommandKind.TEMPERATURE, 27.0)
+
+    assert [path for path, _time in post_times] == [
+        HVAC_MODE_PATH,
+        TEMPERATURE_PATH,
+    ]
+    assert post_times[1][1] - post_times[0][1] == 2.0
 
 
 async def test_power_failure_retains_verified_remembered_mode(

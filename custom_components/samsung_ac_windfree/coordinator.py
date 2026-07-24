@@ -1694,9 +1694,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         except TimeoutError:
             return False
 
-    async def _async_wait_for_mode_settle(self, kind: CommandKind) -> None:
-        if kind not in {CommandKind.POWER, CommandKind.HVAC_MODE}:
-            return
+    async def _async_wait_for_mode_settle(self) -> None:
         while (remaining := self._mode_settle_until - self._monotonic()) > 0:
             await self._sleep(remaining)
 
@@ -1722,7 +1720,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         event = asyncio.Event()
         self._observe_events[command.path] = event
         try:
-            await self._async_wait_for_mode_settle(kind)
+            await self._async_wait_for_mode_settle()
             try:
                 await self.transport.async_post(command.path, command.payload)
             finally:
