@@ -96,6 +96,35 @@ class _CallFailure:
     fatal_alert: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PublicFailure:
+    operation: str
+    fatal_alert: str | None = None
+    coap_code: int | None = None
+    error_kind: str = "transport"
+
+
+def _raise_public_failure(result: _PublicFailure) -> None:
+    operation = result.operation
+    fatal_alert = result.fatal_alert
+    coap_code = result.coap_code
+    error_kind = result.error_kind
+    del result
+    if error_kind == "value":
+        raise ValueError(
+            "transport_discovery_invalid_ports: ports are outside the safe range"
+        )
+    if error_kind == "connection":
+        raise ConnectionError(
+            "transport_discovery_failed: no authenticated local endpoint"
+        )
+    raise TransportError(
+        operation,
+        fatal_alert=fatal_alert,
+        coap_code=coap_code,
+    )
+
+
 def _extract_ssl_alert(error: SSL.Error) -> str | None:
     if len(error.args) != 1 or not isinstance(error.args[0], list):
         return None
@@ -186,10 +215,6 @@ def _encode_representation(
     return encoded
 
 
-def _redacted_target() -> None:
-    """Replace sensitive callable locals before cancellation escapes."""
-
-
 async def _await_executor[T](
     hass: HomeAssistant,
     target: Callable[..., T],
@@ -203,9 +228,9 @@ async def _await_executor[T](
             await asyncio.shield(job)
         except Exception:
             pass
-        target = _redacted_target
-        args = ()
         raise
+    finally:
+        del target, args, job
 
 
 async def _executor_outcome[T](
@@ -216,13 +241,13 @@ async def _executor_outcome[T](
     try:
         return await _await_executor(hass, target, *args)
     except asyncio.CancelledError:
-        target = _redacted_target
-        args = ()
         raise
     except Exception as error:
         fatal_alert = _extract_fatal_alert(error)
         error = None
         return _CallFailure(fatal_alert)
+    finally:
+        del target, args
 
 
 def _close_and_join(session: DtlsCoapSession) -> _CallFailure | None:
@@ -275,9 +300,8 @@ class WindFreeTransport:
         self._credentials = None
         if credentials is None:
             return _CallFailure(None)
-        try:
-            return await _executor_outcome(
-                self._hass,
+        job = asyncio.ensure_future(
+            self._hass.async_add_executor_job(
                 _build_session,
                 self._session_factory,
                 self._host,
@@ -285,65 +309,90 @@ class WindFreeTransport:
                 credentials,
                 self._handshake_timeout,
             )
+        )
+        built: DtlsCoapSession | _CallFailure = _CallFailure(None)
+        try:
+            built = await asyncio.shield(job)
+            return built
+        except asyncio.CancelledError:
+            try:
+                built = await asyncio.shield(job)
+            except Exception:
+                built = _CallFailure(None)
+            if not isinstance(built, _CallFailure):
+                self._session = built
+            raise
         finally:
-            credentials = None
+            del credentials, job, built
 
-    async def async_connect(self) -> None:
-        """Construct, connect, and start exactly one blocking session."""
-        failure: TransportError | None = None
+    async def _async_cleanup_bounded(self) -> None:
+        cleanup = self._ensure_cleanup_task()
+        try:
+            if cleanup is not None:
+                await self._wait_for_cleanup(cleanup)
+        finally:
+            del cleanup
+
+    async def _async_connect_result(self) -> _PublicFailure | None:
+        built: DtlsCoapSession | _CallFailure | None = None
+        session: DtlsCoapSession | None = None
+        connected: object = None
+        reader: object = None
         try:
             async with self._lifecycle_lock:
                 if self._closed:
-                    raise TransportError("transport_closed")
+                    return _PublicFailure("transport_closed")
                 if self._connected:
-                    return
+                    return None
                 built = await self._async_build_session()
                 if isinstance(built, _CallFailure):
-                    failure = TransportError(
+                    return _PublicFailure(
                         "transport_connect_failed",
                         fatal_alert=built.fatal_alert,
                     )
-                else:
-                    session = built
-                    self._session = session
-                    connected = await _executor_outcome(
-                        self._hass,
-                        session.connect,
+                session = built
+                self._session = session
+                if self._closed:
+                    return _PublicFailure("transport_closed")
+                connected = await _executor_outcome(
+                    self._hass,
+                    session.connect,
+                )
+                if isinstance(connected, _CallFailure):
+                    return _PublicFailure(
+                        "transport_connect_failed",
+                        fatal_alert=connected.fatal_alert,
                     )
-                    if isinstance(connected, _CallFailure):
-                        failure = TransportError(
-                            "transport_connect_failed",
-                            fatal_alert=connected.fatal_alert,
-                        )
-                    elif self._closed:
-                        failure = TransportError("transport_closed")
-                    else:
-                        reader = await _executor_outcome(
-                            self._hass,
-                            session.start_reader,
-                        )
-                        if isinstance(reader, _CallFailure):
-                            failure = TransportError(
-                                "transport_connect_failed",
-                                fatal_alert=reader.fatal_alert,
-                            )
-                        else:
-                            self._connected = True
-                            return
+                if self._closed:
+                    return _PublicFailure("transport_closed")
+                reader = await _executor_outcome(
+                    self._hass,
+                    session.start_reader,
+                )
+                if isinstance(reader, _CallFailure):
+                    return _PublicFailure(
+                        "transport_connect_failed",
+                        fatal_alert=reader.fatal_alert,
+                    )
+                if self._closed:
+                    return _PublicFailure("transport_closed")
+                self._connected = True
+                return None
         except asyncio.CancelledError:
             self._closed = True
-            cleanup = self._ensure_cleanup_task()
-            if cleanup is not None:
-                await self._wait_for_cleanup(cleanup)
+            await self._async_cleanup_bounded()
             raise
+        finally:
+            del built, session, connected, reader
 
-        if failure is None:
-            failure = TransportError("transport_connect_failed")
+    async def async_connect(self) -> None:
+        """Construct, connect, and start exactly one blocking session."""
+        result = await self._async_connect_result()
+        if result is None:
+            return
         self._closed = True
-        cleanup = self._ensure_cleanup_task()
-        if cleanup is not None:
-            await self._wait_for_cleanup(cleanup)
-        raise failure
+        await self._async_cleanup_bounded()
+        _raise_public_failure(result)
 
     async def _pace_request(self) -> None:
         now = time.monotonic()
@@ -362,38 +411,105 @@ class WindFreeTransport:
         target: Callable[..., T],
         *args: object,
     ) -> T | _CallFailure:
-        async with self._request_lock:
-            try:
+        try:
+            async with self._request_lock:
                 self._require_session()
                 await self._pace_request()
                 return await _executor_outcome(self._hass, target, *args)
-            finally:
-                self._last_request_at = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            fatal_alert = _extract_fatal_alert(error)
+            error = None
+            return _CallFailure(fatal_alert)
+        finally:
+            del target, args
+            self._last_request_at = time.monotonic()
+
+    async def _async_get_result(
+        self,
+        path: str,
+    ) -> Representation | _PublicFailure:
+        segments: tuple[str, ...] = ()
+        session: DtlsCoapSession | None = None
+        outcome: object = None
+        payload = b""
+        representation: Representation | _CallFailure | None = None
+        try:
+            segments = _path_segments(path)
+            session = self._require_session()
+            outcome = await self._request_outcome(session.get, segments)
+            if isinstance(outcome, _CallFailure):
+                return _PublicFailure(
+                    "transport_get_failed",
+                    fatal_alert=outcome.fatal_alert,
+                )
+            code, payload = outcome
+            if code != _GET_CONTENT:
+                return _PublicFailure(
+                    "transport_get_rejected",
+                    coap_code=code,
+                )
+            representation = _decode_representation(payload)
+            if isinstance(representation, _CallFailure):
+                return _PublicFailure("transport_get_invalid_response")
+            return representation
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _PublicFailure("transport_get_failed")
+        finally:
+            del path, segments, session, outcome, payload, representation
 
     async def async_get(self, path: str) -> Representation:
         """Read and decode one complete dependency-owned Block2 response."""
-        segments = _path_segments(path)
-        path = ""
-        session = self._require_session()
-        outcome = await self._request_outcome(session.get, segments)
-        if isinstance(outcome, _CallFailure):
-            raise TransportError(
-                "transport_get_failed",
-                fatal_alert=outcome.fatal_alert,
+        try:
+            result = await self._async_get_result(path)
+        finally:
+            del path
+        if isinstance(result, _PublicFailure):
+            _raise_public_failure(result)
+        return result
+
+    async def _async_post_result(
+        self,
+        path: str,
+        payload: Representation,
+    ) -> _PublicFailure | None:
+        segments: tuple[str, ...] = ()
+        encoded: bytes | _CallFailure = b""
+        session: DtlsCoapSession | None = None
+        outcome: object = None
+        response = b""
+        try:
+            segments = _path_segments(path)
+            encoded = _encode_representation(payload)
+            if isinstance(encoded, _CallFailure):
+                return _PublicFailure("transport_post_invalid_payload")
+            session = self._require_session()
+            outcome = await self._request_outcome(
+                session.post,
+                segments,
+                encoded,
             )
-        code, payload = outcome
-        outcome = None
-        if code != _GET_CONTENT:
-            payload = b""
-            raise TransportError(
-                "transport_get_rejected",
-                coap_code=code,
-            )
-        representation = _decode_representation(payload)
-        payload = b""
-        if isinstance(representation, _CallFailure):
-            raise TransportError("transport_get_invalid_response")
-        return representation
+            if isinstance(outcome, _CallFailure):
+                return _PublicFailure(
+                    "transport_post_failed",
+                    fatal_alert=outcome.fatal_alert,
+                )
+            code, response = outcome
+            if code != _POST_CHANGED:
+                return _PublicFailure(
+                    "transport_post_rejected",
+                    coap_code=code,
+                )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _PublicFailure("transport_post_failed")
+        finally:
+            del path, payload, segments, encoded, session, outcome, response
 
     async def async_post(
         self,
@@ -401,32 +517,48 @@ class WindFreeTransport:
         payload: Representation,
     ) -> None:
         """Encode and post one representation, requiring CoAP 2.04."""
-        segments = _path_segments(path)
+        try:
+            result = await self._async_post_result(path, payload)
+        finally:
+            del path, payload
+        if result is not None:
+            _raise_public_failure(result)
+
+    async def _async_observe_result(
+        self,
+        paths: tuple[str, ...],
+        callback: NotificationCallback,
+    ) -> _PublicFailure | None:
+        session: DtlsCoapSession | None = None
         path = ""
-        encoded = _encode_representation(payload)
-        payload = {}
-        if isinstance(encoded, _CallFailure):
-            raise TransportError("transport_post_invalid_payload")
-        session = self._require_session()
-        outcome = await self._request_outcome(
-            session.post,
-            segments,
-            encoded,
-        )
-        encoded = b""
-        if isinstance(outcome, _CallFailure):
-            raise TransportError(
-                "transport_post_failed",
-                fatal_alert=outcome.fatal_alert,
+        segments: tuple[str, ...] = ()
+        outcome: object = None
+        deliver: Callable[[str, Representation], None] | None = None
+        try:
+            session = self._require_session()
+            deliver = _generation_target(self._generation, callback)
+            session.on_notification = self.threadsafe_callback(
+                generation=self._generation,
+                target=deliver,
             )
-        code, response = outcome
-        outcome = None
-        del response
-        if code != _POST_CHANGED:
-            raise TransportError(
-                "transport_post_rejected",
-                coap_code=code,
-            )
+            for path in paths:
+                segments = _path_segments(path)
+                outcome = await self._request_outcome(
+                    session.subscribe,
+                    segments,
+                )
+                if isinstance(outcome, _CallFailure):
+                    return _PublicFailure(
+                        "transport_observe_failed",
+                        fatal_alert=outcome.fatal_alert,
+                    )
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _PublicFailure("transport_observe_failed")
+        finally:
+            del paths, callback, session, path, segments, outcome, deliver
 
     async def async_observe(
         self,
@@ -434,24 +566,12 @@ class WindFreeTransport:
         callback: NotificationCallback,
     ) -> None:
         """Register dependency OBSERVE callbacks for the supplied paths."""
-        session = self._require_session()
-
-        def deliver(path: str, body: Representation) -> None:
-            callback(self._generation, path, body)
-
-        session.on_notification = self.threadsafe_callback(
-            generation=self._generation,
-            target=deliver,
-        )
-        for path in paths:
-            segments = _path_segments(path)
-            path = ""
-            outcome = await self._request_outcome(session.subscribe, segments)
-            if isinstance(outcome, _CallFailure):
-                raise TransportError(
-                    "transport_observe_failed",
-                    fatal_alert=outcome.fatal_alert,
-                )
+        try:
+            result = await self._async_observe_result(paths, callback)
+        finally:
+            del paths, callback
+        if result is not None:
+            _raise_public_failure(result)
 
     def threadsafe_callback(
         self,
@@ -562,24 +682,97 @@ class WindFreeTransport:
             except TimeoutError:
                 pass
             raise
+        finally:
+            del task
+
+    async def _async_close_result(self) -> _PublicFailure | None:
+        cleanup: asyncio.Task[_CallFailure | None] | None = None
+        self._closed = True
+        try:
+            cleanup = self._ensure_cleanup_task()
+            if cleanup is not None:
+                await self._wait_for_cleanup(cleanup)
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _PublicFailure("transport_close_failed")
+        finally:
+            del cleanup
 
     async def async_close(self) -> None:
         """Start or observe one retained, bounded session cleanup."""
-        self._closed = True
-        cleanup = self._ensure_cleanup_task()
-        if cleanup is not None:
-            await self._wait_for_cleanup(cleanup)
+        result = await self._async_close_result()
+        if result is not None:
+            _raise_public_failure(result)
 
 
 def _path_segments(path: str) -> tuple[str, ...]:
     return tuple(segment for segment in path.split("/") if segment)
 
 
-def _validate_probe_ports(ports: tuple[int, ...]) -> None:
-    if any(type(port) is not int or port not in PROBE_PORTS for port in ports):
-        raise ValueError(
-            "transport_discovery_invalid_ports: ports are outside the safe range"
+def _probe_ports_are_valid(ports: tuple[int, ...]) -> bool:
+    return not any(type(port) is not int or port not in PROBE_PORTS for port in ports)
+
+
+def _generation_target(
+    generation: int,
+    callback: NotificationCallback,
+) -> Callable[[str, Representation], None]:
+    def deliver(path: str, body: Representation) -> None:
+        callback(generation, path, body)
+
+    return deliver
+
+
+async def _async_discover_result(
+    hass: HomeAssistant,
+    host: str,
+    credentials: Credentials,
+    ports: tuple[int, ...],
+) -> tuple[int, WindFreeTransport] | _PublicFailure:
+    port = 0
+    candidate: WindFreeTransport | None = None
+    try:
+        if not _probe_ports_are_valid(ports):
+            return _PublicFailure(
+                "transport_discovery_invalid_ports",
+                error_kind="value",
+            )
+        for port in ports:
+            candidate = WindFreeTransport(
+                hass,
+                host=host,
+                port=port,
+                credentials=credentials,
+                handshake_timeout=PROBE_HANDSHAKE_TIMEOUT,
+            )
+            try:
+                await candidate.async_connect()
+            except asyncio.CancelledError:
+                await candidate.async_close()
+                raise
+            except TransportError as probe_error:
+                await candidate.async_close()
+                if probe_error.fatal_alert is not None:
+                    return _PublicFailure(
+                        probe_error.operation,
+                        fatal_alert=probe_error.fatal_alert,
+                        coap_code=probe_error.coap_code,
+                    )
+                candidate = None
+                continue
+            except Exception:
+                await candidate.async_close()
+                candidate = None
+                continue
+            return port, candidate
+        return _PublicFailure(
+            "transport_discovery_failed",
+            error_kind="connection",
         )
+    finally:
+        del host, credentials, ports, port, candidate
 
 
 async def async_discover_transport(
@@ -590,27 +783,10 @@ async def async_discover_transport(
     ports: tuple[int, ...] = PROBE_PORTS,
 ) -> tuple[int, WindFreeTransport]:
     """Sequentially probe a safe-range subset and return the first session."""
-    _validate_probe_ports(ports)
-    for port in ports:
-        candidate = WindFreeTransport(
-            hass,
-            host=host,
-            port=port,
-            credentials=credentials,
-            handshake_timeout=PROBE_HANDSHAKE_TIMEOUT,
-        )
-        try:
-            await candidate.async_connect()
-        except asyncio.CancelledError:
-            await candidate.async_close()
-            raise
-        except TransportError as error:
-            await candidate.async_close()
-            if error.fatal_alert is not None:
-                raise
-            continue
-        except Exception:
-            await candidate.async_close()
-            continue
-        return port, candidate
-    raise ConnectionError("transport_discovery_failed: no authenticated local endpoint")
+    try:
+        result = await _async_discover_result(hass, host, credentials, ports)
+    finally:
+        del host, credentials, ports
+    if isinstance(result, _PublicFailure):
+        _raise_public_failure(result)
+    return result

@@ -82,8 +82,8 @@ class ThreadedCleanupSession(FakeSession):
         self._record("join")
         if not self.close_finished.is_set():
             self.join_before_close = True
-        assert self.reader_thread is not None
-        self.reader_thread.join()
+        if self.reader_thread is not None:
+            self.reader_thread.join()
 
 
 def _structured_alert(reason: str) -> ConnectionError:
@@ -95,17 +95,35 @@ def _structured_alert(reason: str) -> ConnectionError:
 
 def _assert_transport_traceback_redacted(
     error: BaseException,
-    *forbidden: str,
+    *sensitive_values: object,
+    forbidden_names: frozenset[str] = frozenset(),
 ) -> None:
+    transport_frames = []
     for frame, _line in traceback.walk_tb(error.__traceback__):
         if (
             frame.f_globals.get("__name__")
             != "custom_components.samsung_ac_windfree.transport"
         ):
             continue
-        rendered = repr(frame.f_locals)
-        for secret in forbidden:
-            assert secret not in rendered
+        transport_frames.append(frame)
+
+    assert transport_frames
+    for frame in transport_frames:
+        assert forbidden_names.isdisjoint(frame.f_locals), (
+            frame.f_code.co_name,
+            forbidden_names.intersection(frame.f_locals),
+        )
+        for name, value in frame.f_locals.items():
+            for sensitive in sensitive_values:
+                assert value is not sensitive, (frame.f_code.co_name, name)
+                if isinstance(sensitive, str) and isinstance(value, str):
+                    assert sensitive not in value, (frame.f_code.co_name, name)
+                if isinstance(sensitive, bytes) and isinstance(value, bytes):
+                    assert sensitive not in value, (frame.f_code.co_name, name)
+                assert repr(sensitive) not in repr(value), (
+                    frame.f_code.co_name,
+                    name,
+                )
 
 
 async def test_constructor_uses_only_in_memory_pem_and_exact_rate_limit(
@@ -170,7 +188,24 @@ async def test_constructor_failure_is_sanitized_and_scrubs_traceback_material(
         "192.0.2.10",
         "secret-factory-payload",
         "secret-private-key",
-        credentials.client_key_pem[:64],
+        credentials.client_key_pem,
+        credentials.client_chain_pem,
+        credentials,
+        fail_factory,
+        forbidden_names=frozenset(
+            {
+                "built",
+                "cleanup",
+                "connected",
+                "credentials",
+                "factory",
+                "failure",
+                "host",
+                "port",
+                "reader",
+                "session",
+            }
+        ),
     )
 
 
@@ -1010,6 +1045,151 @@ async def test_close_timeout_retains_one_ordered_cleanup_until_reader_exits(
     assert transport._cleanup_task is None
 
 
+async def test_close_during_blocking_constructor_never_starts_session_and_retains_cleanup(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.samsung_ac_windfree import transport as transport_module
+
+    monkeypatch.setattr(transport_module, "_CLOSE_TIMEOUT", 0.01)
+    factory_started = threading.Event()
+    factory_release = threading.Event()
+    session = ThreadedCleanupSession(encoded_resources)
+
+    def blocking_factory(**_kwargs: object) -> FakeSession:
+        factory_started.set()
+        factory_release.wait()
+        return session
+
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=blocking_factory,
+    )
+    connect_task = asyncio.create_task(transport.async_connect())
+    cleanup_task = None
+    try:
+        await hass.async_add_executor_job(factory_started.wait)
+        await asyncio.wait_for(transport.async_close(), 0.1)
+        factory_release.set()
+
+        with pytest.raises(TransportError) as err:
+            await asyncio.wait_for(connect_task, 0.2)
+        assert err.value.operation == "transport_closed"
+        assert not any(
+            name in {"connect", "start_reader"} for name, _args in session.calls
+        )
+        cleanup_task = transport._cleanup_task
+        assert cleanup_task is not None
+        assert transport._session is session
+        assert session.close_started.is_set()
+    finally:
+        factory_release.set()
+        session.close_release.set()
+        if not connect_task.done():
+            connect_task.cancel()
+        try:
+            await connect_task
+        except BaseException:
+            pass
+        cleanup_task = transport._cleanup_task or cleanup_task
+        if cleanup_task is not None:
+            await asyncio.wait_for(asyncio.shield(cleanup_task), 1.0)
+        await asyncio.sleep(0)
+
+    assert [name for name, _args in session.calls] == ["close", "join"]
+    assert transport._session is None
+
+
+async def test_cancelled_connect_during_constructor_retains_constructed_session_cleanup(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.samsung_ac_windfree import transport as transport_module
+
+    monkeypatch.setattr(transport_module, "_CLOSE_TIMEOUT", 0.01)
+    factory_started = threading.Event()
+    factory_release = threading.Event()
+    session = ThreadedCleanupSession(encoded_resources)
+
+    def blocking_factory(**_kwargs: object) -> FakeSession:
+        factory_started.set()
+        factory_release.wait()
+        return session
+
+    transport = WindFreeTransport(
+        hass,
+        host="secret-constructor-host",
+        port=49154,
+        credentials=credentials,
+        session_factory=blocking_factory,
+    )
+    connect_task = asyncio.create_task(transport.async_connect())
+    cleanup_task = None
+    try:
+        await hass.async_add_executor_job(factory_started.wait)
+        connect_task.cancel("exact-constructor-cancellation")
+        factory_release.set()
+
+        with pytest.raises(asyncio.CancelledError) as err:
+            await asyncio.wait_for(connect_task, 0.2)
+        assert err.value.args == ("exact-constructor-cancellation",)
+        assert not any(
+            name in {"connect", "start_reader"} for name, _args in session.calls
+        )
+        cleanup_task = transport._cleanup_task
+        assert cleanup_task is not None
+        assert transport._session is session
+        _assert_transport_traceback_redacted(
+            err.value,
+            "secret-constructor-host",
+            credentials,
+            credentials.client_key_pem,
+            credentials.client_chain_pem,
+            blocking_factory,
+            session,
+            forbidden_names=frozenset(
+                {
+                    "args",
+                    "built",
+                    "cleanup",
+                    "connected",
+                    "credentials",
+                    "factory",
+                    "host",
+                    "job",
+                    "port",
+                    "reader",
+                    "result",
+                    "session",
+                    "target",
+                }
+            ),
+        )
+    finally:
+        factory_release.set()
+        session.close_release.set()
+        if not connect_task.done():
+            connect_task.cancel()
+        try:
+            await connect_task
+        except BaseException:
+            pass
+        cleanup_task = transport._cleanup_task or cleanup_task
+        if cleanup_task is not None:
+            await asyncio.wait_for(asyncio.shield(cleanup_task), 1.0)
+        await asyncio.sleep(0)
+
+    assert [name for name, _args in session.calls] == ["close", "join"]
+    assert transport._session is None
+
+
 async def test_cancellation_propagates_after_blocking_call_settles(
     hass: HomeAssistant,
     credentials: Credentials,
@@ -1044,6 +1224,241 @@ async def test_cancellation_propagates_after_blocking_call_settles(
         await task
 
 
+@pytest.mark.parametrize("operation", ["get", "post", "observe"])
+async def test_request_cancellation_scrubs_complete_production_traceback(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    operation: str,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    secret_path = f"/secret/{operation}/device-uuid"
+    secret_segments = ("secret", operation, "device-uuid")
+    secret_payload = {"value": f"secret-{operation}-payload"}
+    secret_encoded = cbor2.dumps(secret_payload)
+
+    def callback(*_args: object) -> None:
+        return
+
+    class BlockingSession(FakeSession):
+        def get(self, path: tuple[str, ...]) -> tuple[int, bytes]:
+            self._record("get", path)
+            started.set()
+            release.wait()
+            return 69, cbor2.dumps({"value": "secret-get-response"})
+
+        def post(self, path: tuple[str, ...], payload: bytes) -> tuple[int, bytes]:
+            self._record("post", path, payload)
+            started.set()
+            release.wait()
+            return 68, b"secret-post-response"
+
+        def subscribe(self, path: tuple[str, ...]) -> bytes:
+            self._record("subscribe", path)
+            started.set()
+            release.wait()
+            return b"secret-observe-response"
+
+    session = BlockingSession(encoded_resources)
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+    if operation == "get":
+        task = asyncio.create_task(transport.async_get(secret_path))
+    elif operation == "post":
+        task = asyncio.create_task(transport.async_post(secret_path, secret_payload))
+    else:
+        task = asyncio.create_task(transport.async_observe((secret_path,), callback))
+    await hass.async_add_executor_job(started.wait)
+
+    task.cancel(f"exact-{operation}-cancellation")
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as err:
+        await task
+    assert err.value.args == (f"exact-{operation}-cancellation",)
+    _assert_transport_traceback_redacted(
+        err.value,
+        secret_path,
+        secret_segments,
+        secret_payload,
+        secret_encoded,
+        callback,
+        session,
+        forbidden_names=frozenset(
+            {
+                "args",
+                "callback",
+                "decoded",
+                "deliver",
+                "encoded",
+                "outcome",
+                "path",
+                "paths",
+                "payload",
+                "representation",
+                "response",
+                "segments",
+                "session",
+                "target",
+            }
+        ),
+    )
+
+
+async def test_get_error_scrubs_path_segments_raw_response_and_session(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+) -> None:
+    secret_path = "/secret/get/device-uuid"
+    secret_segments = ("secret", "get", "device-uuid")
+    decoded_response = {1: "secret-get-response"}
+    raw_response = cbor2.dumps(decoded_response)
+    session = FakeSession({**encoded_resources, secret_path: raw_response})
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError) as err:
+        await transport.async_get(secret_path)
+
+    _assert_transport_traceback_redacted(
+        err.value,
+        secret_path,
+        secret_segments,
+        decoded_response,
+        raw_response,
+        session,
+        forbidden_names=frozenset(
+            {
+                "args",
+                "decoded",
+                "outcome",
+                "path",
+                "payload",
+                "representation",
+                "segments",
+                "session",
+                "target",
+            }
+        ),
+    )
+
+
+async def test_post_error_scrubs_path_payload_encoded_response_and_session(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+) -> None:
+    secret_path = "/secret/post/device-uuid"
+    secret_segments = ("secret", "post", "device-uuid")
+    secret_payload = {"value": "secret-post-payload"}
+    encoded = cbor2.dumps(secret_payload)
+    raw_response = b"secret-post-response"
+    session = FakeSession(encoded_resources)
+    session.post_code = 128
+    session.post_response = raw_response
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError) as err:
+        await transport.async_post(secret_path, secret_payload)
+
+    _assert_transport_traceback_redacted(
+        err.value,
+        secret_path,
+        secret_segments,
+        secret_payload,
+        encoded,
+        raw_response,
+        session,
+        forbidden_names=frozenset(
+            {
+                "args",
+                "encoded",
+                "outcome",
+                "path",
+                "payload",
+                "response",
+                "segments",
+                "session",
+                "target",
+            }
+        ),
+    )
+
+
+async def test_observe_error_scrubs_paths_segments_callback_and_session(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+) -> None:
+    secret_path = "/secret/observe/device-uuid"
+    secret_paths = (secret_path,)
+    secret_segments = ("secret", "observe", "device-uuid")
+
+    def callback(*_args: object) -> None:
+        return
+
+    raw_error = RuntimeError("secret-observe-dependency-error")
+    session = FakeSession(encoded_resources)
+    session.subscribe_error = raw_error
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError) as err:
+        await transport.async_observe(secret_paths, callback)
+
+    _assert_transport_traceback_redacted(
+        err.value,
+        secret_path,
+        secret_paths,
+        secret_segments,
+        callback,
+        raw_error,
+        session,
+        forbidden_names=frozenset(
+            {
+                "args",
+                "callback",
+                "decoded",
+                "deliver",
+                "encoded",
+                "outcome",
+                "path",
+                "paths",
+                "segments",
+                "session",
+                "target",
+            }
+        ),
+    )
+
+
 async def test_close_cancellation_retains_cleanup_and_exact_cancellation(
     hass: HomeAssistant,
     credentials: Credentials,
@@ -1071,6 +1486,12 @@ async def test_close_cancellation_retains_cleanup_and_exact_cancellation(
         with pytest.raises(asyncio.CancelledError) as err:
             await task
         assert err.value.args == ("exact-close-cancellation",)
+        _assert_transport_traceback_redacted(
+            err.value,
+            session,
+            cleanup_task,
+            forbidden_names=frozenset({"cleanup", "session", "task"}),
+        )
         assert cleanup_task is not None
         assert not cleanup_task.done()
         assert transport._cleanup_task is cleanup_task
@@ -1091,6 +1512,39 @@ async def test_close_cancellation_retains_cleanup_and_exact_cancellation(
     assert not session.join_before_close
     assert not session.reader_thread.is_alive()
     assert transport._session is None
+
+
+async def test_close_error_is_sanitized_and_scrubs_internal_outcome(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_error = RuntimeError("secret-close-internal-error")
+    session = FakeSession(encoded_resources)
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    def fail_cleanup() -> None:
+        raise raw_error
+
+    monkeypatch.setattr(transport, "_ensure_cleanup_task", fail_cleanup)
+
+    with pytest.raises(TransportError) as err:
+        await transport.async_close()
+
+    _assert_transport_traceback_redacted(
+        err.value,
+        raw_error,
+        session,
+        forbidden_names=frozenset({"cleanup", "error", "outcome", "session", "task"}),
+    )
 
 
 @pytest.mark.parametrize("lock_name", ["_lifecycle_lock", "_request_lock"])
@@ -1292,6 +1746,128 @@ async def test_discovery_sweeps_only_all_nine_ports_sequentially_and_cleans_up(
         assert names == ["connect", "close", "join"]
     assert "192.0.2.10" not in str(err.value)
     assert all(str(port) not in str(err.value) for port in PROBE_PORTS)
+
+
+async def test_discovery_error_scrubs_host_ports_credentials_and_candidates(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.samsung_ac_windfree import transport as transport_module
+
+    candidates: list[object] = []
+    raw_errors: list[BaseException] = []
+
+    class FailingCandidate:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            candidates.append(self)
+
+        async def async_connect(self) -> None:
+            error = RuntimeError("secret-discovery-outcome")
+            raw_errors.append(error)
+            raise error
+
+        async def async_close(self) -> None:
+            return
+
+    monkeypatch.setattr(transport_module, "WindFreeTransport", FailingCandidate)
+    ports = (49152, 49153)
+
+    with pytest.raises(ConnectionError) as err:
+        await async_discover_transport(
+            hass,
+            "secret-discovery-host",
+            credentials,
+            ports=ports,
+        )
+
+    _assert_transport_traceback_redacted(
+        err.value,
+        "secret-discovery-host",
+        ports,
+        credentials,
+        credentials.client_key_pem,
+        credentials.client_chain_pem,
+        *candidates,
+        *raw_errors,
+        forbidden_names=frozenset(
+            {
+                "candidate",
+                "credentials",
+                "error",
+                "factory",
+                "host",
+                "outcome",
+                "port",
+                "ports",
+            }
+        ),
+    )
+
+
+async def test_discovery_cancellation_is_exact_and_scrubs_probe_state(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.samsung_ac_windfree import transport as transport_module
+
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    candidate: object | None = None
+
+    class BlockingCandidate:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal candidate
+            candidate = self
+
+        async def async_connect(self) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        async def async_close(self) -> None:
+            closed.set()
+
+    monkeypatch.setattr(transport_module, "WindFreeTransport", BlockingCandidate)
+    ports = (49152, 49153)
+    task = asyncio.create_task(
+        async_discover_transport(
+            hass,
+            "secret-discovery-host",
+            credentials,
+            ports=ports,
+        )
+    )
+    await started.wait()
+    task.cancel("exact-discovery-cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as err:
+        await task
+
+    assert err.value.args == ("exact-discovery-cancellation",)
+    assert closed.is_set()
+    assert candidate is not None
+    _assert_transport_traceback_redacted(
+        err.value,
+        "secret-discovery-host",
+        ports,
+        credentials,
+        credentials.client_key_pem,
+        credentials.client_chain_pem,
+        candidate,
+        forbidden_names=frozenset(
+            {
+                "candidate",
+                "credentials",
+                "error",
+                "factory",
+                "host",
+                "outcome",
+                "port",
+                "ports",
+            }
+        ),
+    )
 
 
 async def test_discovery_reuses_first_successful_authenticated_session(

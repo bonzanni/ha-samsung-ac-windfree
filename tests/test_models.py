@@ -26,6 +26,21 @@ def test_credentials_are_immutable_and_exclude_universal_key() -> None:
         credentials.client_key_pem = "replacement"  # type: ignore[misc]
 
 
+def test_credentials_repr_redacts_private_key_and_certificate_chain() -> None:
+    credentials = Credentials(
+        client_key_pem="secret-client-private-key",
+        client_chain_pem="secret-client-certificate-chain",
+        not_before="2026-07-23T00:00:00+00:00",
+        not_after="2036-07-23T00:00:00+00:00",
+    )
+
+    rendered = repr(credentials)
+
+    assert "secret-client-private-key" not in rendered
+    assert "secret-client-certificate-chain" not in rendered
+    assert "2026-07-23T00:00:00+00:00" in rendered
+
+
 def test_windfree_data_is_immutable() -> None:
     data = WindFreeData.empty()
     assert data.available is False

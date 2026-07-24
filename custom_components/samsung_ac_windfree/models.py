@@ -74,8 +74,8 @@ class PresetMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Credentials:
-    client_key_pem: str
-    client_chain_pem: str
+    client_key_pem: str = field(repr=False)
+    client_chain_pem: str = field(repr=False)
     not_before: str
     not_after: str
 

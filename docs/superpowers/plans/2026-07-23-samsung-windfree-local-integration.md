@@ -1387,6 +1387,24 @@ range and validation happens before session construction. After bounded
 cleanup, discovery immediately preserves and raises a structured classified
 fatal `TransportError`; transient candidates continue through the subset.
 
+Review hardening amendment: every public async transport boundary uses an
+internal result helper and raises only after its public frame has deleted
+sensitive arguments. Production-frame traceback tests cover ordinary failure
+and exact cancellation for connect, GET, POST, OBSERVE, close, and discovery;
+they reject forbidden local names plus sensitive object identity, byte/string
+content, and repr exposure. GET/POST scrub paths, derived segments, payloads,
+encoded CBOR, decoded responses, dependency outcomes, and session callables.
+OBSERVE and discovery likewise scrub callback, candidate, credential, host,
+port, and probe outcome state. Credential PEM fields are excluded from
+`Credentials.__repr__`.
+
+Session construction remains executor-only but is cancellation-owned: if close
+or cancellation wins while the factory blocks, the eventual constructed
+session is attached before any handshake, observes the closed state, and is
+retained by exactly one cleanup task. No `connect` or `start_reader` call may
+occur after close wins; the retained task still executes close then join and
+the original cancellation is re-raised unchanged.
+
 - [ ] **Step 5: Run transport tests**
 
 Add real-dependency tests in `tests/test_dependency_contract.py`:
