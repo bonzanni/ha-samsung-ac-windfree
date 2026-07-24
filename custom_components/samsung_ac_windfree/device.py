@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from types import MappingProxyType
 
 from .const import (
     SUPPORTED_DEVICE_TYPE,
@@ -83,57 +84,83 @@ _ALL_HVAC_MODES = frozenset(HvacMode)
 _AUTO_ALIASES = frozenset({"Auto", "AI Auto"})
 
 
-def _immutable_payload(*_args: object, **_kwargs: object) -> None:
-    raise TypeError("command payload is immutable")
+@dataclass(frozen=True, slots=True, eq=False)
+class _ImmutableMapping(Mapping[object, object]):
+    """Structural immutable mapping with no mutable built-in base."""
 
+    _data: Mapping[object, object]
 
-class _FrozenDict(dict[object, object]):
-    """A CBOR-compatible dictionary that rejects mutation."""
+    def __getitem__(self, key: object) -> object:
+        return self._data[key]
 
-    __setitem__ = _immutable_payload
-    __delitem__ = _immutable_payload
-    clear = _immutable_payload
-    pop = _immutable_payload
-    popitem = _immutable_payload
-    setdefault = _immutable_payload
-    update = _immutable_payload
-    __ior__ = _immutable_payload
+    def __iter__(self) -> Iterator[object]:
+        return iter(self._data)
 
-    def __copy__(self) -> _FrozenDict:
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, Mapping)
+            and all(
+                key in other and value == other[key]
+                for key, value in self._data.items()
+            )
+            and len(self) == len(other)
+        )
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+    def __copy__(self) -> _ImmutableMapping:
         return self
 
-    def __deepcopy__(self, _memo: object) -> _FrozenDict:
+    def __deepcopy__(self, _memo: object) -> _ImmutableMapping:
         return self
 
 
-class _FrozenList(list[object]):
-    """A CBOR-compatible list that rejects mutation."""
+@dataclass(frozen=True, slots=True, eq=False)
+class _ImmutableSequence(Sequence[object]):
+    """Structural immutable sequence with no mutable built-in base."""
 
-    __setitem__ = _immutable_payload
-    __delitem__ = _immutable_payload
-    append = _immutable_payload
-    clear = _immutable_payload
-    extend = _immutable_payload
-    insert = _immutable_payload
-    pop = _immutable_payload
-    remove = _immutable_payload
-    reverse = _immutable_payload
-    sort = _immutable_payload
-    __iadd__ = _immutable_payload
-    __imul__ = _immutable_payload
+    _items: tuple[object, ...]
 
-    def __copy__(self) -> _FrozenList:
+    def __getitem__(self, index: int | slice) -> object:
+        return self._items[index]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, Sequence)
+            and not isinstance(other, (str, bytes, bytearray))
+            and len(self) == len(other)
+            and all(left == right for left, right in zip(self, other, strict=True))
+        )
+
+    def __repr__(self) -> str:
+        return repr(list(self._items))
+
+    def append(self, _item: object) -> None:
+        raise TypeError("command payload is immutable")
+
+    def __copy__(self) -> _ImmutableSequence:
         return self
 
-    def __deepcopy__(self, _memo: object) -> _FrozenList:
+    def __deepcopy__(self, _memo: object) -> _ImmutableSequence:
         return self
 
 
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
-        return _FrozenDict((key, _freeze(item)) for key, item in value.items())
+        return _ImmutableMapping(
+            MappingProxyType({key: _freeze(item) for key, item in value.items()})
+        )
     if isinstance(value, (list, tuple)):
-        return _FrozenList(_freeze(item) for item in value)
+        return _ImmutableSequence(tuple(_freeze(item) for item in value))
+    if isinstance(value, Set):
+        return frozenset(_freeze(item) for item in value)
     return value
 
 

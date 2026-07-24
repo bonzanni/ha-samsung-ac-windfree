@@ -4,7 +4,7 @@ import asyncio
 import logging
 import threading
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING
 
 import cbor2
@@ -16,7 +16,18 @@ from custom_components.samsung_ac_windfree.const import (
     PROBE_PORTS,
     RATE_LIMIT_RPS,
 )
-from custom_components.samsung_ac_windfree.models import Credentials
+from custom_components.samsung_ac_windfree.device import (
+    TEMPERATURE_PATH,
+    CommandKind,
+    build_command,
+)
+from custom_components.samsung_ac_windfree.models import (
+    Credentials,
+    FanMode,
+    HvacMode,
+    PresetMode,
+    SwingMode,
+)
 from custom_components.samsung_ac_windfree.transport import (
     TransportError,
     WindFreeTransport,
@@ -91,6 +102,16 @@ def _structured_alert(reason: str) -> ConnectionError:
     wrapped = ConnectionError("sensitive outer handshake failure")
     wrapped.__cause__ = alert
     return wrapped
+
+
+def _plain_cbor_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_cbor_value(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_plain_cbor_value(item) for item in value]
+    if isinstance(value, Set):
+        return {_plain_cbor_value(item) for item in value}
+    return value
 
 
 def _assert_transport_traceback_redacted(
@@ -362,12 +383,57 @@ async def test_post_encodes_cbor_and_requires_changed_acknowledgement(
 
 
 @pytest.mark.parametrize(
+    ("kind", "value"),
+    [
+        (CommandKind.POWER, True),
+        (CommandKind.HVAC_MODE, HvacMode.AUTO),
+        (CommandKind.TEMPERATURE, 27),
+        (CommandKind.FAN, FanMode.HIGH),
+        (CommandKind.SWING, SwingMode.BOTH),
+        (CommandKind.PRESET, PresetMode.QUIET),
+        (CommandKind.DISPLAY_LIGHT, False),
+        (CommandKind.AUTO_CLEAN, True),
+    ],
+)
+async def test_post_thaws_and_canonically_encodes_every_immutable_command(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    kind: CommandKind,
+    value: object,
+) -> None:
+    session = FakeSession(encoded_resources)
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+    aggregate = None
+    if kind is CommandKind.TEMPERATURE:
+        aggregate = cbor2.loads(encoded_resources[TEMPERATURE_PATH])
+        aggregate["unknownSet"] = {"preserved", "values"}
+    command = build_command(kind, value, fresh_aggregate=aggregate)
+
+    await transport.async_post(command.path, command.payload)
+
+    post_call = next(call for call in session.calls if call[0] == "post")
+    encoded = post_call[1][1]
+    plain = _plain_cbor_value(command.payload)
+    assert cbor2.loads(encoded) == plain
+    assert encoded == cbor2.dumps(plain, canonical=True)
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {1: "non-string-key"},
         {"value": "x" * (128 * 1024)},
+        {"value": {"unsupported": object()}},
     ],
-    ids=["non-string-key", "oversize"],
+    ids=["non-string-key", "oversize", "unsupported-nested-value"],
 )
 async def test_post_rejects_invalid_or_oversize_representation_before_session(
     hass: HomeAssistant,

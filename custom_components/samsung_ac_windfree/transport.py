@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass
 
 import cbor2
@@ -201,13 +201,35 @@ def _decode_representation(payload: bytes) -> Representation | _CallFailure:
     return decoded
 
 
+def _to_cbor_native(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            _to_cbor_native(key): _to_cbor_native(item) for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        return [_to_cbor_native(item) for item in value]
+    if isinstance(value, Set):
+        return {_to_cbor_native(item) for item in value}
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    raise TypeError("unsupported CBOR value")
+
+
 def _encode_representation(
     representation: Representation,
 ) -> bytes | _CallFailure:
     if not _is_representation(representation):
         return _CallFailure(None)
     try:
-        encoded = cbor2.dumps(representation)
+        encoded = cbor2.dumps(
+            _to_cbor_native(representation),
+            canonical=True,
+        )
     except Exception:
         return _CallFailure(None)
     if len(encoded) > _MAX_CBOR_PAYLOAD:

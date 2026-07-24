@@ -7,7 +7,6 @@ from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
-import cbor2
 import pytest
 
 from custom_components.samsung_ac_windfree.device import (
@@ -812,7 +811,7 @@ def test_auto_verification_accepts_auto_and_ai_auto_equivalence() -> None:
     )
 
 
-def test_command_payload_is_recursively_immutable_and_cbor_encodable() -> None:
+def test_command_payload_is_recursively_immutable() -> None:
     aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
     command = build_command(
         CommandKind.TEMPERATURE,
@@ -832,18 +831,53 @@ def test_command_payload_is_recursively_immutable_and_cbor_encodable() -> None:
     expected["x.com.samsung.da.items"][0][  # type: ignore[index]
         "x.com.samsung.da.desired"
     ] = "27.0"
-    assert cbor2.loads(cbor2.dumps(command.payload)) == expected
+    assert command.payload == expected
 
 
-def test_hvac_payload_nested_modes_are_immutable_and_cbor_encodable() -> None:
+def test_hvac_payload_nested_modes_are_immutable() -> None:
     command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
     modes = command.payload["x.com.samsung.da.modes"]
 
     with pytest.raises(TypeError):
         modes.append("Heat")  # type: ignore[union-attr]
-    assert cbor2.loads(cbor2.dumps(command.payload)) == {
-        "x.com.samsung.da.modes": ["Cool"]
-    }
+    assert command.payload == {"x.com.samsung.da.modes": ["Cool"]}
+
+
+def test_command_payload_has_no_mutable_builtin_base_bypass() -> None:
+    command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
+    modes = command.payload["x.com.samsung.da.modes"]
+
+    assert not isinstance(command.payload, dict)
+    assert not isinstance(modes, list)
+    with pytest.raises(TypeError):
+        dict.__setitem__(command.payload, "new", "value")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        list.append(modes, "Heat")  # type: ignore[arg-type]
+
+
+def test_command_payload_internal_storage_cannot_be_reassigned() -> None:
+    command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
+    modes = command.payload["x.com.samsung.da.modes"]
+
+    with pytest.raises(AttributeError):
+        command.payload._data = {}  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        modes._items = ()  # type: ignore[attr-defined]
+
+
+def test_nested_set_is_frozen_and_preserved_by_equality() -> None:
+    aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
+    aggregate["unknown"] = {"preserved", "values"}
+    command = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    )
+    frozen = command.payload["unknown"]
+
+    assert frozen == {"preserved", "values"}
+    with pytest.raises(AttributeError):
+        frozen.add("mutation")  # type: ignore[union-attr]
 
 
 def test_immutable_command_payload_is_safe_to_deepcopy() -> None:
