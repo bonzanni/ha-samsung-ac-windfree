@@ -107,6 +107,8 @@ def _structured_alert(reason: str) -> ConnectionError:
 def _plain_cbor_value(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _plain_cbor_value(item) for key, item in value.items()}
+    if isinstance(value, bytearray):
+        return bytes(value)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_plain_cbor_value(item) for item in value]
     if isinstance(value, Set):
@@ -414,6 +416,7 @@ async def test_post_thaws_and_canonically_encodes_every_immutable_command(
     aggregate = None
     if kind is CommandKind.TEMPERATURE:
         aggregate = cbor2.loads(encoded_resources[TEMPERATURE_PATH])
+        aggregate["unknownBytes"] = bytearray(b"\x00\x80\xff")
         aggregate["unknownSet"] = {"preserved", "values"}
         aggregate["unknownNestedSet"] = frozenset(
             {

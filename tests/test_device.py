@@ -857,6 +857,41 @@ def test_command_payload_has_no_mutable_builtin_base_bypass() -> None:
         list.append(modes, "Heat")  # type: ignore[arg-type]
 
 
+def test_frozen_mapping_membership_and_equality_use_mapping_semantics() -> None:
+    first = build_command(CommandKind.HVAC_MODE, HvacMode.COOL).payload
+    second = build_command(CommandKind.HVAC_MODE, HvacMode.COOL).payload
+    plain = {"x.com.samsung.da.modes": ["Cool"]}
+
+    assert "x.com.samsung.da.modes" in first
+    assert "missing" not in first
+    assert [] not in first
+    assert first == first
+    assert first == second
+    assert second == first
+    assert first == plain
+    assert plain == first
+
+
+def test_frozen_nested_mapping_equality_is_symmetric() -> None:
+    aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
+    aggregate["unknown"] = {"nested": {"value": ["preserved"]}}
+    first = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    ).payload
+    second = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    ).payload
+
+    assert first == second
+    assert second == first
+    assert first["unknown"] == second["unknown"]
+    assert second["unknown"] == first["unknown"]
+
+
 def test_command_payload_internal_storage_cannot_be_reassigned() -> None:
     command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
     modes = command.payload["x.com.samsung.da.modes"]
@@ -884,6 +919,24 @@ def test_nested_set_is_frozen_and_preserved_by_equality() -> None:
     assert frozen == {"preserved", "values"}
     with pytest.raises(AttributeError):
         frozen.add("mutation")  # type: ignore[union-attr]
+
+
+def test_nested_bytearray_is_frozen_to_unaliased_bytes() -> None:
+    aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
+    caller_value = bytearray(b"\x01\x02")
+    aggregate["unknown"] = {"bytes": caller_value}
+    command = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    )
+    frozen = command.payload["unknown"]["bytes"]  # type: ignore[index]
+
+    assert type(frozen) is bytes
+    assert frozen == b"\x01\x02"
+    caller_value[0] = 0xFF
+    assert frozen == b"\x01\x02"
+    assert copy.deepcopy(command.payload) is command.payload
 
 
 def test_immutable_command_payload_is_safe_to_deepcopy() -> None:

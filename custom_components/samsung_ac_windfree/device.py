@@ -106,6 +106,9 @@ class _FrozenMapping(
     def __iter__(self) -> Iterator[object]:
         return (key for key, _value in tuple.__iter__(self))
 
+    def __contains__(self, key: object) -> bool:
+        return any(candidate == key for candidate, _value in tuple.__iter__(self))
+
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, Mapping)
@@ -166,6 +169,8 @@ def _is_sequence(value: object) -> bool:
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         return _FrozenMapping((key, _freeze(item)) for key, item in value.items())
+    if isinstance(value, bytearray):
+        return bytes(value)
     if _is_sequence(value):
         return _FrozenSequence(_freeze(item) for item in value)
     if isinstance(value, Set):
