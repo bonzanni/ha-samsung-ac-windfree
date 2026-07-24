@@ -57,6 +57,10 @@ class FakeTransportFactory:
             }
         )
         self.transports: list[AsyncMock] = []
+        self.observe_error: BaseException | None = None
+        self.block_generation: int | None = None
+        self.seed_started = asyncio.Event()
+        self.seed_release = asyncio.Event()
         self.reconnect = AsyncMock(side_effect=self._reconnect)
         self.discover = AsyncMock(side_effect=self._discover)
 
@@ -67,8 +71,14 @@ class FakeTransportFactory:
     def create(self, *, generation: int, **_: object) -> AsyncMock:
         transport = AsyncMock()
         transport.generation = generation
-        transport.async_get.side_effect = self._get
+
+        async def get(path: str) -> dict[str, object]:
+            return await self._get_for(generation, path)
+
+        transport.async_get.side_effect = get
         transport.async_post.side_effect = self._post
+        if self.observe_error is not None:
+            transport.async_observe.side_effect = self.observe_error
         self.transports.append(transport)
         return transport
 
@@ -80,6 +90,12 @@ class FakeTransportFactory:
 
     async def _get(self, path: str) -> dict[str, object]:
         return copy.deepcopy(self.resources[path])
+
+    async def _get_for(self, generation: int, path: str) -> dict[str, object]:
+        if generation == self.block_generation and path == "/device/0":
+            self.seed_started.set()
+            await self.seed_release.wait()
+        return await self._get(path)
 
     async def _post(self, path: str, payload: object) -> None:
         self.resources[path] = copy.deepcopy(payload)
@@ -378,6 +394,39 @@ async def test_matching_observe_arriving_during_post_avoids_fallback_get(
     coordinator.transport.async_get.assert_not_awaited()
 
 
+async def test_matching_observe_is_cached_and_signaled_before_final_publication(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator._observe_wait = 0.01
+    observe_merged = asyncio.Event()
+    post_release = asyncio.Event()
+    snapshots = []
+
+    async def post(path: str, payload: object) -> None:
+        await coordinator.transport_factory._post(path, payload)
+        coordinator.handle_observe(coordinator.generation, path, payload)
+        assert coordinator._resources[path] == payload
+        assert coordinator._observe_events[path].is_set()
+        observe_merged.set()
+        await post_release.wait()
+
+    coordinator.async_add_listener(lambda: snapshots.append(coordinator.data))
+    coordinator.transport.async_post.side_effect = post
+    coordinator.transport.async_get.reset_mock()
+    operation = asyncio.create_task(coordinator.async_command(CommandKind.POWER, True))
+    await observe_merged.wait()
+
+    assert snapshots == []
+    assert not coordinator.data.climate.power
+
+    post_release.set()
+    await operation
+    coordinator.transport.async_get.assert_not_awaited()
+    assert len(snapshots) == 1
+    assert snapshots[0].climate.power
+    assert snapshots[0].update_source is UpdateSource.COMMAND
+
+
 async def test_foreground_command_prevents_poll_interleaving(
     coordinator: WindFreeCoordinator,
 ) -> None:
@@ -445,7 +494,7 @@ async def test_power_failure_retains_verified_remembered_mode(
         await coordinator.transport_factory._post(path, payload)
 
     coordinator.transport.async_post.side_effect = post
-    with pytest.raises(TimeoutError):
+    with pytest.raises(CommandRejected, match="command_failed"):
         await coordinator.async_set_hvac_mode(HvacMode.HEAT)
     assert not coordinator.data.climate.power
     assert coordinator.data.climate.mode is HvacMode.HEAT
@@ -541,3 +590,648 @@ async def test_command_cancellation_propagates_without_speculative_publication(
     with pytest.raises(asyncio.CancelledError):
         await coordinator.async_command(CommandKind.POWER, True)
     assert coordinator.data is before
+
+
+async def test_start_observe_failure_never_publishes_available(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    factory = FakeTransportFactory(resource_representations)
+    factory.observe_error = TransportError("transport_observe_failed")
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        transport_factory=factory,
+        start_scheduler=False,
+    )
+    publications: list[bool] = []
+    instance.async_add_listener(lambda: publications.append(instance.data.available))
+
+    with pytest.raises(TransportError):
+        await instance.async_start()
+
+    assert True not in publications
+    assert not instance.data.available
+    assert not instance.last_update_success
+    factory.current.async_close.assert_awaited_once()
+
+
+async def test_reconnect_seed_is_not_exposed_and_blocks_commands(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    old_transport = coordinator.transport
+    old_generation = coordinator.generation
+    factory.block_generation = old_generation + 1
+    reconnect = asyncio.create_task(coordinator.async_run_reconnect_attempt())
+    await factory.seed_started.wait()
+
+    assert coordinator.transport is old_transport
+    assert coordinator.generation == old_generation
+    command = asyncio.create_task(coordinator.async_command(CommandKind.POWER, True))
+    await asyncio.sleep(0)
+    coordinator.transport.async_post.assert_not_awaited()
+
+    factory.seed_release.set()
+    await reconnect
+    await command
+    assert coordinator.generation == old_generation + 1
+
+
+async def test_reconnect_observe_failure_keeps_unavailable_and_retryable(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    coordinator._publish_unavailable("connection_failed")
+    factory.observe_error = TransportError("transport_observe_failed")
+
+    await coordinator.async_run_reconnect_attempt()
+
+    assert not coordinator.data.available
+    assert not coordinator.last_update_success
+    assert factory.current.async_close.await_count == 1
+    assert coordinator.reconnect_delay == 2
+
+
+async def test_off_to_mode_has_no_intermediate_available_publication(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    power_started = asyncio.Event()
+    power_release = asyncio.Event()
+    original_post = coordinator.transport_factory._post
+
+    async def post(path: str, payload: object) -> None:
+        await original_post(path, payload)
+        coordinator.handle_observe(coordinator.generation, path, payload)
+        if path == POWER_PATH:
+            power_started.set()
+            await power_release.wait()
+
+    snapshots = []
+    coordinator.async_add_listener(lambda: snapshots.append(coordinator.data))
+    coordinator.transport.async_post.side_effect = post
+    operation = asyncio.create_task(coordinator.async_set_hvac_mode(HvacMode.HEAT))
+    await power_started.wait()
+    assert snapshots == []
+    power_release.set()
+    await operation
+    assert len(snapshots) == 1
+    assert snapshots[0].climate.power
+    assert snapshots[0].climate.mode is HvacMode.HEAT
+
+
+async def test_turn_on_rejects_and_publishes_authoritative_mode_coercion(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    await coordinator.async_command(CommandKind.HVAC_MODE, HvacMode.HEAT)
+    original_post = coordinator.transport_factory._post
+
+    async def post(path: str, payload: object) -> None:
+        await original_post(path, payload)
+        if path == POWER_PATH:
+            coerced = {"x.com.samsung.da.modes": ["Cool"]}
+            coordinator.transport_factory.resources[HVAC_MODE_PATH] = coerced
+
+    coordinator.transport.async_post.side_effect = post
+    with pytest.raises(CommandRejected):
+        await coordinator.async_turn_on()
+    assert coordinator.data.climate.power
+    assert coordinator.data.climate.mode is HvacMode.COOL
+
+
+async def test_shutdown_uses_coordinator_failure_semantics(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    assert coordinator.last_update_success
+    await coordinator.async_shutdown()
+    assert not coordinator.last_update_success
+    assert not coordinator.data.available
+
+
+async def test_scheduled_hot_failures_advance_deadline_and_trigger_supervision(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = ConnectionError
+    factory.discover.side_effect = ConnectionError
+    coordinator.transport.async_get.side_effect = TimeoutError
+    for _ in range(3):
+        path = coordinator.next_due().path
+        coordinator.force_due(path, due=0)
+        before = coordinator.deadline_for(path)
+        await coordinator.async_run_scheduled_once()
+        assert coordinator.deadline_for(path) > before
+    assert not coordinator.data.available
+    assert coordinator.transport_factory.reconnect.await_count >= 1
+    reconnect = coordinator._reconnect_task
+    assert reconnect is not None
+    for _ in range(100):
+        coordinator._ensure_reconnect_task()
+    assert coordinator._reconnect_task is reconnect
+    assert (
+        len(
+            [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == "windfree reconnect" and not task.done()
+            ]
+        )
+        == 1
+    )
+
+
+async def test_scheduled_failure_does_not_starve_warm_or_reconcile(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    failing_hot = HOT_PATHS[0]
+    original_get = coordinator.transport_factory._get
+
+    async def get(path: str) -> dict[str, object]:
+        if path == failing_hot:
+            raise TimeoutError
+        return await original_get(path)
+
+    coordinator.transport_factory._get = get
+    coordinator.force_due(failing_hot, due=0)
+    coordinator.force_due(WARM_PATHS[0], due=0)
+    await coordinator.async_run_scheduled_once()
+    await coordinator.async_run_scheduled_once()
+    assert WARM_PATHS[0] in [
+        call.args[0] for call in coordinator.transport.async_get.await_args_list
+    ]
+    coordinator.force_reconcile_due(0)
+    await coordinator.async_run_scheduled_once()
+    assert coordinator.reconcile_deadline > 0
+
+
+async def test_background_fatal_auth_confirmation_is_exposed(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed", fatal_alert="unknown_ca"
+    )
+    coordinator.force_due(HOT_PATHS[0], due=0)
+    await coordinator.async_run_scheduled_once()
+    coordinator._generation += 1
+    coordinator.force_due(HOT_PATHS[0], due=0)
+    await coordinator.async_run_scheduled_once()
+    assert coordinator.authentication_rejected
+    assert coordinator.connection_reason == "authentication_rejected"
+    assert not coordinator.last_update_success
+
+
+async def test_transient_scheduled_failure_never_sets_authentication_rejected(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_get.side_effect = TimeoutError
+    coordinator.force_due(HOT_PATHS[0], due=0)
+    await coordinator.async_run_scheduled_once()
+    coordinator._generation += 1
+    coordinator.force_due(HOT_PATHS[0], due=0)
+    await coordinator.async_run_scheduled_once()
+    assert not coordinator.authentication_rejected
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TransportError(
+            "transport_connect_failed",
+            coap_code=129,
+        ),
+        TransportError(
+            "transport_connect_failed",
+            fatal_alert="handshake_failure",
+        ),
+        TimeoutError(),
+    ],
+)
+async def test_unallowed_reconnect_signals_remain_transient(
+    coordinator: WindFreeCoordinator,
+    error: BaseException,
+) -> None:
+    coordinator.transport_factory.reconnect.side_effect = [error, error]
+    await coordinator.async_run_reconnect_attempt()
+    await coordinator.async_run_reconnect_attempt()
+    assert not coordinator.authentication_rejected
+    assert coordinator.connection_reason != "authentication_rejected"
+
+
+async def test_shutdown_cancellation_is_retained_idempotent_and_exact(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+
+    async def close() -> None:
+        close_started.set()
+        await close_release.wait()
+
+    coordinator.transport.async_close.side_effect = close
+    shutdown = asyncio.create_task(coordinator.async_shutdown())
+    await close_started.wait()
+    shutdown.cancel("exact-shutdown-cancel")
+    await asyncio.sleep(0)
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await shutdown
+    assert caught.value.args == ("exact-shutdown-cancel",)
+    await coordinator.async_shutdown()
+    assert coordinator.transport_factory.current.async_close.await_count == 1
+
+
+async def test_shutdown_close_failure_retains_transport_for_retry(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    active = coordinator.transport
+    active.async_close.side_effect = [
+        TransportError("transport_close_failed"),
+        None,
+    ]
+    with pytest.raises(TransportError):
+        await coordinator.async_shutdown()
+    await coordinator.async_shutdown()
+    assert active.async_close.await_count == 2
+    assert not coordinator.data.available
+    assert not coordinator.last_update_success
+
+
+async def test_shutdown_close_cancellation_retains_transport_for_retry(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    active = coordinator.transport
+    active.async_close.side_effect = [
+        asyncio.CancelledError("transport-close-cancelled"),
+        None,
+    ]
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator.async_shutdown()
+
+    await coordinator.async_shutdown()
+
+    assert active.async_close.await_count == 2
+    assert not coordinator.data.available
+    assert not coordinator.last_update_success
+
+
+async def test_shutdown_retries_only_the_exact_transport_that_failed_to_close(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    active = coordinator.transport
+    pending = AsyncMock()
+    pending.async_close.side_effect = [
+        TransportError("transport_close_failed"),
+        None,
+    ]
+    coordinator._pending_transport = pending
+
+    with pytest.raises(TransportError):
+        await coordinator.async_shutdown()
+    await coordinator.async_shutdown()
+
+    active.async_close.assert_awaited_once()
+    assert pending.async_close.await_count == 2
+    assert coordinator._transport is None
+    assert coordinator._pending_transport is None
+
+
+async def test_priority_admission_reorders_waiters_command_hot_then_reconcile(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    order: list[str] = []
+    original_get = coordinator.transport_factory._get
+    original_post = coordinator.transport_factory._post
+
+    async def get(path: str) -> dict[str, object]:
+        order.append(f"get:{path}")
+        return await original_get(path)
+
+    async def post(path: str, payload: object) -> None:
+        order.append(f"post:{path}")
+        await original_post(path, payload)
+
+    coordinator.transport_factory._get = get
+    coordinator.transport.async_post.side_effect = post
+    await coordinator._admission.acquire(0)
+    reconcile = asyncio.create_task(coordinator.async_reconcile())
+    await asyncio.sleep(0)
+    hot = asyncio.create_task(coordinator.async_poll_path(HOT_PATHS[0]))
+    await asyncio.sleep(0)
+    command = asyncio.create_task(coordinator.async_command(CommandKind.POWER, True))
+    await asyncio.sleep(0)
+    coordinator._admission.release()
+    await asyncio.gather(reconcile, hot, command)
+
+    assert order[0] == f"post:{POWER_PATH}"
+    assert order.index(f"get:{HOT_PATHS[0]}") < order.index("get:/oic/d")
+
+
+async def test_scheduler_rechecks_deadline_and_priority_after_admission(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    warm = WARM_PATHS[0]
+    hot = HOT_PATHS[0]
+    coordinator.transport.async_get.reset_mock()
+    await coordinator._admission.acquire(0)
+    coordinator.force_due(warm, due=0)
+    queued_warm = asyncio.create_task(coordinator.async_run_scheduled_once())
+    await asyncio.sleep(0)
+    coordinator.handle_observe(
+        coordinator.generation,
+        warm,
+        coordinator.transport_factory.resources[warm],
+    )
+    coordinator.force_due(hot, due=0)
+    queued_hot = asyncio.create_task(coordinator.async_run_scheduled_once())
+    await asyncio.sleep(0)
+    coordinator._admission.release()
+    await asyncio.gather(queued_warm, queued_hot)
+
+    calls = [call.args[0] for call in coordinator.transport.async_get.await_args_list]
+    assert calls == [hot]
+
+
+async def test_real_scheduler_processes_failure_warm_and_reconcile(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    clock = FakeClock()
+    factory = FakeTransportFactory(resource_representations)
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        transport_factory=factory,
+        observe_wait=0,
+        start_scheduler=True,
+    )
+    await instance.async_start()
+    original_get = factory._get
+
+    async def get(path: str) -> dict[str, object]:
+        if path == HOT_PATHS[0]:
+            raise TimeoutError
+        return await original_get(path)
+
+    factory._get = get
+    instance.force_due(HOT_PATHS[0], due=0)
+    instance.force_due(WARM_PATHS[0], due=0)
+    instance.force_reconcile_due(0)
+    try:
+        for _ in range(20):
+            await asyncio.sleep(0)
+            called = [
+                call.args[0] for call in instance.transport.async_get.await_args_list
+            ]
+            if WARM_PATHS[0] in called and "/oic/d" in called[3:]:
+                break
+        assert instance.data.failure_count == 1
+        assert WARM_PATHS[0] in called
+        assert "/oic/d" in called[3:]
+    finally:
+        await instance.async_shutdown()
+
+
+async def test_cancelled_start_cleans_candidate_and_never_resurrects(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    factory = FakeTransportFactory(resource_representations)
+    factory.block_generation = 1
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        transport_factory=factory,
+        start_scheduler=False,
+    )
+    start = asyncio.create_task(instance.async_start())
+    await factory.seed_started.wait()
+    start.cancel("exact-start-cancel")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await start
+    assert caught.value.args == ("exact-start-cancel",)
+    await instance.async_shutdown()
+    factory.seed_release.set()
+    await asyncio.sleep(0)
+    assert not instance.data.available
+    assert factory.current.async_close.await_count == 1
+
+
+class _SecretCommandValue:
+    def __repr__(self) -> str:
+        return "adversarial-public-command-secret"
+
+
+async def test_public_builder_error_scrubs_command_from_all_traceback_frames(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    secret = "adversarial-public-command-secret"
+    with pytest.raises(CommandRejected) as caught:
+        await coordinator.async_command(
+            CommandKind.TEMPERATURE,
+            _SecretCommandValue(),
+        )
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != (
+            "custom_components.samsung_ac_windfree.coordinator"
+        ):
+            continue
+        assert all(secret not in repr(value) for value in frame.f_locals.values())
+
+
+async def test_aggregate_command_cancellation_is_exact_and_traceback_redacted(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    secret = "adversarial-cancel-aggregate-secret"
+    aggregate = copy.deepcopy(coordinator.transport_factory.resources[TEMPERATURE_PATH])
+    aggregate["unknown"] = secret
+    coordinator.transport_factory.resources[TEMPERATURE_PATH] = aggregate
+    post_started = asyncio.Event()
+
+    async def post(_path: str, _payload: object) -> None:
+        post_started.set()
+        await asyncio.Event().wait()
+
+    coordinator.transport.async_post.side_effect = post
+    command = asyncio.create_task(
+        coordinator.async_command(CommandKind.TEMPERATURE, 27)
+    )
+    await post_started.wait()
+    command.cancel("exact-command-cancel")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await command
+    assert caught.value.args == ("exact-command-cancel",)
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != (
+            "custom_components.samsung_ac_windfree.coordinator"
+        ):
+            continue
+        assert all(secret not in repr(value) for value in frame.f_locals.values())
+
+
+async def test_real_scheduler_three_hot_failures_close_and_reconnect(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    clock = FakeClock()
+    factory = FakeTransportFactory(resource_representations)
+    factory.reconnect.side_effect = ConnectionError
+    factory.discover.side_effect = ConnectionError
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        transport_factory=factory,
+        observe_wait=0,
+        start_scheduler=True,
+    )
+    await instance.async_start()
+    active = instance.transport
+
+    async def get(path: str) -> dict[str, object]:
+        if path in HOT_PATHS:
+            raise TimeoutError
+        return await factory._get(path)
+
+    factory._get = get
+    for path in HOT_PATHS[:3]:
+        instance.force_due(path, due=0)
+    try:
+        for _ in range(30):
+            await asyncio.sleep(0)
+            if active.async_close.await_count and factory.reconnect.await_count:
+                break
+        assert not instance.data.available
+        assert not instance.last_update_success
+        active.async_close.assert_awaited_once()
+        assert factory.reconnect.await_count >= 1
+    finally:
+        await instance.async_shutdown()
+
+
+async def test_discovery_fatal_auth_confirmation_is_exposed_and_raised(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = ConnectionError
+    factory.discover.side_effect = TransportError(
+        "transport_connect_failed",
+        fatal_alert="unknown_ca",
+    )
+    for _ in range(2):
+        coordinator._stored_port_failures = 2
+        if coordinator.authentication_rejected:
+            break
+        try:
+            await coordinator.async_run_reconnect_attempt()
+        except AuthenticationRejected:
+            pass
+    assert coordinator.authentication_rejected
+    assert coordinator.connection_reason == "authentication_rejected"
+
+
+async def test_reconcile_fatal_auth_confirmation_is_exposed(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_get.side_effect = TransportError(
+        "transport_get_failed",
+        fatal_alert="access_denied",
+    )
+    await coordinator.async_reconcile()
+    coordinator._generation += 1
+    await coordinator.async_reconcile()
+    assert coordinator.authentication_rejected
+    assert not coordinator.last_update_success
+
+
+async def test_command_fatal_auth_confirmation_is_exposed(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    coordinator.transport.async_post.side_effect = TransportError(
+        "transport_post_rejected",
+        coap_code=131,
+    )
+    with pytest.raises(CommandRejected):
+        await coordinator.async_command(CommandKind.POWER, True)
+    coordinator._generation += 1
+    with pytest.raises(CommandRejected):
+        await coordinator.async_command(CommandKind.POWER, True)
+    assert coordinator.authentication_rejected
+    assert not coordinator.last_update_success
+
+
+@pytest.mark.parametrize("stage", ["post", "wait", "get", "related"])
+async def test_every_public_command_failure_scrubs_internal_secrets(
+    coordinator: WindFreeCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    secret = f"adversarial-{stage}-command-secret"
+    original_get = coordinator.transport_factory._get
+    coordinator.transport.async_post.side_effect = coordinator.transport_factory._post
+    if stage == "post":
+        coordinator.transport.async_post.side_effect = RuntimeError(secret)
+    elif stage == "wait":
+        monkeypatch.setattr(
+            coordinator,
+            "_wait_for_observe",
+            AsyncMock(side_effect=RuntimeError(secret)),
+        )
+    elif stage == "get":
+        coordinator.transport.async_post.side_effect = None
+        coordinator.transport.async_post.return_value = None
+        coordinator.transport.async_get.side_effect = RuntimeError(secret)
+    else:
+        calls = 0
+
+        async def get(path: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError(secret)
+            return await original_get(path)
+
+        coordinator.transport.async_get.side_effect = get
+
+    kind = CommandKind.HVAC_MODE if stage == "related" else CommandKind.POWER
+    value = HvacMode.COOL if stage == "related" else True
+    with pytest.raises(CommandRejected) as caught:
+        await coordinator.async_command(kind, value)
+
+    assert caught.value.__cause__ is None
+    assert secret not in repr(caught.value)
+    forbidden = (
+        secret,
+        "device.invalid",
+        coordinator._credentials.client_key_pem,
+        coordinator._credentials.client_chain_pem,
+    )
+    for frame, _line in traceback.walk_tb(caught.value.__traceback__):
+        if frame.f_globals.get("__name__") != (
+            "custom_components.samsung_ac_windfree.coordinator"
+        ):
+            continue
+        rendered = tuple(repr(value) for value in frame.f_locals.values())
+        assert all(marker not in item for marker in forbidden for item in rendered)
