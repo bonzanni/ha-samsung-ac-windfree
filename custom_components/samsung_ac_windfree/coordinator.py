@@ -811,8 +811,21 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                     "windfree scheduler",
                 )
 
+    def _begin_shutdown(self) -> None:
+        """Make shutdown terminal before any cleanup task can be scheduled."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._terminated = True
+        self._lifecycle_epoch += 1
+
     async def async_shutdown(self) -> None:
         """Retain one cancellation-safe shutdown operation until cleanup ends."""
+        self._begin_shutdown()
+        current = asyncio.current_task()
+        registered_caller = current in self._command_tasks or (
+            current in self._operation_tasks
+        )
         task = self._shutdown_task
         if task is None:
             task = self.hass.async_create_task(
@@ -820,6 +833,8 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                 "windfree shutdown",
             )
             self._shutdown_task = task
+        if registered_caller:
+            return
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -841,9 +856,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             raise
 
     async def _async_shutdown_impl(self) -> None:
-        self._shutting_down = True
-        self._terminated = True
-        self._lifecycle_epoch += 1
+        self._begin_shutdown()
         startup = self._startup_task
         command_tasks = tuple(self._command_tasks)
         command_completions = tuple(self._command_completions)
@@ -1707,53 +1720,62 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         kind: CommandKind | None,
         value: object,
     ) -> _CommandOutcome:
-        generation = 0
         try:
             async with self._admission.hold(0):
                 epoch = self._lifecycle_epoch
                 self._require_command_epoch(epoch)
+                transport = self._transport
+                assert transport is not None
                 generation = self._generation
+                classification: tuple[str, object] | None = None
+                category: str | None = None
                 self._command_active = True
                 try:
-                    if operation == "command":
-                        assert kind is not None
-                        await self._async_command_locked(kind, value, epoch)
-                    elif operation == "set_mode":
-                        await self._async_set_hvac_mode_locked(value, epoch)
-                    elif operation == "turn_on":
-                        await self._async_turn_on_locked(epoch)
-                    else:
-                        await self._async_command_locked(
-                            CommandKind.POWER,
-                            False,
-                            epoch,
+                    try:
+                        if operation == "command":
+                            assert kind is not None
+                            await self._async_command_locked(kind, value, epoch)
+                        elif operation == "set_mode":
+                            await self._async_set_hvac_mode_locked(value, epoch)
+                        elif operation == "turn_on":
+                            await self._async_turn_on_locked(epoch)
+                        else:
+                            await self._async_command_locked(
+                                CommandKind.POWER,
+                                False,
+                                epoch,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        classification = self._fatal_classification(error)
+                        category = (
+                            str(error)
+                            if isinstance(error, CommandRejected)
+                            and str(error)
+                            in {
+                                "command_unavailable",
+                                "command_incompatible",
+                                "command_rejected",
+                            }
+                            else "command_failed"
                         )
+                        error = None
                 finally:
                     self._command_active = False
-            return _CommandOutcome()
+                if category is not None:
+                    self._require_operation_epoch(epoch, transport)
+                    if classification is not None:
+                        await self._async_handle_fatal_evidence_locked(
+                            classification,
+                            generation,
+                        )
+                    return _CommandOutcome(error=category)
+                return _CommandOutcome()
         except asyncio.CancelledError:
             return _CommandOutcome(cancelled=True)
-        except Exception as error:
-            classification = self._fatal_classification(error)
-            category = (
-                str(error)
-                if isinstance(error, CommandRejected)
-                and str(error)
-                in {
-                    "command_unavailable",
-                    "command_incompatible",
-                    "command_rejected",
-                }
-                else "command_failed"
-            )
-            error = None
-            if classification is not None:
-                async with self._admission.hold(0):
-                    await self._async_handle_fatal_evidence_locked(
-                        classification,
-                        generation,
-                    )
-            return _CommandOutcome(error=category)
+        except Exception:
+            return _CommandOutcome(error="command_failed")
 
     async def _async_public_command(
         self,

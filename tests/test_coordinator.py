@@ -837,6 +837,40 @@ async def test_shutdown_joins_blocked_public_reconnect_attempt(
             await asyncio.gather(operation, return_exceptions=True)
 
 
+async def test_registered_child_can_request_shutdown_without_join_cycle(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    original_get = coordinator.transport_factory._get
+    publications: list[bool] = []
+    shutdown_returned = asyncio.Event()
+
+    async def get(path: str) -> dict[str, object]:
+        await coordinator.async_shutdown()
+        shutdown_returned.set()
+        return await original_get(path)
+
+    coordinator.transport.async_get.side_effect = get
+    coordinator.async_add_listener(
+        lambda: publications.append(coordinator.data.available)
+    )
+    operation = asyncio.create_task(coordinator.async_poll_path(HOT_PATHS[0]))
+
+    try:
+        await asyncio.wait_for(shutdown_returned.wait(), timeout=0.2)
+    finally:
+        operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    await asyncio.wait_for(coordinator.async_shutdown(), timeout=0.2)
+
+    assert not coordinator._operation_tasks
+    assert not coordinator._operation_completions
+    assert not coordinator.data.available
+    assert not coordinator.last_update_success
+    assert True not in publications
+    await coordinator.async_shutdown()
+
+
 async def test_start_observe_failure_never_publishes_available(
     hass,
     credentials,
@@ -1747,6 +1781,50 @@ async def test_command_fatal_auth_forces_fresh_generation_before_confirmation(
         await coordinator.async_command(CommandKind.POWER, True)
     assert coordinator.authentication_rejected
     assert not coordinator.data.available
+
+
+async def test_command_fatal_is_handled_before_waiting_candidate_activation(
+    coordinator: WindFreeCoordinator,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = coordinator.transport_factory
+    old = coordinator.transport
+    post_started = asyncio.Event()
+    failure_release = asyncio.Event()
+    fatal = TransportError("transport_post_rejected", coap_code=131)
+    monkeypatch.setattr(coordinator, "_ensure_reconnect_task", lambda: None)
+
+    async def post(_path: str, _payload: object) -> None:
+        post_started.set()
+        await failure_release.wait()
+        raise fatal
+
+    old.async_post.side_effect = post
+    command = asyncio.create_task(coordinator.async_command(CommandKind.POWER, True))
+    await post_started.wait()
+    reconnect = asyncio.create_task(coordinator.async_run_reconnect_attempt())
+    await asyncio.sleep(0)
+    candidate = factory.current
+    assert candidate is not old
+
+    failure_release.set()
+    with pytest.raises(CommandRejected):
+        await command
+    await reconnect
+
+    assert coordinator._fatal_signals[("coap", 131)] == 1
+    assert coordinator.generation == 2
+    assert coordinator.transport is candidate
+    assert coordinator.data.available
+    assert not coordinator.authentication_rejected
+    candidate.async_close.assert_not_awaited()
+
+    candidate.async_post.side_effect = fatal
+    with pytest.raises(CommandRejected):
+        await coordinator.async_command(CommandKind.POWER, True)
+    assert coordinator.authentication_rejected
+    assert not coordinator.data.available
+    candidate.async_close.assert_awaited_once()
 
 
 async def test_nonfatal_reconcile_error_keeps_current_generation_connected(
