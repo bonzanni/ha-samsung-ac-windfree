@@ -524,9 +524,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         )
 
     def _publish(self, data: WindFreeData) -> None:
+        recovered = not self.last_update_success and data.available
         if data.update_source in self._update_counts:
             self._update_counts[data.update_source] += 1
         self.async_set_updated_data(data)
+        if recovered:
+            _LOGGER.info("Samsung WindFree connection recovered")
 
     def _publish_unavailable(self, reason: str) -> None:
         """Retain typed data while applying coordinator failure semantics."""

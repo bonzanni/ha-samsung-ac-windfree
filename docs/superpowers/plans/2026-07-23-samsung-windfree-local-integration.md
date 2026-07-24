@@ -2344,6 +2344,10 @@ git commit -m "feat: add private diagnostics and repairs"
 - Create: `CHANGELOG.md`
 - Create: `LICENSE`
 - Expand: `tests/test_init.py`
+- Review fix: `custom_components/samsung_ac_windfree/__init__.py`
+- Review fix: `custom_components/samsung_ac_windfree/coordinator.py`
+- Review fix: `custom_components/samsung_ac_windfree/{binary_sensor,climate,sensor,switch}.py`
+- Review fix: `tests/test_coordinator.py`
 
 **Interfaces:**
 - Consumes: every user-visible key from Tasks 7–10.
@@ -2426,6 +2430,23 @@ git add custom_components/samsung_ac_windfree/strings.json \
   README.md CHANGELOG.md LICENSE tests/test_init.py
 git commit -m "docs: document Samsung WindFree local integration"
 ```
+
+#### Task 11 quality review closure
+
+The implementation review added evidence-backed production work needed to make
+the claimed Silver rules truthful on Home Assistant 2026.7:
+
+- every entity platform declares `PARALLEL_UPDATES = 0` because the coordinator
+  admission gate owns outbound serialization;
+- coordinator recovery emits one fixed, sanitized info log only on each
+  unavailable-to-available transition;
+- all config-entry lifecycle exceptions use Home Assistant translation metadata
+  with no placeholders, backed by an exhaustive English exception-key set;
+- the cool/warm example uses one conditional `choose` action driven by an input
+  helper rather than sending conflicting commands sequentially.
+
+Focused tests cover those behaviors directly. The review fix is committed
+separately as `fix: complete WindFree quality metadata`.
 
 ---
 

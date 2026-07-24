@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -66,6 +67,17 @@ def _integration_traceback_locals(error: BaseException) -> str:
             values.extend(repr(value) for value in frame.f_locals.values())
         traceback = traceback.tb_next
     return "\n".join(values)
+
+
+def _assert_translated_entry_error(
+    error: BaseException,
+    translation_key: str,
+) -> None:
+    assert error.args == (translation_key,)
+    assert error.translation_domain == DOMAIN
+    assert error.translation_key == translation_key
+    assert error.translation_placeholders is None
+    assert error.generate_message is True
 
 
 def test_fixed_product_contract() -> None:
@@ -148,11 +160,12 @@ async def test_setup_failure_shuts_down_coordinator_before_reraising(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator",
             return_value=coordinator,
         ),
-        pytest.raises(Exception, match="setup_failed") as caught,
+        pytest.raises(ConfigEntryNotReady) as caught,
     ):
         await async_setup_entry(hass, entry)
 
     coordinator.async_shutdown.assert_awaited_once_with()
+    _assert_translated_entry_error(caught.value, "setup_failed")
     traceback_locals = _integration_traceback_locals(caught.value)
     assert HOST not in traceback_locals
     assert credentials.client_key_pem not in traceback_locals
@@ -195,10 +208,11 @@ async def test_setup_cleanup_failure_does_not_replace_sanitized_error(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator",
             return_value=coordinator,
         ),
-        pytest.raises(expected_type, match=expected_message) as caught,
+        pytest.raises(expected_type) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, expected_message)
     assert caught.value.__context__ is None
     traceback_locals = _integration_traceback_locals(caught.value)
     assert HOST not in traceback_locals
@@ -224,10 +238,11 @@ async def test_delayed_setup_cleanup_failure_is_sanitized(hass, credentials) -> 
             "custom_components.samsung_ac_windfree.WindFreeCoordinator",
             return_value=coordinator,
         ),
-        pytest.raises(ConfigEntryNotReady, match="setup_failed") as caught,
+        pytest.raises(ConfigEntryNotReady) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "setup_failed")
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
     traceback_locals = _integration_traceback_locals(caught.value)
@@ -377,10 +392,11 @@ async def test_expired_certificate_starts_reauth_without_constructing_coordinato
         patch(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator"
         ) as constructor,
-        pytest.raises(ConfigEntryAuthFailed, match="credentials_expired"),
+        pytest.raises(ConfigEntryAuthFailed) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "credentials_expired")
     entry.async_start_reauth.assert_called_once_with(hass)
     constructor.assert_not_called()
 
@@ -456,12 +472,11 @@ async def test_not_yet_valid_certificate_starts_reauth_offline(
         patch(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator"
         ) as constructor,
-        pytest.raises(
-            ConfigEntryAuthFailed, match="credentials_not_yet_valid"
-        ) as caught,
+        pytest.raises(ConfigEntryAuthFailed) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "credentials_not_yet_valid")
     entry.async_start_reauth.assert_called_once_with(hass)
     constructor.assert_not_called()
     assert caught.value.__context__ is None
@@ -601,10 +616,11 @@ async def test_unload_shutdown_failure_is_sanitized(hass, credentials) -> None:
             "async_unload_platforms",
             new=AsyncMock(return_value=True),
         ),
-        pytest.raises(ConfigEntryError, match="unload_failed") as caught,
+        pytest.raises(ConfigEntryError) as caught,
     ):
         await async_unload_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "unload_failed")
     assert caught.value.__context__ is None
     traceback_locals = _integration_traceback_locals(caught.value)
     assert HOST not in traceback_locals
@@ -630,10 +646,11 @@ async def test_delayed_unload_shutdown_failure_is_sanitized(hass, credentials) -
             "async_unload_platforms",
             new=AsyncMock(return_value=True),
         ),
-        pytest.raises(ConfigEntryError, match="unload_failed") as caught,
+        pytest.raises(ConfigEntryError) as caught,
     ):
         await async_unload_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "unload_failed")
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
     traceback_locals = _integration_traceback_locals(caught.value)
@@ -963,10 +980,11 @@ async def test_enabled_reload_preserves_issue_until_runtime_is_evaluated(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator",
             return_value=failed,
         ),
-        pytest.raises(ConfigEntryNotReady, match="setup_failed"),
+        pytest.raises(ConfigEntryNotReady) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "setup_failed")
     assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
     assert entry.entry_id in store.runtime_pending
 
@@ -1133,10 +1151,11 @@ async def test_failed_reload_after_successful_unload_does_not_restore_old_lifecy
 
     with (
         patch.object(hass.config_entries, "async_reload", side_effect=reload),
-        pytest.raises(ConfigEntryError, match="reload_failed"),
+        pytest.raises(ConfigEntryError) as caught,
     ):
         await _async_reload_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "reload_failed")
     unsubscribes[0].assert_called_once_with()
     assert len(listeners) == 1
     assert entry.entry_id not in _lifecycles(hass)
@@ -1184,10 +1203,11 @@ async def test_failed_reload_unload_restores_and_reconciles_auth_once(
 
     with (
         patch.object(hass.config_entries, "async_reload", side_effect=reload),
-        pytest.raises(ConfigEntryError, match="reload_failed"),
+        pytest.raises(ConfigEntryError) as caught,
     ):
         await _async_reload_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "reload_failed")
     assert len(listeners) == 2
     entry.async_start_reauth.assert_called_once_with(hass)
     listeners[-1]()
@@ -1241,10 +1261,11 @@ async def test_invalid_stored_validity_is_sanitized_and_offline(
         patch(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator"
         ) as constructor,
-        pytest.raises(Exception, match="invalid_stored_credentials") as caught,
+        pytest.raises(ConfigEntryError) as caught,
     ):
         await async_setup_entry(hass, entry)
 
+    _assert_translated_entry_error(caught.value, "invalid_stored_credentials")
     constructor.assert_not_called()
     assert HOST not in repr(caught.value)
     assert credentials.client_key_pem not in repr(caught.value)
@@ -1298,7 +1319,19 @@ _ENTITY_KEYS = {
     },
     "switch": {"auto_clean", "display_light"},
 }
-_EXCEPTION_KEYS = {
+_LIFECYCLE_EXCEPTION_KEYS = {
+    "authentication_rejected",
+    "capability_mismatch",
+    "credentials_expired",
+    "credentials_not_yet_valid",
+    "invalid_stored_credentials",
+    "invalid_stored_entry",
+    "reload_failed",
+    "setup_failed",
+    "unload_failed",
+    "unsupported_device",
+}
+_EXCEPTION_KEYS = _LIFECYCLE_EXCEPTION_KEYS | {
     "command_failed",
     "command_incompatible",
     "command_rejected",
@@ -1423,6 +1456,73 @@ def test_all_entity_and_command_translation_keys_are_defined() -> None:
     assert all(set(value) == {"message"} for value in strings["exceptions"].values())
 
 
+def test_platforms_explicitly_delegate_parallelism_to_coordinator() -> None:
+    from custom_components.samsung_ac_windfree import (
+        binary_sensor,
+        climate,
+        sensor,
+        switch,
+    )
+
+    assert {
+        binary_sensor.PARALLEL_UPDATES,
+        climate.PARALLEL_UPDATES,
+        sensor.PARALLEL_UPDATES,
+        switch.PARALLEL_UPDATES,
+    } == {0}
+
+
+@pytest.mark.parametrize(
+    ("error_type", "translation_key"),
+    [
+        (ConfigEntryAuthFailed, "authentication_rejected"),
+        (ConfigEntryError, "capability_mismatch"),
+        (ConfigEntryAuthFailed, "credentials_expired"),
+        (ConfigEntryAuthFailed, "credentials_not_yet_valid"),
+        (ConfigEntryError, "invalid_stored_credentials"),
+        (ConfigEntryError, "invalid_stored_entry"),
+        (ConfigEntryError, "reload_failed"),
+        (ConfigEntryNotReady, "setup_failed"),
+        (ConfigEntryError, "unload_failed"),
+        (ConfigEntryError, "unsupported_device"),
+    ],
+)
+def test_lifecycle_entry_errors_use_translation_metadata(
+    error_type, translation_key
+) -> None:
+    from custom_components.samsung_ac_windfree import _translated_entry_error
+
+    error = _translated_entry_error(error_type, translation_key)
+
+    assert type(error) is error_type
+    _assert_translated_entry_error(error, translation_key)
+
+
+def test_every_lifecycle_error_callsite_uses_the_translated_factory() -> None:
+    tree = ast.parse((_INTEGRATION_DIR / "__init__.py").read_text())
+    callsite_keys = {
+        call.args[1].value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_translated_entry_error"
+        and len(call.args) == 2
+        and isinstance(call.args[1], ast.Constant)
+        and isinstance(call.args[1].value, str)
+    }
+    direct_lifecycle_constructors = {
+        call.func.id
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id
+        in {"ConfigEntryAuthFailed", "ConfigEntryError", "ConfigEntryNotReady"}
+    }
+
+    assert callsite_keys == _LIFECYCLE_EXCEPTION_KEYS
+    assert direct_lifecycle_constructors == set()
+
+
 def test_all_repair_issue_and_fix_flow_keys_are_defined() -> None:
     issues = _load_strings()["issues"]
 
@@ -1516,6 +1616,28 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
     ):
         assert heading in readme
     assert "https://github.com/bonzanni/ha-samsung-ac-windfree/issues" in readme
+
+
+def test_readme_warm_cool_automation_chooses_exactly_one_mode() -> None:
+    readme = Path("README.md").read_text()
+    example = readme.partition("Switch between cool and warm mode from an input:")[2]
+    yaml_text = example.partition("```yaml")[2].partition("```")[0]
+
+    automation = yaml.safe_load(yaml_text)
+    assert "input_select.windfree_mode" in yaml_text
+    assert len(automation["actions"]) == 1
+    choice = automation["actions"][0]
+    assert set(choice) == {"choose", "default"}
+    sequences = [option["sequence"] for option in choice["choose"]]
+    sequences.append(choice["default"])
+    assert all(len(sequence) == 1 for sequence in sequences)
+    assert {sequence[0]["data"]["hvac_mode"] for sequence in sequences} == {
+        "cool",
+        "heat",
+    }
+    assert all(
+        sequence[0]["action"] == "climate.set_hvac_mode" for sequence in sequences
+    )
 
 
 def test_release_metadata_matches_manifest_and_supported_scope() -> None:

@@ -15,6 +15,8 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from .coordinator import WindFreeCoordinator
 from .entity import WindFreeEntity
 
+PARALLEL_UPDATES = 0
+
 BINARY_SENSOR_DESCRIPTIONS = (
     BinarySensorEntityDescription(
         key="filter_attention",

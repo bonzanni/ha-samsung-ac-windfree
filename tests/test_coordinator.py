@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import traceback
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import AsyncMock, call
 
@@ -1038,6 +1039,44 @@ async def test_shutdown_uses_coordinator_failure_semantics(
     await coordinator.async_shutdown()
     assert not coordinator.last_update_success
     assert not coordinator.data.available
+
+
+def test_unavailable_recovery_logging_is_once_per_transition_and_private(
+    coordinator: WindFreeCoordinator,
+    caplog,
+) -> None:
+    host = "device.invalid"
+    recovery_message = "Samsung WindFree connection recovered"
+    caplog.clear()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_components.samsung_ac_windfree.coordinator",
+    ):
+        for _ in range(2):
+            coordinator._publish_unavailable("connection_failed")
+        coordinator._publish(replace(coordinator.data, available=True))
+        coordinator._publish(coordinator.data)
+        coordinator._publish_unavailable("connection_failed")
+        coordinator._publish(replace(coordinator.data, available=True))
+
+    recoveries = [
+        record for record in caplog.records if record.message == recovery_message
+    ]
+    failures = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and record.message
+        == "Error requesting Samsung WindFree data: connection_failed"
+    ]
+    assert len(recoveries) == 2
+    assert len(failures) == 2
+    assert all(record.levelno == logging.INFO for record in recoveries)
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert host not in rendered
+    assert coordinator._credentials.client_key_pem not in rendered
+    assert coordinator.data.identity.device_id not in rendered
 
 
 async def test_scheduled_hot_failures_advance_deadline_and_trigger_supervision(

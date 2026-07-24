@@ -16,6 +16,8 @@ from .device import CommandKind
 from .entity import WindFreeEntity
 from .models import CommandRejected
 
+PARALLEL_UPDATES = 0
+
 SWITCH_DESCRIPTIONS = (
     SwitchEntityDescription(
         key="auto_clean",

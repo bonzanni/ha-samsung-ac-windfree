@@ -32,6 +32,8 @@ from .models import (
     SwingMode,
 )
 
+PARALLEL_UPDATES = 0
+
 HVAC_TO_HA = MappingProxyType(
     {
         HvacMode.AUTO: HVACMode.AUTO,

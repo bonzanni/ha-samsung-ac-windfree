@@ -49,6 +49,21 @@ _LIFECYCLE_DATA = f"{DOMAIN}_entry_lifecycle"
 _ENTRY_MINOR_VERSION = 1
 
 
+def _translated_entry_error(
+    error_type: (
+        type[ConfigEntryError] | type[ConfigEntryNotReady] | type[ConfigEntryAuthFailed]
+    ),
+    translation_key: str,
+) -> ConfigEntryError | ConfigEntryNotReady | ConfigEntryAuthFailed:
+    """Create a lifecycle error containing translation metadata only."""
+
+    return error_type(
+        translation_domain=DOMAIN,
+        translation_key=translation_key,
+        translation_placeholders=None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ShutdownOutcome:
     completed: bool
@@ -238,7 +253,7 @@ async def _async_reload_entry(
         del cancellation_args
         raise asyncio.CancelledError(*args) from None
     if reload_failed:
-        raise ConfigEntryError("reload_failed") from None
+        raise _translated_entry_error(ConfigEntryError, "reload_failed") from None
 
 
 async def async_setup_entry(
@@ -250,12 +265,18 @@ async def async_setup_entry(
     credentials = _stored_credentials(entry.data)
     if credentials is None:
         entry = None
-        raise ConfigEntryError("invalid_stored_credentials") from None
+        raise _translated_entry_error(
+            ConfigEntryError,
+            "invalid_stored_credentials",
+        ) from None
     endpoint = _stored_endpoint(entry.data)
     if endpoint is None:
         credentials = None
         entry = None
-        raise ConfigEntryError("invalid_stored_entry") from None
+        raise _translated_entry_error(
+            ConfigEntryError,
+            "invalid_stored_entry",
+        ) from None
     host, port = endpoint
     endpoint = None
     validity = _certificate_validity(credentials)
@@ -263,7 +284,10 @@ async def async_setup_entry(
         host = ""
         credentials = None
         entry = None
-        raise ConfigEntryError("invalid_stored_credentials") from None
+        raise _translated_entry_error(
+            ConfigEntryError,
+            "invalid_stored_credentials",
+        ) from None
     starts, expires = validity
     validity = None
     now = dt_util.utcnow()
@@ -279,14 +303,20 @@ async def async_setup_entry(
         entry.async_start_reauth(hass)
         entry = None
         del host, credentials, starts, expires, now, entry
-        raise ConfigEntryAuthFailed("credentials_not_yet_valid") from None
+        raise _translated_entry_error(
+            ConfigEntryAuthFailed,
+            "credentials_not_yet_valid",
+        ) from None
     if expires <= now:
         host = ""
         credentials = None
         entry.async_start_reauth(hass)
         entry = None
         del host, credentials, starts, expires, now, entry
-        raise ConfigEntryAuthFailed("credentials_expired") from None
+        raise _translated_entry_error(
+            ConfigEntryAuthFailed,
+            "credentials_expired",
+        ) from None
 
     coordinator = WindFreeCoordinator(
         hass,
@@ -358,12 +388,18 @@ async def async_setup_entry(
         del cancellation_args
         raise asyncio.CancelledError(*args) from None
     if failure == "authentication_rejected":
-        raise ConfigEntryAuthFailed("authentication_rejected") from None
+        raise _translated_entry_error(
+            ConfigEntryAuthFailed,
+            "authentication_rejected",
+        ) from None
     if failure == "unsupported_device":
-        raise ConfigEntryError("unsupported_device") from None
+        raise _translated_entry_error(ConfigEntryError, "unsupported_device") from None
     if failure == "capability_mismatch":
-        raise ConfigEntryError("capability_mismatch") from None
-    raise ConfigEntryNotReady("setup_failed") from None
+        raise _translated_entry_error(
+            ConfigEntryError,
+            "capability_mismatch",
+        ) from None
+    raise _translated_entry_error(ConfigEntryNotReady, "setup_failed") from None
 
 
 async def async_unload_entry(
@@ -403,7 +439,7 @@ async def async_unload_entry(
             del cancellation_args
             raise asyncio.CancelledError(*args) from None
         if platform_error:
-            raise ConfigEntryError("unload_failed") from None
+            raise _translated_entry_error(ConfigEntryError, "unload_failed") from None
         return False
 
     coordinator = entry.runtime_data
@@ -428,7 +464,7 @@ async def async_unload_entry(
         del cancellation_args
         raise asyncio.CancelledError(*args) from None
     if not completed:
-        raise ConfigEntryError("unload_failed") from None
+        raise _translated_entry_error(ConfigEntryError, "unload_failed") from None
     return True
 
 

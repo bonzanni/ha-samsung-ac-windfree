@@ -23,6 +23,8 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from .coordinator import WindFreeCoordinator
 from .entity import WindFreeEntity
 
+PARALLEL_UPDATES = 0
+
 _FILTER_STATUSES = ("normal", "wash", "replace")
 _ALARM_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _MAX_ENERGY_KWH = (2**53 - 1) / 1000

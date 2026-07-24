@@ -207,20 +207,28 @@ Switch between cool and warm mode from an input:
 
 ```yaml
 actions:
-  - action: climate.set_hvac_mode
-    target:
-      entity_id: climate.samsung_windfree_ac
-    data:
-      hvac_mode: cool # mode: cool
-  - action: climate.set_hvac_mode
-    target:
-      entity_id: climate.samsung_windfree_ac
-    data:
-      hvac_mode: heat # mode: heat
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: input_select.windfree_mode
+            state: Warm
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: climate.samsung_windfree_ac
+            data:
+              hvac_mode: heat
+    default:
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.samsung_windfree_ac
+        data:
+          hvac_mode: cool
 ```
 
-The executable Home Assistant climate action field is `hvac_mode`; the comments
-also label these choices as `mode: cool` and `mode: heat`.
+Create `input_select.windfree_mode` with `Cool` and `Warm` choices. The
+automation sends exactly one `climate.set_hvac_mode` action: `mode: heat` for
+Warm, otherwise `mode: cool`. The executable action field is `hvac_mode`.
 
 ## Bootstrap source and pin maintenance
 

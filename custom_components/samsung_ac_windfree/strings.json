@@ -98,6 +98,12 @@
     }
   },
   "exceptions": {
+    "authentication_rejected": {
+      "message": "The air conditioner rejected the stored local credentials"
+    },
+    "capability_mismatch": {
+      "message": "The air conditioner no longer matches the supported local capability contract"
+    },
     "command_failed": {
       "message": "The air conditioner command failed"
     },
@@ -110,11 +116,35 @@
     "command_unavailable": {
       "message": "This command is not currently available"
     },
+    "credentials_expired": {
+      "message": "The stored local credentials have expired and must be renewed"
+    },
+    "credentials_not_yet_valid": {
+      "message": "The stored local credentials are not valid yet. Check the Home Assistant clock and renew them"
+    },
+    "invalid_stored_credentials": {
+      "message": "The stored local credentials are invalid and must be renewed"
+    },
+    "invalid_stored_entry": {
+      "message": "The stored local connection settings are invalid. Reconfigure the integration"
+    },
     "invalid_command": {
       "message": "The requested value is not supported"
     },
     "invalid_temperature": {
       "message": "Set point must be a whole number from 16 to 30 °C"
+    },
+    "reload_failed": {
+      "message": "The Samsung WindFree integration could not reload"
+    },
+    "setup_failed": {
+      "message": "The air conditioner is temporarily unavailable"
+    },
+    "unload_failed": {
+      "message": "The Samsung WindFree integration could not unload cleanly"
+    },
+    "unsupported_device": {
+      "message": "The connected device is not the supported Samsung WindFree model and firmware"
     }
   },
   "issues": {
