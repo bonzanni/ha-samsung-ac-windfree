@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from homeassistant.config_entries import (
     ConfigEntryAuthFailed,
     ConfigEntryDisabler,
@@ -1250,3 +1252,302 @@ async def test_invalid_stored_validity_is_sanitized_and_offline(
     assert HOST not in traceback_locals
     assert credentials.client_key_pem not in traceback_locals
     assert credentials.client_chain_pem not in traceback_locals
+
+
+_INTEGRATION_DIR = Path("custom_components/samsung_ac_windfree")
+_METADATA_FILES = (
+    _INTEGRATION_DIR / "strings.json",
+    _INTEGRATION_DIR / "translations/en.json",
+)
+_CONFIG_ERRORS = {
+    "bootstrap_invalid_material",
+    "bootstrap_pin_mismatch",
+    "bootstrap_unavailable",
+    "cannot_connect",
+    "cannot_resolve",
+    "capability_mismatch",
+    "dns_timeout",
+    "fetch_timeout",
+    "invalid_clock",
+    "read_timeout",
+    "setup_timeout",
+    "sweep_timeout",
+    "unknown",
+    "unsupported_device",
+}
+_CONFIG_ABORTS = {
+    "already_configured",
+    "already_in_progress",
+    "reauth_successful",
+    "reconfigure_successful",
+    "unique_id_mismatch",
+    "unknown",
+}
+_ENTITY_KEYS = {
+    "binary_sensor": {
+        "current_limit_enabled",
+        "filter_attention",
+        "problem",
+    },
+    "sensor": {
+        "active_alarm",
+        "current_limit_level",
+        "energy_consumption",
+        "filter_status",
+        "filter_usage",
+    },
+    "switch": {"auto_clean", "display_light"},
+}
+_EXCEPTION_KEYS = {
+    "command_failed",
+    "command_incompatible",
+    "command_rejected",
+    "command_unavailable",
+    "invalid_command",
+    "invalid_temperature",
+}
+_ISSUE_KEYS = {
+    "authentication_rejected",
+    "bootstrap_pin_changed",
+    "bootstrap_unavailable",
+    "certificate_expiring",
+    "port_range_exhausted",
+    "resource_contract_changed",
+    "unsupported_identity_after_update",
+}
+_BRONZE_SILVER_RULES = {
+    "action-exceptions",
+    "action-setup",
+    "appropriate-polling",
+    "brands",
+    "common-modules",
+    "config-entry-unloading",
+    "config-flow",
+    "config-flow-test-coverage",
+    "dependency-transparency",
+    "docs-actions",
+    "docs-conditions",
+    "docs-configuration-parameters",
+    "docs-high-level-description",
+    "docs-installation-instructions",
+    "docs-installation-parameters",
+    "docs-removal-instructions",
+    "docs-triggers",
+    "entity-event-setup",
+    "entity-unavailable",
+    "entity-unique-id",
+    "has-entity-name",
+    "integration-owner",
+    "log-when-unavailable",
+    "parallel-updates",
+    "reauthentication-flow",
+    "runtime-data",
+    "test-before-configure",
+    "test-before-setup",
+    "test-coverage",
+    "unique-config-entry",
+}
+
+
+def _load_strings() -> dict[str, object]:
+    return json.loads((_INTEGRATION_DIR / "strings.json").read_text())
+
+
+def test_translation_mirrors_strings_and_uses_current_schema() -> None:
+    strings = _load_strings()
+    english = json.loads((_INTEGRATION_DIR / "translations/en.json").read_text())
+
+    assert english == strings
+    assert set(strings) == {"config", "entity", "exceptions", "issues"}
+
+
+@pytest.mark.parametrize(
+    ("category", "expected_key"),
+    [
+        ("config", "component.samsung_ac_windfree.config.step.user.title"),
+        (
+            "entity",
+            "component.samsung_ac_windfree.entity.sensor.filter_status.state.wash",
+        ),
+        (
+            "exceptions",
+            "component.samsung_ac_windfree.exceptions.command_failed.message",
+        ),
+        (
+            "issues",
+            "component.samsung_ac_windfree.issues.certificate_expiring."
+            "fix_flow.step.confirm.title",
+        ),
+    ],
+)
+async def test_home_assistant_loads_translation_categories(
+    hass, category, expected_key
+) -> None:
+    from homeassistant.helpers import translation
+
+    translated = await translation.async_get_translations(
+        hass,
+        "en",
+        category,
+        integrations={DOMAIN},
+    )
+
+    assert expected_key in translated
+
+
+def test_all_config_flow_translation_keys_are_defined() -> None:
+    config = _load_strings()["config"]
+
+    assert set(config["step"]) == {"reauth_confirm", "reconfigure", "user"}
+    assert set(config["progress"]) == {"validate"}
+    assert set(config["error"]) == _CONFIG_ERRORS
+    assert set(config["abort"]) == _CONFIG_ABORTS
+    for step in ("user", "reconfigure"):
+        assert set(config["step"][step]["data"]) == {"host"}
+        assert set(config["step"][step]["data_description"]) == {"host"}
+
+
+def test_all_entity_and_command_translation_keys_are_defined() -> None:
+    strings = _load_strings()
+    entities = strings["entity"]
+
+    assert set(entities) == set(_ENTITY_KEYS)
+    for platform, keys in _ENTITY_KEYS.items():
+        assert set(entities[platform]) == keys
+    assert set(entities["sensor"]["filter_status"]["state"]) == {
+        "normal",
+        "replace",
+        "wash",
+    }
+    assert set(strings["exceptions"]) == _EXCEPTION_KEYS
+    assert all(set(value) == {"message"} for value in strings["exceptions"].values())
+
+
+def test_all_repair_issue_and_fix_flow_keys_are_defined() -> None:
+    issues = _load_strings()["issues"]
+
+    assert set(issues) == _ISSUE_KEYS
+    for issue_id, issue in issues.items():
+        assert {"title", "description"} <= set(issue)
+        if issue_id in {"authentication_rejected", "certificate_expiring"}:
+            fix_flow = issue["fix_flow"]
+            assert set(fix_flow["step"]) == {"confirm"}
+            assert {"title", "description"} == set(fix_flow["step"]["confirm"])
+            assert {"issue_resolved", "unknown_issue"} <= set(fix_flow["abort"])
+        else:
+            assert "fix_flow" not in issue
+
+
+def test_user_visible_metadata_contains_no_private_protocol_material() -> None:
+    from custom_components.samsung_ac_windfree.const import (
+        REMOVED_SIGNING_DIGEST_NAME,
+        BUNDLE_SHA256,
+        BUNDLE_URL,
+        SAMSUNG_IDENTITY_HOST,
+        SAMSUNG_IDENTITY_LEAF_SHA256,
+        SAMSUNG_IDENTITY_SPKI_SHA256,
+    )
+
+    text = "\n".join(
+        path.read_text()
+        for path in (*_METADATA_FILES, Path("README.md"), Path("CHANGELOG.md"))
+    )
+    for private_value in (
+        REMOVED_SIGNING_DIGEST_NAME,
+        BUNDLE_SHA256,
+        BUNDLE_URL,
+        SAMSUNG_IDENTITY_HOST,
+        SAMSUNG_IDENTITY_LEAF_SHA256,
+        SAMSUNG_IDENTITY_SPKI_SHA256,
+    ):
+        assert private_value not in text
+    assert "BEGIN PRIVATE KEY" not in text
+    assert (
+        re.search(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        is None
+    )
+    assert "/oic/" not in text
+    assert "/vs/" not in text
+
+
+def test_readme_documents_security_scope_operation_and_examples() -> None:
+    readme = Path("README.md").read_text()
+
+    for phrase in (
+        "AR60F12C1AWNEU",
+        "TP1X_DA-AC-RAC-01001_001",
+        "fully local after setup",
+        "unofficial certificate",
+        "Home Assistant backups",
+        "SmartThings is not required",
+        "host or IP address",
+        "one-time internet bootstrap",
+        "OBSERVE",
+        "polling",
+        "Reconfigure",
+        "reauthentication",
+        "certificate expiry",
+        "competing clients",
+        "BUNDLE_SHA256",
+        "update only `BUNDLE_URL`",
+        "unpinned fallback mirrors",
+        "must not be committed to Git",
+        "climate.set_temperature",
+        "climate.set_hvac_mode",
+        "mode: heat",
+        "mode: cool",
+    ):
+        assert phrase in readme
+    for heading in (
+        "## Installation",
+        "## Removal",
+        "## Supported device and firmware",
+        "## Entities and controls",
+        "## Update behavior",
+        "## Limitations",
+        "## Troubleshooting",
+        "## Automation examples",
+        "## Bootstrap source and pin maintenance",
+    ):
+        assert heading in readme
+    assert "https://github.com/bonzanni/ha-samsung-ac-windfree/issues" in readme
+
+
+def test_release_metadata_matches_manifest_and_supported_scope() -> None:
+    manifest = json.loads((_INTEGRATION_DIR / "manifest.json").read_text())
+    changelog = Path("CHANGELOG.md").read_text()
+    license_text = Path("LICENSE").read_text()
+
+    assert manifest["version"] == "0.1.0"
+    assert manifest["documentation"] in Path("README.md").read_text()
+    assert "## [0.1.0]" in changelog
+    for phrase in (
+        "AR60F12C1AWNEU",
+        "TP1X_DA-AC-RAC-01001_001",
+        "SmartThings",
+        "Older models",
+        "multi-device",
+        "cloud control",
+    ):
+        assert phrase in changelog
+    assert license_text.startswith("MIT License")
+    assert "Copyright (c) 2026" in license_text
+    assert "Permission is hereby granted, free of charge" in license_text
+
+
+def test_quality_scale_truthfully_covers_bronze_and_silver() -> None:
+    quality = yaml.safe_load((_INTEGRATION_DIR / "quality_scale.yaml").read_text())
+    rules = quality["rules"]
+
+    assert set(rules) == _BRONZE_SILVER_RULES
+    for value in rules.values():
+        if isinstance(value, str):
+            assert value == "done"
+        else:
+            assert value["status"] == "exempt"
+            assert value["comment"].strip()

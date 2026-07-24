@@ -1,0 +1,174 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This air conditioner is already configured",
+      "already_in_progress": "Configuration for this air conditioner is already in progress",
+      "reauth_successful": "Local credentials were renewed successfully",
+      "reconfigure_successful": "The air conditioner address was updated successfully",
+      "unique_id_mismatch": "The validated air conditioner is not the device assigned to this entry",
+      "unknown": "An unexpected error occurred"
+    },
+    "error": {
+      "bootstrap_invalid_material": "The one-time certificate bootstrap returned invalid material",
+      "bootstrap_pin_mismatch": "The pinned certificate bootstrap source changed. Installation was stopped for safety",
+      "bootstrap_unavailable": "The one-time certificate bootstrap service is unavailable",
+      "cannot_connect": "Unable to establish a local authenticated connection to the air conditioner",
+      "cannot_resolve": "Unable to resolve the air conditioner address",
+      "capability_mismatch": "The device resource contract does not match the supported air conditioner",
+      "dns_timeout": "Resolving the air conditioner address timed out",
+      "fetch_timeout": "Downloading the one-time certificate bootstrap material timed out",
+      "invalid_clock": "The Home Assistant clock differs too much from the authenticated server clock",
+      "read_timeout": "Reading the local device identity timed out",
+      "setup_timeout": "Validating the air conditioner timed out",
+      "sweep_timeout": "Searching the supported local secure ports timed out",
+      "unknown": "An unexpected error occurred",
+      "unsupported_device": "This model, firmware, platform, or device type is not supported"
+    },
+    "progress": {
+      "validate": "Creating local credentials and validating the air conditioner"
+    },
+    "step": {
+      "reauth_confirm": {
+        "description": "Renew the locally stored client certificate. This performs the one-time internet bootstrap again, then validates the air conditioner locally.",
+        "title": "Renew local credentials"
+      },
+      "reconfigure": {
+        "data": {
+          "host": "Host"
+        },
+        "data_description": {
+          "host": "The new hostname or IP address of the same air conditioner."
+        },
+        "description": "Enter the new local address. Home Assistant will verify that it belongs to the already configured air conditioner.",
+        "title": "Reconfigure Samsung WindFree AC"
+      },
+      "user": {
+        "data": {
+          "host": "Host"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of the air conditioner."
+        },
+        "description": "Home Assistant will perform a one-time internet certificate bootstrap, find the supported local secure port, and verify the exact device contract.",
+        "title": "Set up Samsung WindFree AC"
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "current_limit_enabled": {
+        "name": "Current limit enabled"
+      },
+      "filter_attention": {
+        "name": "Filter attention"
+      },
+      "problem": {
+        "name": "Problem"
+      }
+    },
+    "sensor": {
+      "active_alarm": {
+        "name": "Active alarm"
+      },
+      "current_limit_level": {
+        "name": "Current limit level"
+      },
+      "energy_consumption": {
+        "name": "Energy consumption"
+      },
+      "filter_status": {
+        "name": "Filter status",
+        "state": {
+          "normal": "Normal",
+          "replace": "Replace",
+          "wash": "Wash"
+        }
+      },
+      "filter_usage": {
+        "name": "Filter usage"
+      }
+    },
+    "switch": {
+      "auto_clean": {
+        "name": "Auto clean"
+      },
+      "display_light": {
+        "name": "Display light"
+      }
+    }
+  },
+  "exceptions": {
+    "command_failed": {
+      "message": "The air conditioner command failed"
+    },
+    "command_incompatible": {
+      "message": "This command is not compatible with the current operating mode"
+    },
+    "command_rejected": {
+      "message": "The air conditioner rejected the command"
+    },
+    "command_unavailable": {
+      "message": "This command is not currently available"
+    },
+    "invalid_command": {
+      "message": "The requested value is not supported"
+    },
+    "invalid_temperature": {
+      "message": "Set point must be a whole number from 16 to 30 °C"
+    }
+  },
+  "issues": {
+    "authentication_rejected": {
+      "description": "The air conditioner rejected the stored local client certificate. Renew the credentials while Home Assistant has temporary internet access.",
+      "fix_flow": {
+        "abort": {
+          "issue_resolved": "The authentication issue is no longer active",
+          "unknown_issue": "This repair issue is no longer available"
+        },
+        "step": {
+          "confirm": {
+            "description": "Select Submit to start reauthentication for affected Samsung WindFree entries. The one-time certificate bootstrap needs internet access; normal operation remains local afterward.",
+            "title": "Renew rejected local credentials"
+          }
+        }
+      },
+      "title": "Samsung WindFree local authentication was rejected"
+    },
+    "bootstrap_pin_changed": {
+      "description": "The digest-pinned certificate bootstrap source no longer matches the reviewed bytes. Setup and credential renewal stop intentionally. Do not bypass this check; update the integration only after the maintainer has reviewed and released new pins.",
+      "title": "Samsung WindFree bootstrap source changed"
+    },
+    "bootstrap_unavailable": {
+      "description": "The one-time certificate bootstrap could not be reached. Check temporary internet access, DNS, and time synchronization, then retry setup or reauthentication.",
+      "title": "Samsung WindFree bootstrap is unavailable"
+    },
+    "certificate_expiring": {
+      "description": "The locally stored client certificate is approaching expiry. Renew it before expiry while Home Assistant has temporary internet access.",
+      "fix_flow": {
+        "abort": {
+          "issue_resolved": "The certificate expiry issue is no longer active",
+          "unknown_issue": "This repair issue is no longer available"
+        },
+        "step": {
+          "confirm": {
+            "description": "Select Submit to renew credentials for affected Samsung WindFree entries. The one-time certificate bootstrap needs internet access; normal operation remains local afterward.",
+            "title": "Renew expiring local credentials"
+          }
+        }
+      },
+      "title": "Samsung WindFree local certificate is expiring"
+    },
+    "port_range_exhausted": {
+      "description": "None of the model's supported local secure ports accepted a connection. Check that the air conditioner is online and that another client is not holding its local session.",
+      "title": "Samsung WindFree local ports are unavailable"
+    },
+    "resource_contract_changed": {
+      "description": "The air conditioner's local resource contract changed after setup. This integration fails closed rather than sending commands against an unknown contract. Check for a firmware change and install an integration update if available.",
+      "title": "Samsung WindFree resource contract changed"
+    },
+    "unsupported_identity_after_update": {
+      "description": "The air conditioner identity no longer matches the exact supported model, firmware family, platform, and device type. Check whether its firmware changed and install an integration update if available.",
+      "title": "Samsung WindFree identity is no longer supported"
+    }
+  }
+}
