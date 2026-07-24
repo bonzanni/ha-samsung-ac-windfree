@@ -1,12 +1,12 @@
-"""Linux pytest-process resource safeguards."""
+"""Best-effort pytest-process resource safeguards."""
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
-import resource
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Protocol, cast
 
 _ENVIRONMENT_VARIABLE = "PYTEST_RLIMIT_AS_GB"
 _DEFAULT_LIMIT_GIB = 2.0
@@ -22,11 +22,26 @@ class _ResourceModule(Protocol):
     def setrlimit(self, resource_id: int, limits: tuple[int, int]) -> None: ...
 
 
+def _load_resource_module() -> _ResourceModule | None:
+    """Return the optional Unix resource module."""
+
+    try:
+        module = importlib.import_module("resource")
+    except ImportError:
+        return None
+    if not all(
+        hasattr(module, attribute)
+        for attribute in ("RLIMIT_AS", "RLIM_INFINITY", "getrlimit", "setrlimit")
+    ):
+        return None
+    return cast("_ResourceModule", module)
+
+
 def apply_address_space_limit(
     environ: Mapping[str, str] = os.environ,
-    resource_module: _ResourceModule = resource,
+    resource_module: _ResourceModule | None = None,
 ) -> int | None:
-    """Apply the configured soft address-space ceiling and return its value."""
+    """Apply a supported address-space ceiling and return the effective limit."""
 
     raw_limit = environ.get(_ENVIRONMENT_VARIABLE, str(_DEFAULT_LIMIT_GIB))
     try:
@@ -42,11 +57,15 @@ def apply_address_space_limit(
     if limit_gib == 0:
         return None
 
+    resource_module = resource_module or _load_resource_module()
+    if resource_module is None:
+        return None
     requested = int(limit_gib * _BYTES_PER_GIB)
     soft, hard = resource_module.getrlimit(resource_module.RLIMIT_AS)
-    applied = (
+    ceiling = (
         requested if hard == resource_module.RLIM_INFINITY else min(requested, hard)
     )
-    if soft == resource_module.RLIM_INFINITY or soft > applied:
-        resource_module.setrlimit(resource_module.RLIMIT_AS, (applied, hard))
-    return applied
+    effective = ceiling if soft == resource_module.RLIM_INFINITY else min(soft, ceiling)
+    if soft == resource_module.RLIM_INFINITY or soft > ceiling:
+        resource_module.setrlimit(resource_module.RLIMIT_AS, (ceiling, hard))
+    return effective

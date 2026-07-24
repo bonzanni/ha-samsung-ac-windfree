@@ -66,6 +66,23 @@ def test_address_space_limit_environment_override_and_hard_ceiling() -> None:
     assert resource.calls == []
 
 
+def test_address_space_limit_reports_preexisting_lower_soft_limit() -> None:
+    from tests.resource_limits import apply_address_space_limit
+
+    resource = FakeResource((GIB, -1))
+    assert apply_address_space_limit({"PYTEST_RLIMIT_AS_GB": "2"}, resource) == GIB
+    assert resource.calls == []
+
+
+def test_address_space_limit_is_portable_when_resource_is_unavailable(
+    monkeypatch,
+) -> None:
+    from tests import resource_limits
+
+    monkeypatch.setattr(resource_limits, "_load_resource_module", lambda: None)
+    assert resource_limits.apply_address_space_limit({}) is None
+
+
 @pytest.mark.parametrize("value", ["-1", "nan", "infinity", "not-a-number"])
 def test_address_space_limit_rejects_invalid_override(value: str) -> None:
     from tests.resource_limits import apply_address_space_limit
@@ -76,7 +93,7 @@ def test_address_space_limit_rejects_invalid_override(value: str) -> None:
         )
 
 
-def test_workflow_uses_pinned_supported_test_environments() -> None:
+def test_workflow_uses_supported_test_environments_and_immutable_actions() -> None:
     workflow = _workflow()
     assert workflow["permissions"] == {"contents": "read"}
     jobs = workflow["jobs"]
@@ -109,6 +126,14 @@ def test_workflow_uses_pinned_supported_test_environments() -> None:
     assert "linux/arm64" in rendered
     assert "cryptography==48.0.1" in rendered
     assert "ruff check custom_components tests .github/scripts" in rendered
+    assert "@master" not in rendered
+    assert "@main" not in rendered
+    for job in jobs.values():
+        for step in job["steps"]:
+            if uses := step.get("uses"):
+                revision = uses.rsplit("@", 1)[-1]
+                assert len(revision) == 40
+                assert set(revision) <= set("0123456789abcdef")
 
 
 def test_workflow_enforces_dependency_and_resource_safety_contracts() -> None:
@@ -120,6 +145,7 @@ def test_workflow_enforces_dependency_and_resource_safety_contracts() -> None:
         assert job["timeout-minutes"] <= 30
         assert "pip check" in rendered
         assert "pip freeze" in rendered
+        assert "sha256sum dependency-closure-" in rendered
         assert "test_dependency_contract.py" in rendered
         assert "ulimit -v 2097152" in rendered
         assert "--timeout=120" in rendered
@@ -127,6 +153,10 @@ def test_workflow_enforces_dependency_and_resource_safety_contracts() -> None:
     assert "--memory=2g" in smoke
     assert "--network=none" in smoke
     assert "import smartthings_local, cbor2" in smoke
+    for name in ("stable", "beta-canary"):
+        upload = jobs[name]["steps"][-1]
+        assert upload["if"] == "always()"
+        assert ".sha256" in upload["with"]["path"]
 
 
 def test_workflow_canaries_are_scheduled_nonblocking_and_exact() -> None:
@@ -147,13 +177,13 @@ def test_workflow_canaries_are_scheduled_nonblocking_and_exact() -> None:
 
 def test_workflow_uses_required_validation_actions_and_no_secrets() -> None:
     rendered = WORKFLOW_PATH.read_text()
-    for action in (
-        "actions/checkout@v4",
-        "actions/setup-python@v5",
-        "home-assistant/actions/hassfest@master",
-        "hacs/action@main",
+    for action_and_version in (
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5",
+        "home-assistant/actions/hassfest@e3fb68ebda13d88a0d695082f471ba2c83d025fb",
+        "hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa",
     ):
-        assert action in rendered
+        assert action_and_version in rendered
     assert "secrets." not in rendered
     assert "pull_request_target" not in rendered
     hacs = _workflow()["jobs"]["hacs"]
