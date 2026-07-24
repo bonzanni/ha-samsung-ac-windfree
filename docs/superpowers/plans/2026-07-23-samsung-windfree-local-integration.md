@@ -1850,8 +1850,10 @@ git commit -m "feat: coordinate WindFree state and verified commands"
 **Files:**
 - Create: `custom_components/samsung_ac_windfree/config_flow.py`
 - Modify: `custom_components/samsung_ac_windfree/__init__.py`
+- Create: `custom_components/samsung_ac_windfree/repairs.py`
 - Create: `tests/test_config_flow.py`
 - Expand: `tests/test_init.py`
+- Create: `tests/test_repairs.py`
 
 **Interfaces:**
 - Consumes: bootstrap, discovery, coordinator.
@@ -1898,7 +1900,7 @@ async def test_success_uses_progress_then_creates_entry(
             context={"source": config_entries.SOURCE_USER},
             data={"host": "ac.example.test"},
         )
-        assert result["type"] is FlowResultType.PROGRESS
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
         await hass.async_block_till_done()
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"]
@@ -1914,6 +1916,9 @@ rejection, reconfigure unique-ID mismatch, failed reauth preserving old
 credentials, successful atomic reauth, offline startup proving bootstrap is not
 called, certificate-expiry Repairs, expired-certificate reauth, setup/unload,
 reload, and version-1 migration.
+Also prove that the fixable certificate-expiry Repair opens a confirmation flow
+which starts reauthentication without placing config-entry IDs or other private
+entry data in the issue.
 
 - [ ] **Step 2: Run config flow tests and observe missing flow**
 
@@ -1979,10 +1984,16 @@ Create the expiry Repairs issue at 90 days; an already expired certificate
 starts reauth without attempting an infinite reconnect. This startup check uses
 stored data only and performs no device or internet I/O.
 
+Implement the certificate-expiry Repairs fix flow in `repairs.py`. Confirmation
+starts reauthentication for the offline-detected expiring entry or entries and
+then closes successfully; a stale issue aborts as resolved. Keep the issue and
+flow free of host, config-entry ID, certificate, and key data.
+
 - [ ] **Step 5: Run flow and lifecycle tests**
 
 Run:
-`.venv/bin/pytest tests/test_config_flow.py tests/test_init.py -q`
+`.venv/bin/pytest tests/test_config_flow.py tests/test_init.py \
+  tests/test_repairs.py -q`
 
 Expected: success, every timeout/error class, cancellation cleanup, duplicate,
 exact-model failure, reconfigure identity mismatch, atomic reauth, offline
@@ -1993,7 +2004,8 @@ startup, setup, unload, reload, and migration tests pass.
 ```bash
 git add custom_components/samsung_ac_windfree/config_flow.py \
   custom_components/samsung_ac_windfree/__init__.py \
-  tests/test_config_flow.py tests/test_init.py
+  custom_components/samsung_ac_windfree/repairs.py \
+  tests/test_config_flow.py tests/test_init.py tests/test_repairs.py
 git commit -m "feat: add zero-input WindFree config flow"
 ```
 

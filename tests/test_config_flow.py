@@ -71,6 +71,20 @@ def _aggregate_device_tree(
     }
 
 
+def _config_flow_traceback_locals(error: BaseException) -> str:
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__")
+            == "custom_components.samsung_ac_windfree.config_flow"
+        ):
+            values.extend(repr(value) for value in frame.f_locals.values())
+        traceback = traceback.tb_next
+    return "\n".join(values)
+
+
 async def _finish_progress(hass, result):
     await hass.async_block_till_done()
     progress = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
@@ -635,6 +649,36 @@ async def test_validate_setup_cancellation_closes_transport(hass, credentials) -
             await task
 
     transport.async_close.assert_awaited_once_with()
+
+
+async def test_public_validate_cancellation_scrubs_host_and_internal_context(
+    hass, credentials
+) -> None:
+    from custom_components.samsung_ac_windfree.config_flow import async_validate_setup
+
+    started = asyncio.Event()
+
+    async def blocked(_hass, _host):
+        started.set()
+        await asyncio.Event().wait()
+
+    with patch(
+        "custom_components.samsung_ac_windfree.config_flow."
+        "_async_validate_setup_outcome",
+        blocked,
+    ):
+        task = hass.async_create_task(async_validate_setup(hass, HOST))
+        await started.wait()
+        task.cancel("public_validation_cancelled")
+        with pytest.raises(
+            asyncio.CancelledError, match="public_validation_cancelled"
+        ) as caught:
+            await task
+
+    traceback_locals = _config_flow_traceback_locals(caught.value)
+    assert HOST not in traceback_locals
+    assert credentials.client_key_pem not in traceback_locals
+    assert caught.value.__context__ is None
 
 
 async def test_validate_setup_close_failure_is_sanitized(

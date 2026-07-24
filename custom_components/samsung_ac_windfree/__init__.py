@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 from homeassistant.config_entries import (
@@ -13,7 +15,7 @@ from homeassistant.config_entries import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
@@ -38,6 +40,55 @@ _COMPATIBILITY: Mapping[str, object] = {
         "Heat": [],
     },
 }
+_LIFECYCLE_DATA = f"{DOMAIN}_entry_lifecycle"
+_ENTRY_MINOR_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _ShutdownOutcome:
+    completed: bool
+    cancellation_args: tuple[object, ...] | None = None
+
+
+@dataclass(slots=True)
+class _EntryLifecycle:
+    coordinator: WindFreeCoordinator
+    start_reauth: Callable[[], None]
+    unsubscribe: Callable[[], None] | None = None
+    suppressed: bool = True
+    reauth_started: bool = False
+
+    def handle_update(self) -> None:
+        """Start reauth once, only while the entry is fully active."""
+
+        if (
+            not self.suppressed
+            and self.coordinator.authentication_rejected
+            and not self.reauth_started
+        ):
+            self.reauth_started = True
+            self.start_reauth()
+
+    def attach(self) -> None:
+        """Install exactly one active coordinator listener."""
+
+        if self.unsubscribe is not None:
+            return
+        self.unsubscribe = self.coordinator.async_add_listener(self.handle_update)
+        self.suppressed = False
+
+    def suspend(self) -> None:
+        """Suppress first, then detach to close callback races."""
+
+        self.suppressed = True
+        unsubscribe = self.unsubscribe
+        self.unsubscribe = None
+        if unsubscribe is not None:
+            unsubscribe()
+
+
+def _lifecycles(hass: HomeAssistant) -> dict[str, _EntryLifecycle]:
+    return hass.data.setdefault(_LIFECYCLE_DATA, {})
 
 
 def _stored_credentials(data: Mapping[str, Any]) -> Credentials | None:
@@ -88,36 +139,51 @@ def _stored_endpoint(data: Mapping[str, Any]) -> tuple[str, int] | None:
     return host, port
 
 
-def _certificate_expiry(credentials: Credentials) -> datetime | None:
+def _certificate_validity(
+    credentials: Credentials,
+) -> tuple[datetime, datetime] | None:
     try:
+        starts = datetime.fromisoformat(credentials.not_before)
         expires = datetime.fromisoformat(credentials.not_after)
-        if expires.tzinfo is None:
+        if starts.tzinfo is None or expires.tzinfo is None:
             raise ValueError
     except TypeError, ValueError:
         return None
-    return expires
+    return starts, expires
 
 
 async def _async_shutdown_cancellation_safe(
     hass: HomeAssistant,
     coordinator: WindFreeCoordinator,
-) -> None:
+    cancellation_args: tuple[object, ...] | None = None,
+) -> _ShutdownOutcome:
     task = hass.async_create_task(
         coordinator.async_shutdown(),
         "windfree entry shutdown",
     )
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError as cancelled:
-        args = cancelled.args
-        cancelled.__traceback__ = None
-        cancelled = None
+    while not task.done():
         try:
             await asyncio.shield(task)
-        except Exception:
-            pass
-        del coordinator, task
-        raise asyncio.CancelledError(*args) from None
+        except asyncio.CancelledError as cancelled:
+            cancellation_args = cancelled.args
+            cancelled.__traceback__ = None
+            cancelled = None
+
+    completed = True
+    try:
+        task.result()
+    except asyncio.CancelledError as cancelled:
+        cancelled.__traceback__ = None
+        cancelled = None
+        completed = False
+    except Exception as error:
+        error.__traceback__ = None
+        error = None
+        completed = False
+    coordinator = None
+    task = None
+    del coordinator, task
+    return _ShutdownOutcome(completed, cancellation_args)
 
 
 async def _async_reload_entry(
@@ -126,7 +192,34 @@ async def _async_reload_entry(
 ) -> None:
     """Reload an entry after its atomically updated stored data changes."""
 
-    await hass.config_entries.async_reload(entry.entry_id)
+    lifecycle = _lifecycles(hass).get(entry.entry_id)
+    if lifecycle is not None:
+        lifecycle.suspend()
+    reload_failed = False
+    cancellation_args: tuple[object, ...] | None = None
+    try:
+        reloaded = await hass.config_entries.async_reload(entry.entry_id)
+        reload_failed = not reloaded
+    except asyncio.CancelledError as cancelled:
+        cancellation_args = cancelled.args
+        cancelled.__traceback__ = None
+        cancelled = None
+    except Exception as error:
+        error.__traceback__ = None
+        error = None
+        reload_failed = True
+    if reload_failed and lifecycle is not None:
+        lifecycle.attach()
+    lifecycle = None
+    entry = None
+    del lifecycle, entry
+    if cancellation_args is not None:
+        args = cancellation_args
+        cancellation_args = None
+        del cancellation_args
+        raise asyncio.CancelledError(*args) from None
+    if reload_failed:
+        raise ConfigEntryError("reload_failed") from None
 
 
 async def async_setup_entry(
@@ -146,19 +239,28 @@ async def async_setup_entry(
         raise ConfigEntryError("invalid_stored_entry") from None
     host, port = endpoint
     endpoint = None
-    expires = _certificate_expiry(credentials)
-    if expires is None:
+    validity = _certificate_validity(credentials)
+    if validity is None:
         host = ""
         credentials = None
         entry = None
         raise ConfigEntryError("invalid_stored_credentials") from None
+    starts, expires = validity
+    validity = None
     now = dt_util.utcnow()
+    if starts > now:
+        host = ""
+        credentials = None
+        entry.async_start_reauth(hass)
+        entry = None
+        del host, credentials, starts, expires, now, entry
+        raise ConfigEntryAuthFailed("credentials_not_yet_valid") from None
     if expires <= now:
         host = ""
         credentials = None
         entry.async_start_reauth(hass)
         entry = None
-        del host, credentials, expires, now, entry
+        del host, credentials, starts, expires, now, entry
         raise ConfigEntryAuthFailed("credentials_expired") from None
 
     if expires - now <= CERT_REPAIR_WINDOW:
@@ -179,72 +281,73 @@ async def async_setup_entry(
         credentials=credentials,
         compatibility=_COMPATIBILITY,
     )
-    reauth_started = False
-
-    @callback
-    def _async_handle_update() -> None:
-        nonlocal reauth_started
-        if coordinator.authentication_rejected and not reauth_started:
-            reauth_started = True
-            entry.async_start_reauth(hass)
-
+    failure: str | None = None
+    cancellation_args: tuple[object, ...] | None = None
     try:
         await coordinator.async_start()
         if coordinator.authentication_rejected:
-            _async_handle_update()
             raise AuthenticationRejected("authentication_rejected")
         entry.runtime_data = coordinator
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        entry.async_on_unload(coordinator.async_add_listener(_async_handle_update))
+        lifecycle = _EntryLifecycle(
+            coordinator,
+            partial(entry.async_start_reauth, hass),
+        )
+        lifecycle.attach()
+        _lifecycles(hass)[entry.entry_id] = lifecycle
         entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
-        _async_handle_update()
+        lifecycle.handle_update()
     except asyncio.CancelledError as cancelled:
-        args = cancelled.args
+        cancellation_args = cancelled.args
         cancelled.__traceback__ = None
         cancelled = None
-        await _async_shutdown_cancellation_safe(hass, coordinator)
-        host = ""
-        credentials = None
-        entry = None
-        coordinator = None
-        del host, credentials, entry, coordinator
-        raise asyncio.CancelledError(*args) from None
-    except AuthenticationRejected:
-        _async_handle_update()
-        await _async_shutdown_cancellation_safe(hass, coordinator)
-        host = ""
-        credentials = None
-        entry = None
-        coordinator = None
-        del host, credentials, entry, coordinator
-        raise ConfigEntryAuthFailed("authentication_rejected") from None
-    except UnsupportedDevice:
-        await _async_shutdown_cancellation_safe(hass, coordinator)
-        host = ""
-        credentials = None
-        entry = None
-        coordinator = None
-        del host, credentials, entry, coordinator
-        raise ConfigEntryError("unsupported_device") from None
-    except CapabilityMismatch:
-        await _async_shutdown_cancellation_safe(hass, coordinator)
-        host = ""
-        credentials = None
-        entry = None
-        coordinator = None
-        del host, credentials, entry, coordinator
-        raise ConfigEntryError("capability_mismatch") from None
+        failure = "cancelled"
+    except AuthenticationRejected as error:
+        error.__traceback__ = None
+        error = None
+        failure = "authentication_rejected"
+    except UnsupportedDevice as error:
+        error.__traceback__ = None
+        error = None
+        failure = "unsupported_device"
+    except CapabilityMismatch as error:
+        error.__traceback__ = None
+        error = None
+        failure = "capability_mismatch"
     except Exception as error:
         error.__traceback__ = None
         error = None
-        await _async_shutdown_cancellation_safe(hass, coordinator)
-        host = ""
-        credentials = None
-        entry = None
-        coordinator = None
-        del host, credentials, entry, coordinator
-        raise ConfigEntryNotReady("setup_failed") from None
-    return True
+        failure = "setup_failed"
+
+    if failure is None:
+        return True
+
+    if failure == "authentication_rejected":
+        entry.async_start_reauth(hass)
+    shutdown = await _async_shutdown_cancellation_safe(
+        hass,
+        coordinator,
+        cancellation_args,
+    )
+    cancellation_args = shutdown.cancellation_args
+    host = ""
+    credentials = None
+    entry = None
+    coordinator = None
+    shutdown = None
+    del host, credentials, entry, coordinator, shutdown
+    if cancellation_args is not None:
+        args = cancellation_args
+        cancellation_args = None
+        del cancellation_args
+        raise asyncio.CancelledError(*args) from None
+    if failure == "authentication_rejected":
+        raise ConfigEntryAuthFailed("authentication_rejected") from None
+    if failure == "unsupported_device":
+        raise ConfigEntryError("unsupported_device") from None
+    if failure == "capability_mismatch":
+        raise ConfigEntryError("capability_mismatch") from None
+    raise ConfigEntryNotReady("setup_failed") from None
 
 
 async def async_unload_entry(
@@ -253,9 +356,57 @@ async def async_unload_entry(
 ) -> bool:
     """Unload entity platforms before terminal coordinator shutdown."""
 
-    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+    lifecycle = _lifecycles(hass).get(entry.entry_id)
+    if lifecycle is not None:
+        lifecycle.suspend()
+    platform_error = False
+    cancellation_args: tuple[object, ...] | None = None
+    try:
+        unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    except asyncio.CancelledError as cancelled:
+        cancellation_args = cancelled.args
+        cancelled.__traceback__ = None
+        cancelled = None
+        unloaded = False
+    except Exception as error:
+        error.__traceback__ = None
+        error = None
+        unloaded = False
+        platform_error = True
+
+    if not unloaded:
+        if lifecycle is not None:
+            lifecycle.attach()
+        lifecycle = None
+        coordinator = None
+        entry = None
+        del lifecycle, coordinator, entry
+        if cancellation_args is not None:
+            args = cancellation_args
+            cancellation_args = None
+            del cancellation_args
+            raise asyncio.CancelledError(*args) from None
+        if platform_error:
+            raise ConfigEntryError("unload_failed") from None
         return False
-    await _async_shutdown_cancellation_safe(hass, entry.runtime_data)
+
+    coordinator = entry.runtime_data
+    _lifecycles(hass).pop(entry.entry_id, None)
+    shutdown = await _async_shutdown_cancellation_safe(hass, coordinator)
+    cancellation_args = shutdown.cancellation_args
+    completed = shutdown.completed
+    shutdown = None
+    lifecycle = None
+    coordinator = None
+    entry = None
+    del shutdown, lifecycle, coordinator, entry
+    if cancellation_args is not None:
+        args = cancellation_args
+        cancellation_args = None
+        del cancellation_args
+        raise asyncio.CancelledError(*args) from None
+    if not completed:
+        raise ConfigEntryError("unload_failed") from None
     return True
 
 
@@ -263,7 +414,13 @@ async def async_migrate_entry(
     hass: HomeAssistant,
     entry: WindFreeConfigEntry,
 ) -> bool:
-    """Accept the initial version-one schema without performing network I/O."""
+    """Upgrade the initial schema minor version without network I/O."""
 
-    del hass
-    return entry.version == 1
+    if entry.version != 1:
+        return False
+    if entry.minor_version < _ENTRY_MINOR_VERSION:
+        hass.config_entries.async_update_entry(
+            entry,
+            minor_version=_ENTRY_MINOR_VERSION,
+        )
+    return True

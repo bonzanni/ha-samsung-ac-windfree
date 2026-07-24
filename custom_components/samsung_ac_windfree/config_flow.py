@@ -272,8 +272,21 @@ async def async_validate_setup(
 ) -> ValidatedSetup:
     """Bootstrap once, authenticate locally, and enforce the exact contract."""
 
-    outcome = await _async_validate_setup_outcome(hass, host)
+    outcome: ValidatedSetup | _ValidationFailure | None = None
+    cancellation_args: tuple[object, ...] | None = None
+    try:
+        outcome = await _async_validate_setup_outcome(hass, host)
+    except asyncio.CancelledError as cancelled:
+        cancellation_args = cancelled.args
+        cancelled.__traceback__ = None
+        cancelled = None
     host = ""
+    if cancellation_args is not None:
+        args = cancellation_args
+        cancellation_args = None
+        outcome = None
+        del host, cancellation_args, outcome
+        raise asyncio.CancelledError(*args) from None
     if isinstance(outcome, _ValidationFailure):
         key = outcome.error_key
         outcome = None
