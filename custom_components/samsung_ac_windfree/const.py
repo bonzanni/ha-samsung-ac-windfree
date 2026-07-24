@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import MappingProxyType
 
 from homeassistant.const import Platform
+
+from .models import HvacMode, PresetMode
 
 DOMAIN = "samsung_ac_windfree"
 PLATFORMS = (
@@ -14,10 +17,35 @@ PLATFORMS = (
 
 SUPPORTED_MODEL = "AR60F12C1AWNEU"
 SUPPORTED_DEVICE_TYPE = "oic.d.airconditioner"
-SUPPORTED_FIRMWARE_PREFIX = "TP1X_DA-AC-RAC-01001"
+SUPPORTED_FIRMWARE = "TP1X_DA-AC-RAC-01001_0000"
+SUPPORTED_UNIT_FINGERPRINT_SHA256 = (
+    "8010a4b7a22d927fcccd68d572437efbc5c8c686fbc66241a57152be05099652"
+)
 SUPPORTED_PLATFORM = "TizenRT 4.0"
 SUPPORTED_PRODUCT_VERSION = "SYSTEM 2.0"
 SUPPORTED_PLATFORM_FIRMWARE = "ARA-KR-TP1-25-ARXX00_11260401"
+COMPATIBILITY = MappingProxyType(
+    {
+        "always_allowed": ("power", "hvac_mode", "display_light", "auto_clean"),
+        "by_mode": MappingProxyType(
+            {
+                HvacMode.AUTO.value: (),
+                HvacMode.COOL.value: ("temperature", "fan", "swing", "preset"),
+                HvacMode.DRY.value: ("preset",),
+                HvacMode.FAN.value: (),
+                HvacMode.HEAT.value: ("temperature",),
+            }
+        ),
+    }
+)
+PRESETS_BY_MODE = MappingProxyType(
+    {
+        HvacMode.COOL: tuple(
+            preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
+        ),
+        HvacMode.DRY: (PresetMode.NONE, PresetMode.DRY_COMFORT),
+    }
+)
 PROBE_PORTS = tuple(range(49152, 49161))
 
 HOST_RESOLVE_TIMEOUT = 5.0

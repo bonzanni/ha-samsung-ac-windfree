@@ -18,7 +18,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, PLATFORMS
+from .const import COMPATIBILITY, DOMAIN, PLATFORMS
 from .coordinator import WindFreeCoordinator
 from .models import (
     AuthenticationRejected,
@@ -35,16 +35,6 @@ from .repairs import (
 
 type WindFreeConfigEntry = ConfigEntry[WindFreeCoordinator]
 
-_COMPATIBILITY: Mapping[str, object] = {
-    "always_allowed": ["power", "hvac_mode", "display_light", "auto_clean"],
-    "by_mode": {
-        "Auto": [],
-        "Cool": ["temperature", "fan", "swing", "preset"],
-        "Dry": ["preset"],
-        "Fan": [],
-        "Heat": ["temperature"],
-    },
-}
 _LIFECYCLE_DATA = f"{DOMAIN}_entry_lifecycle"
 _ENTRY_MINOR_VERSION = 1
 
@@ -323,7 +313,7 @@ async def async_setup_entry(
         host=host,
         port=port,
         credentials=credentials,
-        compatibility=_COMPATIBILITY,
+        compatibility=COMPATIBILITY,
     )
     failure: str | None = None
     cancellation_args: tuple[object, ...] | None = None

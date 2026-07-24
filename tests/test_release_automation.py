@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -221,3 +222,46 @@ def test_changelog_release_evidence_is_counts_only() -> None:
     assert "Home Assistant production-console smoke: pending" in verification
     forbidden = ("192.168.", "uuid:", "BEGIN PRIVATE KEY", "/power/vs/")
     assert not any(value in verification for value in forbidden)
+
+
+def test_sanitized_live_matrix_records_acceptance_rejection_and_restoration() -> None:
+    evidence = json.loads(
+        (ROOT / "tests" / "fixtures" / "live_capability_matrix.json").read_text()
+    )
+    assert evidence["evidence_version"] == 1
+    assert evidence["scope"] == "single-unit-sha256"
+    assert evidence["transport"]["resource_count"] == 39
+    assert evidence["transport"]["directory_descriptor"] == {
+        "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+        "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+    }
+    assert set(evidence["accepted"]["hvac_modes"]) == {
+        "auto",
+        "cool",
+        "dry",
+        "fan_only",
+        "heat",
+    }
+    assert set(evidence["accepted"]["cool_fan_modes"]) == {
+        "auto",
+        "low",
+        "medium",
+        "high",
+        "turbo",
+    }
+    assert set(evidence["accepted"]["cool_swing_modes"]) == {
+        "fixed",
+        "vertical",
+        "horizontal",
+        "both",
+    }
+    assert evidence["rejected"] == [
+        {"control": "dry_comfort", "condition": "cool"},
+        {"control": "auto_clean", "condition": "power_off"},
+    ]
+    assert evidence["restoration"]["passed"] is True
+    serialized = json.dumps(evidence)
+    assert not any(
+        value in serialized
+        for value in ("192.168.", "uuid:", "BEGIN PRIVATE KEY", "/power/vs/")
+    )

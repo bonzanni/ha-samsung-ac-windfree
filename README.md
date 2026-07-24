@@ -18,7 +18,7 @@ restarts, and reloads are fully local after setup.
 
 ## Supported device and firmware
 
-This release is built and live-tested for exactly:
+This release is built and live-tested for one physical unit:
 
 - Model: `AR60F12C1AWNEU`
 - Reported firmware: `TP1X_DA-AC-RAC-01001_0000`
@@ -28,13 +28,19 @@ This release is built and live-tested for exactly:
 - Device class: Samsung residential air conditioner
 
 Samsung's local OCF payload does not report the consumer SKU. The model above
-was verified from the unit and its manual; the integration validates the exact
-locally reported product/platform fingerprint, firmware family, device type,
-resource shapes, enumerations, and command compatibility before creating an
-entry. Only the hardware and firmware above are claimed as supported. Older
-models and older firmware families are not supported.
+was verified from the unit and Samsung's official support material. Because no
+authoritative SKU-to-OCF mapping exists, the integration compares a one-way
+SHA-256 of the complete local model-number value with a release pin for this
+specific AC. It also validates the exact firmware, product/platform fields,
+exact directory descriptor and 39-resource count, resource shapes,
+enumerations, and command compatibility before creating an entry. The raw
+local model-number value is never stored or logged. Another physical unit—even
+the same retail model—is not supported by version 0.1. Older models and
+firmware are also unsupported.
 
 ## Installation
+
+Requires Home Assistant 2026.7.3.
 
 This repository is designed for installation as a custom integration:
 
@@ -135,9 +141,9 @@ reconnect or restart.
 
 ## Limitations
 
-- Only the exact model and verified firmware listed above are supported.
-- One config entry represents one air conditioner; multi-device discovery and
-  broadcast discovery are intentionally not implemented.
+- Only the release-pinned physical unit and exact firmware listed above are
+  supported.
+- Multi-device and broadcast discovery are intentionally not implemented.
 - There is no cloud control, remote access relay, SmartThings synchronization,
   energy tariff, schedule, firmware update, or owner-account management.
 - Local protocol compatibility can change after a Samsung firmware update.

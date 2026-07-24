@@ -5,9 +5,10 @@
 > superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a HACS-installable Home Assistant custom integration that
-configures the exact Samsung `AR60F12C1AWNEU` from its host alone and controls
-it locally over authenticated OCF/CoAP-DTLS without SmartThings at runtime.
+**Goal:** Build a HACS-installable Home Assistant 2026.7 custom integration
+that configures the one authorized Samsung unit labelled `AR60F12C1AWNEU` from
+its host alone and controls it locally over authenticated OCF/CoAP-DTLS without
+SmartThings at runtime.
 
 **Architecture:** A pinned, one-time bootstrap creates per-installation
 credentials, after which a narrow adapter around
@@ -17,7 +18,7 @@ state cache, tiered polling, OBSERVE updates, verified writes, capability
 drift detection, and availability. Home Assistant entities read coordinator
 memory only.
 
-**Tech Stack:** Python 3.14.2+, Home Assistant 2026.5.4+,
+**Tech Stack:** Python 3.14.2+, Home Assistant 2026.7.3,
 `smartthings-local==0.1.0`,
 `cbor2==6.1.3`, Home Assistant's pyOpenSSL/cryptography stack, pytest,
 pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
@@ -25,9 +26,9 @@ pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
 ## Global Constraints
 
 - Domain: `samsung_ac_windfree`.
-- Exact supported consumer model: `AR60F12C1AWNEU`.
+- Consumer display label: `AR60F12C1AWNEU`.
 - Required OCF device type: `oic.d.airconditioner`.
-- Required firmware prefix: `TP1X_DA-AC-RAC-01001`.
+- Required exact firmware: `TP1X_DA-AC-RAC-01001_0000`.
 - Required platform: Tizen Lite / TizenRT 4.0.
 - Probe only UDP ports `49152` through `49160`; live target was `49154`.
 - Configuration asks for host/IP only.
@@ -38,16 +39,19 @@ pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
   per-installation key, leaf, and required public intermediates.
 - Use in-memory PEM transport loading; never write transport credential temp
   files.
-- Only the exact model and firmware combination is supported; do not add older
-  Samsung protocols or fallback mappings.
+- Only the release-pinned physical unit and exact firmware are supported; do
+  not add older protocols, fallback mappings, or infer reusable SKU support.
 
 Live-validation amendment (2026-07-24): the exact unit reports
 `TP1X_DA-AC-RAC-01001_0000`, `SYSTEM 2.0`, `TizenRT 4.0`, and platform firmware
 `ARA-KR-TP1-25-ARXX00_11260401`. Its `/device/0` response is one `if`/`rt`
-descriptor followed by 39 `href`/`rep` envelopes. The consumer SKU is not
-present in the local OCF payload; `AR60F12C1AWNEU` remains the manually verified
-support label, while code gates the exact locally provable fingerprint and
-resource contract. Earlier plan examples that put the consumer SKU in
+descriptor followed by exactly 39 `href`/`rep` envelopes. The consumer SKU is
+not present in the local OCF payload; `AR60F12C1AWNEU` remains a manually
+verified display label. Setup validates a release-pinned SHA-256 of the complete
+local model-number value, exact platform/firmware fingerprint, ordered
+descriptor, and resource contract. The raw model-number value is never stored
+or committed. This deliberately rejects every other physical unit. Earlier
+plan examples that put the consumer SKU in
 `/oic/d.mnmo`, treat `/oic/p.mnpv` as the OS, use firmware suffix `_001`, or
 model `/device/0` as an already path-keyed map are superseded by this amendment.
 - One DTLS session per config entry, at most two logical requests per second,
@@ -256,7 +260,7 @@ from pathlib import Path
 from custom_components.samsung_ac_windfree.const import (
     DOMAIN,
     PROBE_PORTS,
-    SUPPORTED_FIRMWARE_PREFIX,
+    SUPPORTED_FIRMWARE,
     SUPPORTED_MODEL,
 )
 
@@ -264,7 +268,7 @@ from custom_components.samsung_ac_windfree.const import (
 def test_fixed_product_contract() -> None:
     assert DOMAIN == "samsung_ac_windfree"
     assert SUPPORTED_MODEL == "AR60F12C1AWNEU"
-    assert SUPPORTED_FIRMWARE_PREFIX == "TP1X_DA-AC-RAC-01001"
+    assert SUPPORTED_FIRMWARE == "TP1X_DA-AC-RAC-01001_0000"
     assert PROBE_PORTS == tuple(range(49152, 49161))
 
 
@@ -315,7 +319,8 @@ PLATFORMS = (
 
 SUPPORTED_MODEL = "AR60F12C1AWNEU"
 SUPPORTED_DEVICE_TYPE = "oic.d.airconditioner"
-SUPPORTED_FIRMWARE_PREFIX = "TP1X_DA-AC-RAC-01001"
+SUPPORTED_FIRMWARE = "TP1X_DA-AC-RAC-01001_0000"
+SUPPORTED_UNIT_FINGERPRINT_SHA256 = "<release-pinned live-unit SHA-256>"
 SUPPORTED_PLATFORM = "TizenRT 4.0"
 PROBE_PORTS = tuple(range(49152, 49161))
 
@@ -420,7 +425,7 @@ Create `tests/__init__.py` as an empty file. Set `hacs.json` to:
 ```json
 {
   "name": "Samsung WindFree AC",
-  "homeassistant": "2026.5.4",
+  "homeassistant": "2026.7.3",
   "render_readme": true
 }
 ```
@@ -459,14 +464,9 @@ smartthings-local==0.1.0
 cbor2==6.1.3
 ```
 
-Set `requirements_test_min.txt` to the independently verified mapping where
-PHACC `0.13.333` requires Home Assistant `2026.5.4`:
-
-```text
-pytest-homeassistant-custom-component==0.13.333
-smartthings-local==0.1.0
-cbor2==6.1.3
-```
+Do not create a minimum-version requirements leg. Task 12 established that the
+implemented Repairs contract requires HA 2026.7; `requirements_test.txt` is the
+single supported release environment.
 
 Set `.gitignore` to:
 

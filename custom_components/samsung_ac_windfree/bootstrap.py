@@ -289,7 +289,7 @@ def _is_openssl_metadata(gap: bytes) -> bool:
     if len(gap) > _MAX_OPENSSL_METADATA_SIZE:
         return False
     lines = [line for line in gap.replace(b"\r\n", b"\n").split(b"\n") if line]
-    if not lines or lines[0] != b"Bag Attributes":
+    if len(lines) < 2 or lines[0] != b"Bag Attributes":
         return False
     return all(
         line == b"Key Attributes: <No Attributes>"

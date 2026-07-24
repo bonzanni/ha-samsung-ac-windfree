@@ -65,6 +65,27 @@ def test_identity_parses_exact_supported_contract() -> None:
     assert identity.platform == "TizenRT 4.0"
 
 
+def test_identity_rejects_a_different_unit_discriminator() -> None:
+    oic_d, oic_p, device_0 = identity_parts()
+    information = device_0["/information/vs/0"]
+    information["x.com.samsung.da.modelNum"] = (
+        "TP1X_DA-AC-RAC-01001_0000|DIFFERENT-SANITIZED-UNIT"
+    )
+
+    with pytest.raises(UnsupportedDevice, match="unsupported_device"):
+        parse_identity(oic_d, oic_p, device_0)
+
+
+def test_identity_rejects_a_different_exact_firmware_release() -> None:
+    oic_d, oic_p, device_0 = identity_parts()
+    information = device_0["/information/vs/0"]
+    information["x.com.samsung.da.description"] = "TP1X_DA-AC-RAC-01001_9999"
+    information["x.com.samsung.da.modelNum"] = "TP1X_DA-AC-RAC-01001_9999|SANITIZED"
+
+    with pytest.raises(UnsupportedDevice, match="unsupported_device"):
+        parse_identity(oic_d, oic_p, device_0)
+
+
 @pytest.mark.parametrize(
     ("part", "field", "replacement"),
     [

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 import math
 from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
@@ -10,11 +12,12 @@ from enum import StrEnum
 
 from .const import (
     SUPPORTED_DEVICE_TYPE,
-    SUPPORTED_FIRMWARE_PREFIX,
+    SUPPORTED_FIRMWARE,
     SUPPORTED_MODEL,
     SUPPORTED_PLATFORM,
     SUPPORTED_PLATFORM_FIRMWARE,
     SUPPORTED_PRODUCT_VERSION,
+    SUPPORTED_UNIT_FINGERPRINT_SHA256,
 )
 from .models import (
     AlarmState,
@@ -341,11 +344,14 @@ def parse_identity(
         or product_version != SUPPORTED_PRODUCT_VERSION
         or platform != SUPPORTED_PLATFORM
         or platform_firmware != SUPPORTED_PLATFORM_FIRMWARE
-        or not _is_string(firmware)
-        or not firmware.startswith(SUPPORTED_FIRMWARE_PREFIX)
+        or firmware != SUPPORTED_FIRMWARE
         or separator != "|"
         or model_firmware != firmware
         or not model_discriminator
+        or not hmac.compare_digest(
+            hashlib.sha256(model_number.encode("utf-8")).hexdigest(),
+            SUPPORTED_UNIT_FINGERPRINT_SHA256,
+        )
     ):
         raise _unsupported()
 
@@ -589,7 +595,7 @@ def _identity_is_supported(identity: DeviceIdentity) -> bool:
     return (
         identity.model == SUPPORTED_MODEL
         and identity.device_type == SUPPORTED_DEVICE_TYPE
-        and identity.firmware.startswith(SUPPORTED_FIRMWARE_PREFIX)
+        and identity.firmware == SUPPORTED_FIRMWARE
         and identity.platform == SUPPORTED_PLATFORM
     )
 

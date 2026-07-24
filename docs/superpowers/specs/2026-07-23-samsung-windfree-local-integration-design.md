@@ -5,9 +5,9 @@ Status: Approved for implementation planning
 
 ## Objective
 
-Build a Home Assistant custom integration in this repository for the exact 2025
-Samsung WindFree Comfort room-air-conditioner model `AR60F12C1AWNEU` on its
-verified firmware family.
+Build a Home Assistant 2026.7 custom integration in this repository for the
+specific authorized 2025 Samsung WindFree Comfort room-air-conditioner carrying
+the consumer label `AR60F12C1AWNEU`.
 
 Normal operation must be fully local. Home Assistant communicates directly
 with the air conditioner over authenticated OCF/CoAP-DTLS and never uses a
@@ -20,13 +20,12 @@ integration must operate and restart without internet access.
 
 ## Scope
 
-Version 1 supports only the exact live-verified 2025 Tizen Lite/RT OCF model
-and firmware combination:
+Version 1 is intentionally scoped to one physical, live-verified 2025 Tizen
+Lite/RT OCF unit and one exact firmware release:
 
 - Consumer model: `AR60F12C1AWNEU`
 - OCF device type: `oic.d.airconditioner`
-- Firmware description prefix: `TP1X_DA-AC-RAC-01001`
-- Live firmware: `TP1X_DA-AC-RAC-01001_0000`
+- Exact firmware: `TP1X_DA-AC-RAC-01001_0000`
 - Product version: `SYSTEM 2.0`
 - Platform: `TizenRT 4.0`
 - Platform firmware: `ARA-KR-TP1-25-ARXX00_11260401`
@@ -35,11 +34,16 @@ and firmware combination:
 
 Live implementation validation established that this OCF firmware does not
 report the consumer SKU anywhere in `/oic/d`, `/oic/p`, or the 39 resource
-representations. The SKU is therefore a manually verified support label, not a
-locally provable field. The integration requires the exact locally reported
-device type, product version, OS, platform firmware, firmware-description
-family, matching model-number firmware component, and capability contract.
-Unsupported fingerprints receive a translated config-flow error.
+representations. Samsung's official support page and manual prove that the
+consumer label exists, but provide no authoritative mapping from the local OCF
+model-number value to that SKU. Version 1 therefore hashes the complete local
+model-number value and compares it with a release-pinned SHA-256 for this
+physical unit. It also requires the exact firmware, ordered directory
+descriptor, 39-resource count, device type, product version, OS, platform
+firmware, and capability contract. The raw model-number value is never stored,
+logged, shown, or committed. A different physical unit—including another unit
+sold under the same consumer SKU—is rejected until an authoritative reusable
+model proof is available.
 
 ### Non-goals
 
@@ -137,9 +141,11 @@ On the first setup:
    SHA-1 signature required by the device trust chain.
 9. Sweep UDP ports `49152` through `49160`, establish authenticated DTLS, and
    require successful reads of `/oic/d`, `/oic/p`, and `/device/0`.
-10. Verify the exact local product fingerprint, firmware family, and live
-    capability contract before creating the config entry. The consumer SKU is
-    not asserted from a field the device does not expose.
+10. Verify the release-pinned SHA-256 of the complete local model-number value,
+    exact firmware, exact ordered `/device/0` descriptor, exact 39-resource
+    count, and live capability contract before creating the config entry. The
+    consumer SKU is a display label and is not inferred from a field the device
+    does not expose.
 11. Only after local authentication and identity validation succeed, atomically
     persist the generated client private key, client certificate chain,
     discovered port, host, and sanitized identity metadata.
@@ -467,7 +473,7 @@ and raw production payloads are intentionally omitted.
 
 | Capability | Resource and request shape | Live result |
 | --- | --- | --- |
-| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact local fingerprint, device type, firmware family, and 39-resource contract confirmed; consumer SKU is not reported |
+| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact single-unit hash, exact firmware, device type, ordered descriptor, and 39-resource contract confirmed; consumer SKU is not reported |
 | Standard power path | POST `/power/0` with `{"value": false}` | `4.04`; must not be used |
 | Power | POST `/power/vs/0` with `{"x.com.samsung.da.power": "On"}` | `2.04`, OBSERVE, authoritative read-back `On`; restored `Off` |
 | HVAC mode | POST `/mode/vs/0` with `{"x.com.samsung.da.modes": ["<mode>"]}` | With power Off, Auto, Cool, Dry, Fan, and Heat each persisted and read back; restored Cool |
@@ -573,7 +579,7 @@ boundaries.
 | Binary sensor | `current_limit_enabled` | Diagnostic, disabled | Read-only current-limit state |
 | Sensor | `current_limit_level` | Diagnostic, disabled | Read-only opaque level |
 
-Device information carries the manually verified supported-model label,
+Device information carries the manually verified single-unit consumer label,
 manufacturer, locally reported firmware, and hardware platform. Firmware fields
 do not become standalone entities.
 
@@ -632,7 +638,8 @@ Validation:
 - Authenticate locally
 - Read identity and resource tree
 - Reject non-air-conditioners and any local product, firmware, platform, or
-  capability fingerprint other than the exact tested contract
+  single-unit hash, exact firmware, platform, or capability fingerprint other
+  than the exact tested contract
 - Set the OCF device identifier as the unique ID
 
 Every network operation has its own bounded timeout: 5 seconds for host
@@ -648,7 +655,7 @@ deadline for capability validation and cleanup. Cancellation closes sockets,
 stops executor work at its next bounded operation, retains no universal signing
 material, and returns no partial config entry. Failures are classified as
 bootstrap unavailable, pin mismatch, invalid clock, device unreachable, local
-authentication rejected, unsupported exact model, or capability mismatch.
+authentication rejected, unsupported physical unit, or capability mismatch.
 
 Reconfigure:
 
@@ -673,7 +680,7 @@ Diagnostics are an explicit allowlist and perform zero device I/O.
 Allowed:
 
 - Integration and dependency versions
-- Supported manually verified model and exact local-fingerprint label
+- Supported manually verified consumer label and exact single-unit hash status
 - Connection state and generation
 - Last update success and source
 - Poll and OBSERVE health
@@ -760,7 +767,7 @@ Required test groups:
 - Config-flow progress, DNS/fetch/sweep/read and overall timeout arithmetic,
   reuse of the successful swept session, and cancellation cleanup
 - Unsupported device, exact-fingerprint, and firmware-family rejection
-- Exact consumer-model rejection even when the firmware prefix matches
+- Different-unit rejection even when consumer label and firmware match
 - Duplicate detection, reconfigure, and reauthentication
 - Coordinator polling tiers, OBSERVE merges, generation isolation, reconnects,
   cancellation, and unload

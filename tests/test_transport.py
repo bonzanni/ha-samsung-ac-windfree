@@ -282,11 +282,11 @@ async def test_get_decodes_complete_block2_result_and_normalizes_path(
     )
     await transport.async_connect()
 
-    result = await transport.async_get("//device//0/")
+    result = await transport.async_get("//oic//d/")
 
-    assert result == resource_representations["/device/0"]
+    assert result == resource_representations["/oic/d"]
     assert [call for call in session.calls if call[0] == "get"] == [
-        ("get", (("device", "0"),))
+        ("get", (("oic", "d"),))
     ]
 
 
@@ -296,7 +296,10 @@ async def test_get_normalizes_live_ocf_device_directory(
     encoded_resources: dict[str, bytes],
 ) -> None:
     directory = [
-        {"rt": ["x.com.samsung.da.device"], "if": ["oic.if.baseline"]},
+        {
+            "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+            "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+        },
         {
             "href": "/power/vs/0",
             "rep": {"x.com.samsung.da.power": "On"},
@@ -305,6 +308,7 @@ async def test_get_normalizes_live_ocf_device_directory(
             "href": "/mode/vs/0",
             "rep": {"x.com.samsung.da.modes": ["Cool"]},
         },
+        *[{"href": f"/sanitized/optional/{index}", "rep": {}} for index in range(37)],
     ]
     session = FakeSession(
         {
@@ -321,42 +325,144 @@ async def test_get_normalizes_live_ocf_device_directory(
     )
     await transport.async_connect()
 
-    assert await transport.async_get("/device/0") == {
+    normalized = await transport.async_get("/device/0")
+    assert len(normalized) == 39
+    assert {path: normalized[path] for path in ("/power/vs/0", "/mode/vs/0")} == {
         "/power/vs/0": {"x.com.samsung.da.power": "On"},
         "/mode/vs/0": {"x.com.samsung.da.modes": ["Cool"]},
     }
+
+
+async def test_get_rejects_legacy_path_mapping_device_directory(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    resource_representations: dict[str, dict[str, object]],
+) -> None:
+    session = FakeSession(
+        {
+            **encoded_resources,
+            "/device/0": cbor2.dumps(resource_representations["/device/0"]),
+        }
+    )
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError, match="transport_get_invalid_response"):
+        await transport.async_get("/device/0")
+
+
+@pytest.mark.parametrize("resource_count", [38, 40])
+async def test_get_rejects_nonexact_live_resource_count(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    resource_count: int,
+) -> None:
+    directory = [
+        {
+            "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+            "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+        },
+        *[
+            {"href": f"/sanitized/resource/{index}", "rep": {}}
+            for index in range(resource_count)
+        ],
+    ]
+    session = FakeSession(
+        {
+            **encoded_resources,
+            "/device/0": cbor2.dumps(directory),
+        }
+    )
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError, match="transport_get_invalid_response"):
+        await transport.async_get("/device/0")
+
+
+def _live_directory_with(
+    *envelopes: dict[object, object],
+) -> list[dict[object, object]]:
+    return [
+        {
+            "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+            "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+        },
+        *envelopes,
+        *[
+            {"href": f"/sanitized/optional/{index}", "rep": {}}
+            for index in range(39 - len(envelopes))
+        ],
+    ]
 
 
 @pytest.mark.parametrize(
     "directory",
     [
         [
-            {"rt": ["device"], "if": ["baseline"]},
+            {"rt": ["x.com.samsung.da.device"], "if": ["oic.if.baseline"]},
             {"href": "/power/vs/0", "rep": {}},
-            {"href": "/power/vs/0", "rep": {}},
+            *[
+                {"href": f"/sanitized/optional/{index}", "rep": {}}
+                for index in range(38)
+            ],
         ],
         [
-            {"rt": ["device"], "if": ["baseline"]},
+            {
+                "rt": ["oic.wk.col", "x.com.samsung.devcol"],
+                "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+            },
+            {"href": "/power/vs/0", "rep": {}},
+            *[
+                {"href": f"/sanitized/optional/{index}", "rep": {}}
+                for index in range(38)
+            ],
+        ],
+        _live_directory_with(
+            {"href": "/power/vs/0", "rep": {}},
+            {"href": "/power/vs/0", "rep": {}},
+        ),
+        _live_directory_with(
             {"href": "/power/vs/0"},
-        ],
-        [
-            {"rt": ["device"], "if": ["baseline"]},
+        ),
+        _live_directory_with(
             {"href": "power/vs/0", "rep": {}},
-        ],
-        [
-            {"rt": ["device"], "if": ["baseline"]},
+        ),
+        _live_directory_with(
             {"href": "/power/vs/0", "rep": {1: "invalid"}},
-        ],
-        [
-            {"rt": ["device"], "if": ["baseline"]},
+        ),
+        _live_directory_with(
             {"href": "/power/vs/0", "rep": {}, "unexpected": True},
-        ],
+        ),
         [
             {"href": "/power/vs/0", "rep": {}},
-            {"rt": ["device"], "if": ["baseline"]},
+            {
+                "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+                "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+            },
+            *[
+                {"href": f"/sanitized/optional/{index}", "rep": {}}
+                for index in range(38)
+            ],
         ],
     ],
     ids=[
+        "wrong-descriptor-values",
+        "wrong-descriptor-order",
         "duplicate-href",
         "missing-representation",
         "relative-href",

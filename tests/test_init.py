@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -24,11 +25,12 @@ from custom_components.samsung_ac_windfree.const import (
     DOMAIN,
     PROBE_PORTS,
     SUPPORTED_DEVICE_TYPE,
-    SUPPORTED_FIRMWARE_PREFIX,
+    SUPPORTED_FIRMWARE,
     SUPPORTED_MODEL,
     SUPPORTED_PLATFORM,
     SUPPORTED_PLATFORM_FIRMWARE,
     SUPPORTED_PRODUCT_VERSION,
+    SUPPORTED_UNIT_FINGERPRINT_SHA256,
 )
 from custom_components.samsung_ac_windfree.models import Credentials, UnsupportedDevice
 
@@ -42,7 +44,7 @@ def _entry_data(credentials: Credentials, *, not_after: str | None = None):
         "port": 49154,
         "device_id": DEVICE_ID,
         "model": SUPPORTED_MODEL,
-        "firmware": f"{SUPPORTED_FIRMWARE_PREFIX}.1",
+        "firmware": SUPPORTED_FIRMWARE,
         "platform": SUPPORTED_PLATFORM,
         "client_key_pem": credentials.client_key_pem,
         "client_chain_pem": credentials.client_chain_pem,
@@ -86,10 +88,21 @@ def test_fixed_product_contract() -> None:
     assert DOMAIN == "samsung_ac_windfree"
     assert SUPPORTED_MODEL == "AR60F12C1AWNEU"
     assert SUPPORTED_DEVICE_TYPE == "oic.d.airconditioner"
-    assert SUPPORTED_FIRMWARE_PREFIX == "TP1X_DA-AC-RAC-01001"
+    assert SUPPORTED_FIRMWARE == "TP1X_DA-AC-RAC-01001_0000"
     assert SUPPORTED_PLATFORM == "TizenRT 4.0"
     assert SUPPORTED_PRODUCT_VERSION == "SYSTEM 2.0"
     assert SUPPORTED_PLATFORM_FIRMWARE == "ARA-KR-TP1-25-ARXX00_11260401"
+    assert re.fullmatch(r"[0-9a-f]{64}", SUPPORTED_UNIT_FINGERPRINT_SHA256)
+    sanitized_identity = json.loads(
+        (Path(__file__).parent / "fixtures" / "device_identity.json").read_text()
+    )
+    sanitized_model_number = sanitized_identity["device_0"]["/information/vs/0"][
+        "x.com.samsung.da.modelNum"
+    ]
+    assert (
+        SUPPORTED_UNIT_FINGERPRINT_SHA256
+        != hashlib.sha256(sanitized_model_number.encode()).hexdigest()
+    )
     assert PROBE_PORTS == tuple(range(49152, 49161))
 
 
@@ -1628,8 +1641,10 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
         "climate.set_hvac_mode",
         "mode: heat",
         "mode: cool",
+        "Requires Home Assistant 2026.7.3",
     ):
         assert phrase in readme
+    assert "ordered 39-resource directory" not in readme
     for heading in (
         "## Installation",
         "## Removal",

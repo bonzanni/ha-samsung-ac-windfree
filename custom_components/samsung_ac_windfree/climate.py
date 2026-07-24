@@ -20,7 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, PRESETS_BY_MODE
 from .coordinator import WindFreeCoordinator
 from .device import CommandKind
 from .entity import WindFreeEntity
@@ -80,14 +80,6 @@ _HA_TO_PRESET = MappingProxyType({value: key for key, value in PRESET_TO_HA.item
 _HVAC_MODES = (HVACMode.OFF, *HVAC_TO_HA.values())
 _FAN_MODES = tuple(FAN_TO_HA.values())
 _SWING_MODES = tuple(SWING_TO_HA.values())
-_PRESETS_BY_MODE = MappingProxyType(
-    {
-        HvacMode.COOL: tuple(
-            preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
-        ),
-        HvacMode.DRY: (PresetMode.NONE, PresetMode.DRY_COMFORT),
-    }
-)
 _MODE_GATED = frozenset(
     {
         CommandKind.TEMPERATURE,
@@ -183,7 +175,7 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
     def preset_modes(self) -> list[str]:
         return [
             PRESET_TO_HA[preset]
-            for preset in _PRESETS_BY_MODE.get(
+            for preset in PRESETS_BY_MODE.get(
                 self.coordinator.data.climate.mode,
                 (),
             )
@@ -201,7 +193,7 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
             mode, frozenset()
         ):
             _raise_translated("command_incompatible")
-        if kind is CommandKind.PRESET and value not in _PRESETS_BY_MODE.get(mode, ()):
+        if kind is CommandKind.PRESET and value not in PRESETS_BY_MODE.get(mode, ()):
             _raise_translated("command_incompatible")
 
     async def _async_delegate(

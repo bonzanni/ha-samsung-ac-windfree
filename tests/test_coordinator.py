@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
+from custom_components.samsung_ac_windfree.const import COMPATIBILITY
 from custom_components.samsung_ac_windfree.coordinator import (
     COLD_PATHS,
     HOT_PATHS,
@@ -113,6 +114,17 @@ def compatibility() -> dict[str, object]:
     return json.loads(
         (Path(__file__).parent / "fixtures" / "mode_compatibility.json").read_text()
     )
+
+
+def test_live_compatibility_fixture_matches_production_contract(
+    compatibility: dict[str, object],
+) -> None:
+    assert compatibility == {
+        "always_allowed": list(COMPATIBILITY["always_allowed"]),
+        "by_mode": {
+            mode: list(controls) for mode, controls in COMPATIBILITY["by_mode"].items()
+        },
+    }
 
 
 @pytest.fixture
@@ -545,23 +557,85 @@ async def test_related_paths_are_refreshed_before_command_publication(
 async def test_off_to_mode_is_one_serial_mode_then_power_operation(
     coordinator: WindFreeCoordinator,
 ) -> None:
+    post_times: list[tuple[str, float]] = []
+    original_post = coordinator.transport_factory._post
+
+    async def post(path: str, payload: object) -> None:
+        post_times.append((path, coordinator._monotonic()))
+        await original_post(path, payload)
+
+    coordinator.transport.async_post.side_effect = post
     coordinator.transport.async_post.reset_mock()
     await coordinator.async_set_hvac_mode(HvacMode.HEAT)
     assert [
         call.args[0] for call in coordinator.transport.async_post.await_args_list
     ] == [HVAC_MODE_PATH, POWER_PATH]
+    assert post_times[1][1] - post_times[0][1] == 2.0
     assert coordinator.data.climate.power
     assert coordinator.data.climate.mode is HvacMode.HEAT
 
 
-async def test_successful_mode_change_observes_live_firmware_settle_time(
+async def test_cancelled_off_to_mode_retains_cooldown_before_next_power(
     coordinator: WindFreeCoordinator,
 ) -> None:
-    before = coordinator._monotonic()
+    sleep_started = asyncio.Event()
+    sleep_release = asyncio.Event()
 
-    await coordinator.async_set_hvac_mode(HvacMode.HEAT)
+    async def blocking_sleep(_delay: float) -> None:
+        sleep_started.set()
+        await sleep_release.wait()
 
-    assert coordinator._monotonic() - before == 2.0
+    coordinator._sleep = blocking_sleep
+    coordinator.transport.async_post.reset_mock()
+    operation = asyncio.create_task(coordinator.async_set_hvac_mode(HvacMode.HEAT))
+    await asyncio.wait_for(sleep_started.wait(), timeout=1)
+    assert [
+        call.args[0] for call in coordinator.transport.async_post.await_args_list
+    ] == [HVAC_MODE_PATH]
+
+    operation.cancel("caller_cancelled")
+    with pytest.raises(asyncio.CancelledError, match="caller_cancelled"):
+        await operation
+
+    followup_sleeps: list[float] = []
+    clock = coordinator._monotonic.__self__
+
+    async def followup_sleep(delay: float) -> None:
+        followup_sleeps.append(delay)
+        clock.now += delay
+
+    coordinator._sleep = followup_sleep
+    coordinator.transport.async_post.reset_mock()
+    await coordinator.async_turn_on()
+
+    assert followup_sleeps == [2.0]
+    assert [
+        call.args[0] for call in coordinator.transport.async_post.await_args_list
+    ] == [POWER_PATH]
+
+
+async def test_mode_settle_rechecks_deadline_after_an_early_wakeup(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    now = 100.0
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    async def early_once_sleep(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay - 0.25 if len(sleeps) == 1 else delay
+
+    coordinator._monotonic = monotonic
+    coordinator._sleep = early_once_sleep
+    coordinator._mode_settle_until = 102.0
+
+    await coordinator._async_wait_for_mode_settle(CommandKind.POWER)
+
+    assert sleeps == [2.0, 0.25]
+    assert now == 102.0
 
 
 async def test_power_failure_retains_verified_remembered_mode(

@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
 
+from custom_components.samsung_ac_windfree import device as device_module
 from custom_components.samsung_ac_windfree.bootstrap import (
     BootstrapInputs,
     BootstrapPins,
@@ -308,10 +309,34 @@ def resource_representations() -> dict[str, dict[str, object]]:
 def encoded_resources(
     resource_representations: dict[str, dict[str, object]],
 ) -> dict[str, bytes]:
-    return {
+    encoded = {
         path: cbor2.dumps(representation)
         for path, representation in resource_representations.items()
+        if path != "/device/0"
     }
+    directory_resources = {
+        **resource_representations["/device/0"],
+        **{
+            path: representation
+            for path, representation in resource_representations.items()
+            if path not in {"/oic/d", "/oic/p", "/device/0"}
+        },
+    }
+    for index in range(39 - len(directory_resources)):
+        directory_resources[f"/sanitized/optional/{index}"] = {}
+    encoded["/device/0"] = cbor2.dumps(
+        [
+            {
+                "rt": ["x.com.samsung.devcol", "oic.wk.col"],
+                "if": ["oic.if.baseline", "oic.if.ll", "oic.if.b"],
+            },
+            *[
+                {"href": path, "rep": representation}
+                for path, representation in directory_resources.items()
+            ],
+        ]
+    )
+    return encoded
 
 
 class FakeSession:
@@ -388,3 +413,20 @@ class FakeSession:
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations):
     yield
+
+
+@pytest.fixture(autouse=True)
+def use_sanitized_unit_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep synthetic identity fixtures distinct from the supported live unit."""
+
+    identity = json.loads(
+        (Path(__file__).parent / "fixtures" / "device_identity.json").read_text()
+    )
+    model_number = identity["device_0"]["/information/vs/0"][
+        "x.com.samsung.da.modelNum"
+    ]
+    monkeypatch.setattr(
+        device_module,
+        "SUPPORTED_UNIT_FINGERPRINT_SHA256",
+        hashlib.sha256(model_number.encode("utf-8")).hexdigest(),
+    )

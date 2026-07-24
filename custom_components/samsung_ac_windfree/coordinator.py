@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
+from .const import PRESETS_BY_MODE
 from .device import (
     ALARMS_PATH,
     AUTO_CLEAN_PATH,
@@ -46,7 +47,6 @@ from .models import (
     CommandRejected,
     Credentials,
     HvacMode,
-    PresetMode,
     UnsupportedDevice,
     UpdateSource,
     WindFreeData,
@@ -77,13 +77,6 @@ WARM_PATHS = (
 COLD_PATHS = (FILTER_PATH, CURRENT_LIMIT_PATH)
 RECONCILE_PATHS = ("/oic/d", "/oic/p", "/device/0")
 MODE_SETTLE_SECONDS = 2.0
-
-_PRESETS_BY_MODE = {
-    HvacMode.COOL: frozenset(
-        preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
-    ),
-    HvacMode.DRY: frozenset({PresetMode.NONE, PresetMode.DRY_COMFORT}),
-}
 
 _OBSERVE_PATHS = HOT_PATHS + WARM_PATHS
 _ALL_WRITE_PATHS = frozenset(
@@ -384,6 +377,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._scheduler_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._observe_events: dict[str, asyncio.Event] = {}
+        self._mode_settle_until = 0.0
         self._command_active = False
         self._command_tasks: set[asyncio.Task[_CommandOutcome]] = set()
         self._command_completions: set[asyncio.Future[None]] = set()
@@ -1674,7 +1668,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             )
         ):
             raise CommandRejected("command_incompatible")
-        if kind is CommandKind.PRESET and value not in _PRESETS_BY_MODE.get(
+        if kind is CommandKind.PRESET and value not in PRESETS_BY_MODE.get(
             self.data.climate.mode, frozenset()
         ):
             raise CommandRejected("command_incompatible")
@@ -1700,6 +1694,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         except TimeoutError:
             return False
 
+    async def _async_wait_for_mode_settle(self, kind: CommandKind) -> None:
+        if kind not in {CommandKind.POWER, CommandKind.HVAC_MODE}:
+            return
+        while (remaining := self._mode_settle_until - self._monotonic()) > 0:
+            await self._sleep(remaining)
+
     async def _async_command_locked(
         self,
         kind: CommandKind,
@@ -1722,7 +1722,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         event = asyncio.Event()
         self._observe_events[command.path] = event
         try:
-            await self.transport.async_post(command.path, command.payload)
+            await self._async_wait_for_mode_settle(kind)
+            try:
+                await self.transport.async_post(command.path, command.payload)
+            finally:
+                if kind is CommandKind.HVAC_MODE:
+                    self._mode_settle_until = self._monotonic() + MODE_SETTLE_SECONDS
             self._require_command_epoch(epoch)
             observed = await self._wait_for_observe(command, event)
             self._require_command_epoch(epoch)
@@ -1883,7 +1888,6 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                             await self._async_command_locked(kind, value, epoch)
                         elif operation == "set_mode":
                             await self._async_set_hvac_mode_locked(value, epoch)
-                            await self._sleep(MODE_SETTLE_SECONDS)
                         elif operation == "turn_on":
                             await self._async_turn_on_locked(epoch)
                         else:

@@ -1,0 +1,86 @@
+{
+  "evidence_version": 1,
+  "scope": "single-unit-sha256",
+  "consumer_model_label": "AR60F12C1AWNEU",
+  "firmware": "TP1X_DA-AC-RAC-01001_0000",
+  "transport": {
+    "local_authenticated": true,
+    "cloud_runtime_required": false,
+    "resource_count": 39,
+    "directory_descriptor": {
+      "rt": [
+        "x.com.samsung.devcol",
+        "oic.wk.col"
+      ],
+      "if": [
+        "oic.if.baseline",
+        "oic.if.ll",
+        "oic.if.b"
+      ]
+    }
+  },
+  "accepted": {
+    "hvac_modes": [
+      "auto",
+      "cool",
+      "dry",
+      "fan_only",
+      "heat"
+    ],
+    "target_temperature_modes": [
+      "cool",
+      "heat"
+    ],
+    "cool_fan_modes": [
+      "auto",
+      "low",
+      "medium",
+      "high",
+      "turbo"
+    ],
+    "cool_swing_modes": [
+      "fixed",
+      "vertical",
+      "horizontal",
+      "both"
+    ],
+    "cool_presets": [
+      "none",
+      "quiet",
+      "smart",
+      "boost",
+      "windfree",
+      "windfree_sleep",
+      "sleep"
+    ],
+    "dry_presets": [
+      "none",
+      "dry_comfort"
+    ],
+    "settings": [
+      "display_light",
+      "auto_clean_while_on"
+    ]
+  },
+  "rejected": [
+    {
+      "control": "dry_comfort",
+      "condition": "cool"
+    },
+    {
+      "control": "auto_clean",
+      "condition": "power_off"
+    }
+  ],
+  "restoration": {
+    "passed": true,
+    "power": "off",
+    "mode": "cool",
+    "target_temperature_c": 26,
+    "fan": "auto",
+    "swing": "fixed",
+    "preset": "none",
+    "display_light": true,
+    "auto_clean": true
+  }
+}

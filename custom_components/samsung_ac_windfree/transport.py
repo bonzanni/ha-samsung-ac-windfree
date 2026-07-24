@@ -30,7 +30,9 @@ _POST_CHANGED = 68
 _CLOSE_TIMEOUT = COAP_READ_TIMEOUT
 _REQUEST_INTERVAL = 1.0 / RATE_LIMIT_RPS
 _MAX_CBOR_PAYLOAD = 64 * 1024
-_MAX_DEVICE_RESOURCES = 128
+_EXACT_DEVICE_RESOURCES = 39
+_DEVICE_DIRECTORY_RT = ("x.com.samsung.devcol", "oic.wk.col")
+_DEVICE_DIRECTORY_IF = ("oic.if.baseline", "oic.if.ll", "oic.if.b")
 _FATAL_ALERTS_BY_CODE = {
     42: "bad_certificate",
     43: "unsupported_certificate",
@@ -190,31 +192,21 @@ def _is_representation(value: object) -> bool:
     return isinstance(value, Mapping) and all(isinstance(key, str) for key in value)
 
 
-def _is_string_sequence(value: object) -> bool:
-    return (
-        isinstance(value, Sequence)
-        and not isinstance(value, (str, bytes, bytearray))
-        and all(isinstance(item, str) for item in value)
-    )
-
-
 def _normalize_device_directory(
     value: object,
 ) -> Representation | _CallFailure:
-    if _is_representation(value):
-        return value
     if (
         not isinstance(value, Sequence)
         or isinstance(value, (str, bytes, bytearray))
-        or not 2 <= len(value) <= _MAX_DEVICE_RESOURCES + 1
+        or len(value) != _EXACT_DEVICE_RESOURCES + 1
     ):
         return _CallFailure(None)
     descriptor = value[0]
     if (
         not isinstance(descriptor, Mapping)
         or set(descriptor) != {"rt", "if"}
-        or not _is_string_sequence(descriptor.get("rt"))
-        or not _is_string_sequence(descriptor.get("if"))
+        or descriptor.get("rt") != list(_DEVICE_DIRECTORY_RT)
+        or descriptor.get("if") != list(_DEVICE_DIRECTORY_IF)
     ):
         return _CallFailure(None)
 

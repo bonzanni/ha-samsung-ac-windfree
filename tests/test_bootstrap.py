@@ -395,6 +395,87 @@ def test_bundle_rejects_unrecognized_interstitial_metadata(
         validate_bundle(data, pins=pins)
 
 
+def test_bundle_rejects_empty_bag_attributes_section(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+) -> None:
+    data = bootstrap_inputs.bundle_bytes.replace(
+        b"-----BEGIN PRIVATE KEY-----",
+        b"Bag Attributes\n-----BEGIN PRIVATE KEY-----",
+        1,
+    )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        validate_bundle(data, pins=pins)
+
+
+@pytest.mark.parametrize(("metadata_size", "accepted"), [(1024, True), (1025, False)])
+def test_bundle_enforces_exact_metadata_size_boundary(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    metadata_size: int,
+    accepted: bool,
+) -> None:
+    prefix = b"Bag Attributes\n    friendlyName: "
+    metadata = prefix + (b"A" * (metadata_size - len(prefix) - 1)) + b"\n"
+    assert len(metadata) == metadata_size
+    data = bootstrap_inputs.bundle_bytes.replace(
+        b"-----BEGIN PRIVATE KEY-----",
+        metadata + b"-----BEGIN PRIVATE KEY-----",
+        1,
+    )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    if accepted:
+        validate_bundle(data, pins=pins)
+    else:
+        with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+            validate_bundle(data, pins=pins)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        b"Bag Attributes\n    friendlyName: trailing\n",
+        (
+            b"Bag Attributes\n"
+            b"    friendlyName: first\n"
+            b"Bag Attributes\n"
+            b"    friendlyName: second\n"
+        ),
+    ],
+    ids=["after-final-certificate", "multiple-sections"],
+)
+def test_bundle_rejects_misplaced_or_multiple_metadata_sections(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    metadata: bytes,
+    request: pytest.FixtureRequest,
+) -> None:
+    if request.node.callspec.id == "after-final-certificate":
+        data = bootstrap_inputs.bundle_bytes + metadata
+    else:
+        data = bootstrap_inputs.bundle_bytes.replace(
+            b"-----BEGIN PRIVATE KEY-----",
+            metadata + b"-----BEGIN PRIVATE KEY-----",
+            1,
+        )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        validate_bundle(data, pins=pins)
+
+
 def test_bundle_rejects_wrong_rsa_modulus(
     bootstrap_inputs: BootstrapInputs,
     bootstrap_pins: BootstrapPins,

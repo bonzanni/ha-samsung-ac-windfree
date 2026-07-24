@@ -116,12 +116,12 @@ def test_switches_project_snapshot_without_io(switches, coordinator) -> None:
 
     assert switches["auto_clean"].is_on is True
     assert switches["display_light"].is_on is False
-    assert not switches["auto_clean"].available
+    assert switches["auto_clean"].available
     assert switches["display_light"].available
     coordinator.async_command.assert_not_awaited()
 
 
-def test_auto_clean_is_available_only_while_operating(
+def test_auto_clean_remains_available_while_operating(
     switches,
     coordinator,
 ) -> None:
@@ -224,7 +224,7 @@ async def test_real_switch_state_tracks_coordinator_and_availability(
     live_switches, hass
 ) -> None:
     entities, coordinator = live_switches
-    assert hass.states.get(entities["auto_clean"]).state == "unavailable"  # type: ignore[union-attr]
+    assert hass.states.get(entities["auto_clean"]).state == "on"  # type: ignore[union-attr]
     assert hass.states.get(entities["display_light"]).state == "off"  # type: ignore[union-attr]
 
     coordinator.data = replace(
