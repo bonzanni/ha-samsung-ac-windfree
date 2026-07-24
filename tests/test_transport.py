@@ -1977,6 +1977,26 @@ async def test_discovery_reuses_first_successful_authenticated_session(
     assert discovered._session is factory.sessions[-1]
 
 
+async def test_discovery_assigns_requested_supervisor_generation(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = RecordingSessionFactory(lambda _port: FakeSession(encoded_resources))
+    _patch_discovery_to_use_fake_sessions(monkeypatch, factory)
+
+    _port, discovered = await async_discover_transport(
+        hass,
+        "192.0.2.10",
+        credentials,
+        ports=(49152,),
+        generation=7,
+    )
+
+    assert discovered._generation == 7
+
+
 async def test_discovery_allows_valid_port_subset_in_caller_order(
     hass: HomeAssistant,
     credentials: Credentials,

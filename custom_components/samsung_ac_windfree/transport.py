@@ -752,6 +752,7 @@ async def _async_discover_result(
     host: str,
     credentials: Credentials,
     ports: tuple[int, ...],
+    generation: int,
 ) -> tuple[int, WindFreeTransport] | _PublicFailure:
     port = 0
     candidate: WindFreeTransport | None = None
@@ -767,6 +768,7 @@ async def _async_discover_result(
                 host=host,
                 port=port,
                 credentials=credentials,
+                generation=generation,
                 handshake_timeout=PROBE_HANDSHAKE_TIMEOUT,
             )
             try:
@@ -794,7 +796,7 @@ async def _async_discover_result(
             error_kind="connection",
         )
     finally:
-        del host, credentials, ports, port, candidate
+        del host, credentials, ports, generation, port, candidate
 
 
 async def async_discover_transport(
@@ -803,12 +805,19 @@ async def async_discover_transport(
     credentials: Credentials,
     *,
     ports: tuple[int, ...] = PROBE_PORTS,
+    generation: int = 0,
 ) -> tuple[int, WindFreeTransport]:
     """Sequentially probe a safe-range subset and return the first session."""
     try:
-        result = await _async_discover_result(hass, host, credentials, ports)
+        result = await _async_discover_result(
+            hass,
+            host,
+            credentials,
+            ports,
+            generation,
+        )
     finally:
-        del host, credentials, ports
+        del host, credentials, ports, generation
     if isinstance(result, _PublicFailure):
         _raise_public_failure(result)
     return result
