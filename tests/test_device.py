@@ -19,6 +19,7 @@ from custom_components.samsung_ac_windfree.device import (
     SWING_PATH,
     TEMPERATURE_PATH,
     CommandKind,
+    DeviceCommand,
     build_command,
     parse_device_state,
     parse_humidity,
@@ -716,7 +717,7 @@ def test_temperature_builder_rejects_malformed_fresh_aggregate(
         )
 
 
-def test_temperature_builder_rejects_immutable_nested_item() -> None:
+def test_temperature_builder_accepts_immutable_nested_mapping() -> None:
     aggregate = state_resources()[TEMPERATURE_PATH]
     aggregate["x.com.samsung.da.items"] = [
         MappingProxyType(
@@ -727,12 +728,13 @@ def test_temperature_builder_rejects_immutable_nested_item() -> None:
         )
     ]
 
-    with pytest.raises(ValueError, match="fresh aggregate"):
-        build_command(
-            CommandKind.TEMPERATURE,
-            27,
-            fresh_aggregate=aggregate,
-        )
+    command = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    )
+
+    assert verify_command(command, {TEMPERATURE_PATH: command.payload})
 
 
 @pytest.mark.parametrize(
@@ -863,6 +865,10 @@ def test_command_payload_internal_storage_cannot_be_reassigned() -> None:
         command.payload._data = {}  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         modes._items = ()  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        object.__setattr__(command.payload, "_data", {})
+    with pytest.raises(AttributeError):
+        object.__setattr__(modes, "_items", ())
 
 
 def test_nested_set_is_frozen_and_preserved_by_equality() -> None:
@@ -884,6 +890,97 @@ def test_immutable_command_payload_is_safe_to_deepcopy() -> None:
     command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
 
     assert copy.deepcopy(command.payload) is command.payload
+
+
+def test_deepcopied_immutable_payloads_verify_for_all_commands() -> None:
+    commands = [
+        build_command(CommandKind.POWER, True),
+        build_command(CommandKind.HVAC_MODE, HvacMode.AUTO),
+        build_command(
+            CommandKind.TEMPERATURE,
+            27,
+            fresh_aggregate=state_resources()[TEMPERATURE_PATH],
+        ),
+        build_command(CommandKind.FAN, FanMode.HIGH),
+        build_command(CommandKind.SWING, SwingMode.BOTH),
+        build_command(CommandKind.PRESET, PresetMode.QUIET),
+        build_command(CommandKind.DISPLAY_LIGHT, False),
+        build_command(CommandKind.AUTO_CLEAN, True),
+    ]
+
+    for command in commands:
+        copied = copy.deepcopy(command.payload)
+        assert copied is command.payload
+        assert verify_command(command, {command.path: copied})
+
+
+def test_frozen_protocol_sequences_parse_and_validate_like_cbor_lists() -> None:
+    resources = state_resources()
+    resources[HVAC_MODE_PATH]["x.com.samsung.da.modes"] = ["Auto"]
+    resources[TEMPERATURE_PATH]["x.com.samsung.da.items"][0][  # type: ignore[index]
+        "x.com.samsung.da.desired"
+    ] = "27.0"
+    resources["/alarms/vs/0"]["x.com.samsung.da.items"] = [
+        {
+            "x.com.samsung.da.alarmType": "Device",
+            "x.com.samsung.da.code": "ErrorCode_E101",
+            "x.com.samsung.da.state": "Active",
+        }
+    ]
+    frozen = DeviceCommand(
+        CommandKind.POWER,
+        "/synthetic",
+        resources,
+        None,
+        (),
+    ).payload
+
+    parsed = parse_device_state(frozen, WindFreeData.empty())  # type: ignore[arg-type]
+
+    assert parsed.climate.mode is HvacMode.AUTO
+    assert parsed.climate.target_temperature == 27.0
+    assert parsed.alarms.problem is True
+    validate_contract(
+        parse_identity(*identity_parts()),
+        frozen,  # type: ignore[arg-type]
+        compatibility(),
+    )
+
+
+def test_generators_are_not_accepted_as_protocol_sequences() -> None:
+    resources = state_resources()
+    resources[HVAC_MODE_PATH]["x.com.samsung.da.modes"] = (item for item in ["Auto"])
+    previous = replace(
+        WindFreeData.empty(),
+        climate=replace(WindFreeData.empty().climate, mode=HvacMode.HEAT),
+    )
+
+    parsed = parse_device_state(resources, previous)
+
+    assert parsed.climate.mode is HvacMode.HEAT
+    with pytest.raises(CapabilityMismatch, match="capability_mismatch"):
+        validate_contract(
+            parse_identity(*identity_parts()),
+            resources,
+            compatibility(),
+        )
+
+
+def test_temperature_rmw_accepts_deepcopied_immutable_aggregate() -> None:
+    first = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=state_resources()[TEMPERATURE_PATH],
+    )
+
+    second = build_command(
+        CommandKind.TEMPERATURE,
+        28,
+        fresh_aggregate=copy.deepcopy(first.payload),
+    )
+
+    assert verify_command(second, {TEMPERATURE_PATH: second.payload})
+    assert verify_command(first, {TEMPERATURE_PATH: first.payload})
 
 
 def test_temperature_verification_accepts_numeric_equivalence() -> None:

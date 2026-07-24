@@ -7,7 +7,6 @@ import math
 from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from types import MappingProxyType
 
 from .const import (
     SUPPORTED_DEVICE_TYPE,
@@ -84,52 +83,57 @@ _ALL_HVAC_MODES = frozenset(HvacMode)
 _AUTO_ALIASES = frozenset({"Auto", "AI Auto"})
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class _ImmutableMapping(Mapping[object, object]):
-    """Structural immutable mapping with no mutable built-in base."""
+class _FrozenMapping(
+    tuple[tuple[object, object], ...],
+    Mapping[object, object],
+):
+    """Inherently immutable tuple of pairs with mapping semantics."""
 
-    _data: Mapping[object, object]
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        items: Iterator[tuple[object, object]],
+    ) -> _FrozenMapping:
+        return tuple.__new__(cls, tuple(items))
 
     def __getitem__(self, key: object) -> object:
-        return self._data[key]
+        for candidate, value in tuple.__iter__(self):
+            if candidate == key:
+                return value
+        raise KeyError(key)
 
     def __iter__(self) -> Iterator[object]:
-        return iter(self._data)
-
-    def __len__(self) -> int:
-        return len(self._data)
+        return (key for key, _value in tuple.__iter__(self))
 
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, Mapping)
             and all(
                 key in other and value == other[key]
-                for key, value in self._data.items()
+                for key, value in tuple.__iter__(self)
             )
             and len(self) == len(other)
         )
 
     def __repr__(self) -> str:
-        return repr(dict(self._data))
+        return repr(dict(tuple.__iter__(self)))
 
-    def __copy__(self) -> _ImmutableMapping:
+    def __copy__(self) -> _FrozenMapping:
         return self
 
-    def __deepcopy__(self, _memo: object) -> _ImmutableMapping:
+    def __deepcopy__(self, _memo: object) -> _FrozenMapping:
         return self
 
 
-@dataclass(frozen=True, slots=True, eq=False)
-class _ImmutableSequence(Sequence[object]):
-    """Structural immutable sequence with no mutable built-in base."""
+class _FrozenSequence(tuple[object, ...]):
+    """Inherently immutable tuple with list-compatible equality."""
 
-    _items: tuple[object, ...]
+    __slots__ = ()
+    __hash__ = tuple.__hash__
 
-    def __getitem__(self, index: int | slice) -> object:
-        return self._items[index]
-
-    def __len__(self) -> int:
-        return len(self._items)
+    def __new__(cls, items: Iterator[object]) -> _FrozenSequence:
+        return tuple.__new__(cls, tuple(items))
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -140,28 +144,43 @@ class _ImmutableSequence(Sequence[object]):
         )
 
     def __repr__(self) -> str:
-        return repr(list(self._items))
+        return repr(list(self))
 
     def append(self, _item: object) -> None:
         raise TypeError("command payload is immutable")
 
-    def __copy__(self) -> _ImmutableSequence:
+    def __copy__(self) -> _FrozenSequence:
         return self
 
-    def __deepcopy__(self, _memo: object) -> _ImmutableSequence:
+    def __deepcopy__(self, _memo: object) -> _FrozenSequence:
         return self
+
+
+def _is_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    )
 
 
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
-        return _ImmutableMapping(
-            MappingProxyType({key: _freeze(item) for key, item in value.items()})
-        )
-    if isinstance(value, (list, tuple)):
-        return _ImmutableSequence(tuple(_freeze(item) for item in value))
+        return _FrozenMapping((key, _freeze(item)) for key, item in value.items())
+    if _is_sequence(value):
+        return _FrozenSequence(_freeze(item) for item in value)
     if isinstance(value, Set):
         return frozenset(_freeze(item) for item in value)
     return value
+
+
+def _mutable_copy(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_copy(item) for key, item in value.items()}
+    if _is_sequence(value):
+        return [_mutable_copy(item) for item in value]
+    if isinstance(value, Set):
+        return frozenset(_mutable_copy(item) for item in value)
+    return copy.deepcopy(value)
 
 
 class CommandKind(StrEnum):
@@ -263,7 +282,7 @@ def _parse_enum[EnumT: (HvacMode, FanMode, SwingMode, PresetMode)](
 
 
 def _mode_value(raw: object, fallback: HvacMode) -> HvacMode:
-    if not isinstance(raw, list) or len(raw) != 1:
+    if not _is_sequence(raw) or len(raw) != 1:
         return fallback
     value = raw[0]
     if value in _AUTO_ALIASES:
@@ -301,7 +320,7 @@ def parse_identity(
         not _is_string(device_id)
         or not device_id
         or model != SUPPORTED_MODEL
-        or not isinstance(device_types, list)
+        or not _is_sequence(device_types)
         or not all(isinstance(item, str) for item in device_types)
         or SUPPORTED_DEVICE_TYPE not in device_types
         or platform != SUPPORTED_PLATFORM
@@ -330,7 +349,7 @@ def parse_humidity(raw: object) -> int | None:
 
 def _temperature_item(resource: Mapping[str, object]) -> Mapping[str, object] | None:
     items = resource.get(TEMPERATURE_ITEMS_FIELD)
-    if not isinstance(items, list):
+    if not _is_sequence(items):
         return None
     for item in items:
         mapped = _mapping(item)
@@ -396,7 +415,7 @@ def _parse_energy(resource: Mapping[str, object]) -> EnergyState:
 
 def _parse_alarms(resource: Mapping[str, object]) -> AlarmState | None:
     items = resource.get(TEMPERATURE_ITEMS_FIELD)
-    if not isinstance(items, list):
+    if not _is_sequence(items):
         return None
 
     device_code: str | None = None
@@ -519,7 +538,7 @@ def parse_device_state(
 
 
 def _string_set(value: object) -> frozenset[str] | None:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+    if not _is_sequence(value) or not all(isinstance(item, str) for item in value):
         return None
     return frozenset(value)
 
@@ -531,7 +550,7 @@ def _numeric_equals(value: object, expected: float) -> bool:
 
 def _valid_hvac_mode_value(value: object) -> bool:
     return (
-        isinstance(value, list)
+        _is_sequence(value)
         and len(value) == 1
         and value[0] in _AUTO_ALIASES | frozenset(mode.value for mode in HvacMode)
     )
@@ -684,11 +703,11 @@ def _temperature_payload(
     if fresh_aggregate is None or _mapping(fresh_aggregate) is None:
         raise ValueError("fresh aggregate is required")
     try:
-        payload = copy.deepcopy(fresh_aggregate)
+        payload = _mutable_copy(fresh_aggregate)
     except Exception:
         raise ValueError("fresh aggregate is invalid") from None
     items = payload.get(TEMPERATURE_ITEMS_FIELD)
-    if not isinstance(items, list):
+    if not _is_sequence(items):
         raise ValueError("fresh aggregate is invalid")
     for item in items:
         mapped = _mapping(item)
@@ -822,7 +841,7 @@ def verify_command(
         return _on_off(resource.get(POWER_FIELD)) is command.requested
     if command.kind is CommandKind.HVAC_MODE:
         raw = resource.get(MODES_FIELD)
-        if not isinstance(raw, list) or len(raw) != 1:
+        if not _is_sequence(raw) or len(raw) != 1:
             return False
         actual = raw[0]
         if command.requested is HvacMode.AUTO:

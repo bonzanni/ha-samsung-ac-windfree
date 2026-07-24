@@ -110,7 +110,7 @@ def _plain_cbor_value(value: object) -> object:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_plain_cbor_value(item) for item in value]
     if isinstance(value, Set):
-        return {_plain_cbor_value(item) for item in value}
+        return frozenset(_plain_cbor_value(item) for item in value)
     return value
 
 
@@ -415,6 +415,12 @@ async def test_post_thaws_and_canonically_encodes_every_immutable_command(
     if kind is CommandKind.TEMPERATURE:
         aggregate = cbor2.loads(encoded_resources[TEMPERATURE_PATH])
         aggregate["unknownSet"] = {"preserved", "values"}
+        aggregate["unknownNestedSet"] = frozenset(
+            {
+                frozenset({"nested", "values"}),
+                frozenset({"singleton"}),
+            }
+        )
     command = build_command(kind, value, fresh_aggregate=aggregate)
 
     await transport.async_post(command.path, command.payload)

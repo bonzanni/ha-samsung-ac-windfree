@@ -212,7 +212,7 @@ def _to_cbor_native(value: object) -> object:
     ):
         return [_to_cbor_native(item) for item in value]
     if isinstance(value, Set):
-        return {_to_cbor_native(item) for item in value}
+        return frozenset(_to_cbor_native(item) for item in value)
     if isinstance(value, bytearray):
         return bytes(value)
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
