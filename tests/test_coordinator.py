@@ -636,6 +636,51 @@ async def test_command_cancellation_propagates_without_speculative_publication(
     assert coordinator.data is before
 
 
+async def test_repeated_caller_cancellation_retains_command_until_shutdown_join(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    post_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    publications: list[bool] = []
+
+    async def post(_path: str, _payload: object) -> None:
+        post_started.set()
+        while not cleanup_release.is_set():
+            try:
+                await cleanup_release.wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+
+    coordinator.transport.async_post.side_effect = post
+    coordinator.async_add_listener(
+        lambda: publications.append(coordinator.data.available)
+    )
+    caller = asyncio.create_task(coordinator.async_command(CommandKind.POWER, True))
+    await post_started.wait()
+    caller.cancel("first-command-cancel")
+    await cleanup_started.wait()
+    caller.cancel("second-command-cancel")
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller
+        assert caught.value.args == ("second-command-cancel",)
+
+        assert coordinator._command_tasks
+        shutdown = asyncio.create_task(coordinator.async_shutdown())
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        cleanup_release.set()
+        await shutdown
+
+        assert not coordinator._command_tasks
+        assert not coordinator._command_completions
+        assert not coordinator.data.available
+        assert True not in publications
+    finally:
+        cleanup_release.set()
+
+
 @pytest.mark.parametrize("operation_name", ["simple", "off_to_mode", "turn_on"])
 @pytest.mark.parametrize("blocked_stage", ["post", "observe"])
 async def test_shutdown_joins_every_inflight_command_without_resurrection(
@@ -691,6 +736,99 @@ async def test_shutdown_joins_every_inflight_command_without_resurrection(
         assert not coordinator._command_tasks
         assert not coordinator._command_completions
         await asyncio.sleep(0)
+        assert not coordinator.data.available
+    finally:
+        never.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "operation_name",
+    ["poll", "reconcile", "hot", "scheduled"],
+)
+async def test_shutdown_joins_every_inflight_public_io_without_resurrection(
+    coordinator: WindFreeCoordinator,
+    operation_name: str,
+) -> None:
+    blocked = asyncio.Event()
+    never = asyncio.Event()
+    publications: list[bool] = []
+    original_get = coordinator.transport_factory._get
+
+    async def get(path: str) -> dict[str, object]:
+        blocked.set()
+        await never.wait()
+        return await original_get(path)
+
+    coordinator.transport.async_get.side_effect = get
+    coordinator.async_add_listener(
+        lambda: publications.append(coordinator.data.available)
+    )
+    if operation_name == "poll":
+        operation = asyncio.create_task(coordinator.async_poll_path(HOT_PATHS[0]))
+    elif operation_name == "reconcile":
+        operation = asyncio.create_task(coordinator.async_reconcile())
+    elif operation_name == "hot":
+        operation = asyncio.create_task(coordinator.async_run_hot_cycle())
+    else:
+        coordinator.force_due(HOT_PATHS[0], due=0)
+        operation = asyncio.create_task(coordinator.async_run_scheduled_once())
+
+    try:
+        await blocked.wait()
+        coordinator.handle_observe(
+            coordinator.generation,
+            POWER_PATH,
+            {"x.com.samsung.da.power": "On"},
+        )
+        assert coordinator.data.climate.power
+        await coordinator.async_shutdown()
+        resources = dict(coordinator._resources)
+
+        assert operation.done()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert not coordinator.data.available
+        assert publications[-1] is False
+        assert not coordinator._operation_tasks
+        assert not coordinator._operation_completions
+        never.set()
+        await asyncio.sleep(0)
+        assert coordinator._resources == resources
+        assert not coordinator.data.available
+        assert not coordinator.last_update_success
+    finally:
+        never.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_shutdown_joins_blocked_public_reconnect_attempt(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    reconnect_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def reconnect(**_kwargs: object) -> AsyncMock:
+        reconnect_started.set()
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    coordinator.transport_factory.reconnect.side_effect = reconnect
+    operation = asyncio.create_task(coordinator.async_run_reconnect_attempt())
+    try:
+        await reconnect_started.wait()
+        await coordinator.async_shutdown()
+
+        assert operation.done()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert len(coordinator.transport_factory.transports) == 1
+        assert not coordinator._operation_tasks
+        assert not coordinator._operation_completions
         assert not coordinator.data.available
     finally:
         never.set()
@@ -1035,7 +1173,11 @@ async def test_disconnect_retains_failed_close_and_still_schedules_reconnect(
         await coordinator.async_run_scheduled_once()
 
     assert not coordinator.data.available
-    assert active.async_close.await_count == 1
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if active.async_close.await_count == 2:
+            break
+    assert active.async_close.await_count == 2
     assert coordinator._reconnect_task is not None
     await coordinator.async_shutdown()
     assert active.async_close.await_count == 2
@@ -1158,6 +1300,68 @@ async def test_activation_never_exposes_candidate_before_old_close_succeeds(
     candidate.async_close.assert_awaited_once()
     await coordinator.async_shutdown()
     assert old.async_close.await_count == 2
+
+
+async def test_runtime_close_backpressure_bounds_failed_generation_ownership(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    unclosed = coordinator.transport
+    unclosed.async_close.side_effect = TransportError("transport_close_failed")
+    await coordinator._async_disconnect_locked("connection_failed")
+
+    try:
+        for _ in range(2000):
+            await coordinator.async_run_reconnect_attempt()
+
+        assert len(factory.transports) == 1
+        assert coordinator._pending_transport is None
+        assert coordinator._retired_transports == [unclosed]
+        assert len(coordinator._operation_tasks) <= 1
+        assert len(coordinator._operation_completions) <= 1
+
+        unclosed.async_close.side_effect = None
+        await coordinator.async_run_reconnect_attempt()
+        assert coordinator.generation == 2
+        assert coordinator.data.available
+        assert not coordinator._retired_transports
+    finally:
+        unclosed.async_close.side_effect = None
+
+
+async def test_concurrent_reconnects_cannot_bypass_close_backpressure(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    old = coordinator.transport
+    old.async_close.side_effect = TransportError("transport_close_failed")
+    reconnect_started = asyncio.Event()
+    reconnect_release = asyncio.Event()
+
+    async def reconnect(*, generation: int, **_: object) -> AsyncMock:
+        reconnect_started.set()
+        await reconnect_release.wait()
+        return factory.create(generation=generation)
+
+    factory.reconnect.side_effect = reconnect
+    attempts = [
+        asyncio.create_task(coordinator.async_run_reconnect_attempt())
+        for _ in range(100)
+    ]
+    try:
+        await reconnect_started.wait()
+        await asyncio.sleep(0)
+        assert factory.reconnect.await_count == 1
+        reconnect_release.set()
+        await asyncio.gather(*attempts)
+        assert len(factory.transports) == 2
+        assert coordinator._retired_transports == [old]
+        assert coordinator._pending_transport is None
+        assert not coordinator._operation_tasks
+    finally:
+        reconnect_release.set()
+        await asyncio.gather(*attempts, return_exceptions=True)
+        old.async_close.side_effect = None
 
 
 async def test_priority_handoff_survives_cancel_after_grant(
@@ -1557,6 +1761,53 @@ async def test_nonfatal_reconcile_error_keeps_current_generation_connected(
     assert coordinator.transport is active
     assert coordinator.generation == 1
     assert not coordinator.authentication_rejected
+
+
+@pytest.mark.parametrize("operation_name", ["poll", "reconcile", "hot"])
+async def test_queued_public_io_attributes_fatal_to_activated_generation(
+    coordinator: WindFreeCoordinator,
+    operation_name: str,
+) -> None:
+    factory = coordinator.transport_factory
+    alert = TransportError(
+        "transport_get_failed",
+        fatal_alert="access_denied",
+    )
+
+    async def invoke() -> None:
+        if operation_name == "poll":
+            await coordinator.async_poll_path(HOT_PATHS[0])
+        elif operation_name == "reconcile":
+            await coordinator.async_reconcile()
+        else:
+            await coordinator.async_run_hot_cycle()
+
+    await coordinator._admission.acquire(0)
+    reconnect = asyncio.create_task(coordinator.async_run_reconnect_attempt())
+    await asyncio.sleep(0)
+    candidate = factory.current
+
+    async def observe(*_args: object) -> None:
+        candidate.async_get.side_effect = alert
+
+    candidate.async_observe.side_effect = observe
+    operation = asyncio.create_task(invoke())
+    await asyncio.sleep(0)
+    coordinator._admission.release()
+    await asyncio.gather(reconnect, operation)
+
+    assert coordinator._fatal_signals[("dtls", "access_denied")] == 2
+    for _ in range(30):
+        await asyncio.sleep(0)
+        if coordinator.generation == 3 and coordinator.data.available:
+            break
+    assert coordinator.generation == 3
+    assert not coordinator.authentication_rejected
+
+    coordinator.transport.async_get.side_effect = alert
+    await invoke()
+    assert coordinator.authentication_rejected
+    assert not coordinator.data.available
 
 
 @pytest.mark.parametrize("stage", ["post", "wait", "get", "related"])

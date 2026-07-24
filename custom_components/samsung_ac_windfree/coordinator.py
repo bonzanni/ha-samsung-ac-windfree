@@ -333,6 +333,10 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._command_active = False
         self._command_tasks: set[asyncio.Task[_CommandOutcome]] = set()
         self._command_completions: set[asyncio.Future[None]] = set()
+        self._operation_tasks: set[asyncio.Task[None]] = set()
+        self._operation_completions: set[asyncio.Future[None]] = set()
+        self._close_lock = asyncio.Lock()
+        self._generation_lock = asyncio.Lock()
         self._deadlines: dict[str, float] = {}
         self._deadline_revisions: dict[str, int] = {}
         self._last_updates: dict[str, float] = {}
@@ -415,6 +419,74 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         """Retain typed data while applying coordinator failure semantics."""
         self.data = replace(self.data, available=False)
         self.async_set_update_error(UpdateFailed(reason))
+
+    def _finish_command_task(
+        self,
+        task: asyncio.Task[_CommandOutcome],
+        completion: asyncio.Future[None],
+    ) -> None:
+        self._command_tasks.discard(task)
+        self._command_completions.discard(completion)
+        if not completion.done():
+            completion.set_result(None)
+
+    def _track_command_task(
+        self,
+        task: asyncio.Task[_CommandOutcome],
+    ) -> asyncio.Future[None]:
+        completion = asyncio.get_running_loop().create_future()
+        self._command_tasks.add(task)
+        self._command_completions.add(completion)
+        task.add_done_callback(lambda done: self._finish_command_task(done, completion))
+        return completion
+
+    def _finish_operation_task(
+        self,
+        task: asyncio.Task[None],
+        completion: asyncio.Future[None],
+    ) -> None:
+        self._operation_tasks.discard(task)
+        self._operation_completions.discard(completion)
+        if not completion.done():
+            completion.set_result(None)
+
+    def _track_operation_task(
+        self,
+        task: asyncio.Task[None],
+    ) -> asyncio.Future[None]:
+        completion = asyncio.get_running_loop().create_future()
+        self._operation_tasks.add(task)
+        self._operation_completions.add(completion)
+        task.add_done_callback(
+            lambda done: self._finish_operation_task(done, completion)
+        )
+        return completion
+
+    async def _async_public_operation(
+        self,
+        operation: Callable[[], Awaitable[None]],
+        name: str,
+    ) -> None:
+        if self._shutting_down or self._terminated:
+            return
+        task = self.hass.async_create_task(operation(), name)
+        completion = self._track_operation_task(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            current = asyncio.current_task()
+            cancellation_count = current.cancelling() if current is not None else 0
+            task.cancel(*cancelled.args)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if current is not None and current.cancelling() > cancellation_count:
+                    raise
+                raise cancelled from None
+            raise
+        finally:
+            if task.done():
+                self._finish_operation_task(task, completion)
 
     def _tier_for(self, path: str) -> PollTier:
         if path in HOT_PATHS:
@@ -526,6 +598,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         source: UpdateSource,
         *,
         publish: bool = True,
+        generation: int | None = None,
     ) -> None:
         self._resources[path] = representation
         now = self._monotonic()
@@ -540,7 +613,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                     parsed,
                     available=True,
                     update_source=source,
-                    generation=self._generation,
+                    generation=self._generation if generation is None else generation,
                     failure_count=self._hot_failures,
                 )
             )
@@ -638,6 +711,13 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self,
         transport: WindFreeTransport,
     ) -> bool:
+        async with self._close_lock:
+            return await self._async_try_close_owned_unlocked(transport)
+
+    async def _async_try_close_owned_unlocked(
+        self,
+        transport: WindFreeTransport,
+    ) -> bool:
         try:
             await transport.async_close()
         except asyncio.CancelledError:
@@ -650,26 +730,57 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._forget_owned(transport)
         return True
 
+    async def _async_drain_inactive_transports(self) -> bool:
+        async with self._close_lock:
+            inactive: list[WindFreeTransport] = []
+            for transport in (
+                self._pending_transport,
+                *self._retired_transports,
+            ):
+                if transport is not None and all(
+                    item is not transport for item in inactive
+                ):
+                    inactive.append(transport)
+            drained = True
+            for transport in inactive:
+                if not await self._async_try_close_owned_unlocked(transport):
+                    drained = False
+            return drained
+
     async def async_start(self) -> None:
         """Start one session generation and seed authoritative state."""
         if self._terminated:
             raise RuntimeError("coordinator_shutdown") from None
+        await self._async_public_operation(
+            self._async_start_impl,
+            "windfree startup",
+        )
+
+    async def _async_start_impl(self) -> None:
+        if self._terminated or self._shutting_down:
+            return
         if self._started:
             return
-        self._lifecycle_epoch += 1
-        epoch = self._lifecycle_epoch
-        generation = self._generation + 1
-        transport = self._transport_factory.create(
-            hass=self.hass,
-            host=self._host,
-            port=self._port,
-            credentials=self._credentials,
-            generation=generation,
-        )
-        self._set_pending(transport)
-        current = asyncio.current_task()
-        self._startup_task = current
+        transport: WindFreeTransport | None = None
+        generation_acquired = False
         try:
+            await self._generation_lock.acquire()
+            generation_acquired = True
+            if self._started or self._shutting_down or self._terminated:
+                return
+            if not await self._async_drain_inactive_transports():
+                raise TransportError("transport_close_failed")
+            self._lifecycle_epoch += 1
+            epoch = self._lifecycle_epoch
+            generation = self._generation + 1
+            transport = self._transport_factory.create(
+                hass=self.hass,
+                host=self._host,
+                port=self._port,
+                credentials=self._credentials,
+                generation=generation,
+            )
+            self._set_pending(transport)
             await transport.async_connect()
             async with self._admission.hold(0):
                 seeded = await self._async_seed_generation(
@@ -680,14 +791,19 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                     raise asyncio.CancelledError
                 await self._activate_seeded(seeded)
         except BaseException:
-            await self._async_try_close_owned(transport)
+            if transport is not None:
+                await self._async_try_close_owned(transport)
             if not self._shutting_down:
                 self._publish_unavailable("startup_failed")
             raise
         finally:
-            if self._startup_task is current:
-                self._startup_task = None
-        if epoch == self._lifecycle_epoch and not self._shutting_down:
+            if generation_acquired:
+                self._generation_lock.release()
+        if (
+            transport is not None
+            and epoch == self._lifecycle_epoch
+            and not self._shutting_down
+        ):
             self._initialize_deadlines()
             if self._start_scheduler:
                 self._scheduler_task = self.hass.async_create_task(
@@ -731,6 +847,8 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         startup = self._startup_task
         command_tasks = tuple(self._command_tasks)
         command_completions = tuple(self._command_completions)
+        operation_tasks = tuple(self._operation_tasks)
+        operation_completions = tuple(self._operation_completions)
         tasks = tuple(
             task
             for task in (
@@ -738,6 +856,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                 self._scheduler_task,
                 self._reconnect_task,
                 *command_tasks,
+                *operation_tasks,
             )
             if task is not None and task is not asyncio.current_task()
         )
@@ -745,8 +864,9 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if command_completions:
-            await asyncio.gather(*command_completions)
+        completions = (*command_completions, *operation_completions)
+        if completions:
+            await asyncio.gather(*completions)
         self._startup_task = None
         self._scheduler_task = None
         self._reconnect_task = None
@@ -761,14 +881,15 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             if transport is not None and all(item is not transport for item in owned):
                 owned.append(transport)
         first_error: BaseException | None = None
-        for transport in owned:
-            try:
-                await transport.async_close()
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-            else:
-                self._forget_owned(transport)
+        async with self._close_lock:
+            for transport in owned:
+                try:
+                    await transport.async_close()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    self._forget_owned(transport)
         if first_error is not None:
             raise first_error
 
@@ -792,6 +913,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
 
     async def async_run_scheduled_once(self) -> None:
         """Admit one logical poll, preserving Block2 atomicity in transport."""
+        await self._async_public_operation(
+            self._async_run_scheduled_once_impl,
+            "windfree scheduled operation",
+        )
+
+    async def _async_run_scheduled_once_impl(self) -> None:
         if self._shutting_down or self._transport is None:
             return
         candidate = self.next_due()
@@ -806,35 +933,79 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         async with self._admission.hold(priority):
             if self._shutting_down or self._transport is None:
                 return
+            transport = self._transport
+            epoch = self._lifecycle_epoch
+            generation = self._generation
             candidate = self.next_due()
             now = self._monotonic()
             if candidate.deadline <= now:
                 await self._async_poll_with_failure_locked(
                     candidate.path,
                     candidate.tier,
-                    self._generation,
+                    generation,
+                    transport,
+                    epoch,
                     reconnect=True,
                 )
             elif self._reconcile_deadline <= now:
-                await self._async_reconcile_with_failure_locked(self._generation)
+                await self._async_reconcile_with_failure_locked(
+                    generation,
+                    transport,
+                    epoch,
+                )
 
-    async def _async_poll_path_locked(self, path: str) -> None:
-        representation = await self._async_read(path)
+    def _require_operation_epoch(
+        self,
+        epoch: int,
+        transport: WindFreeTransport,
+    ) -> None:
+        if (
+            self._shutting_down
+            or self._terminated
+            or epoch != self._lifecycle_epoch
+            or self._transport is not transport
+        ):
+            raise asyncio.CancelledError
+
+    async def _async_poll_path_locked(
+        self,
+        path: str,
+        transport: WindFreeTransport,
+        epoch: int,
+        generation: int,
+    ) -> None:
+        representation = await self._async_read_from(transport, path)
+        self._require_operation_epoch(epoch, transport)
         if path in HOT_PATHS:
             self._hot_failures = 0
             self.note_generation_stable()
-        self._merge_resource(path, representation, UpdateSource.POLL)
+        self._merge_resource(
+            path,
+            representation,
+            UpdateSource.POLL,
+            generation=generation,
+        )
 
     async def async_poll_path(self, path: str) -> None:
+        await self._async_public_operation(
+            lambda: self._async_poll_path_impl(path),
+            "windfree poll",
+        )
+
+    async def _async_poll_path_impl(self, path: str) -> None:
         tier = self._tier_for(path)
-        generation = self._generation
         async with self._admission.hold(int(tier)):
             if self._shutting_down or self._transport is None:
                 return
+            transport = self._transport
+            epoch = self._lifecycle_epoch
+            generation = self._generation
             await self._async_poll_with_failure_locked(
                 path,
                 tier,
                 generation,
+                transport,
+                epoch,
                 reconnect=True,
             )
 
@@ -843,19 +1014,29 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         path: str,
         tier: PollTier,
         generation: int,
+        transport: WindFreeTransport,
+        epoch: int,
         *,
         reconnect: bool,
     ) -> None:
         try:
-            await self._async_poll_path_locked(path)
+            await self._async_poll_path_locked(
+                path,
+                transport,
+                epoch,
+                generation,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            self._require_operation_epoch(epoch, transport)
             await self._async_request_failure_locked(
                 path,
                 tier,
                 generation,
                 error,
+                transport,
+                epoch,
                 reconnect=reconnect,
             )
             return
@@ -866,9 +1047,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         tier: PollTier,
         generation: int,
         error: BaseException,
+        transport: WindFreeTransport,
+        epoch: int,
         *,
         reconnect: bool,
     ) -> None:
+        self._require_operation_epoch(epoch, transport)
         now = self._monotonic()
         retry = min(_PERIODS[int(tier)], float(2 ** min(self._hot_failures, 5)))
         self._schedule(path, now + max(1.0, retry))
@@ -919,41 +1103,80 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
 
     async def async_run_hot_cycle(self) -> None:
         """Run one hot health poll and apply the three-failure threshold."""
+        await self._async_public_operation(
+            self._async_run_hot_cycle_impl,
+            "windfree hot cycle",
+        )
+
+    async def _async_run_hot_cycle_impl(self) -> None:
+        if self._shutting_down or self._terminated:
+            return
         path = HOT_PATHS[self._hot_index % len(HOT_PATHS)]
         self._hot_index += 1
-        try:
-            async with self._admission.hold(int(PollTier.HOT)):
-                await self._async_poll_path_locked(path)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            async with self._admission.hold(int(PollTier.HOT)):
+        async with self._admission.hold(int(PollTier.HOT)):
+            if self._shutting_down or self._transport is None:
+                return
+            transport = self._transport
+            epoch = self._lifecycle_epoch
+            generation = self._generation
+            try:
+                await self._async_poll_path_locked(
+                    path,
+                    transport,
+                    epoch,
+                    generation,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._require_operation_epoch(epoch, transport)
                 await self._async_request_failure_locked(
                     path,
                     PollTier.HOT,
-                    self._generation,
+                    generation,
                     error,
+                    transport,
+                    epoch,
                     reconnect=False,
                 )
-            return
+                return
 
     async def async_reconcile(self) -> None:
         """Revalidate exact identity and the model-specific write contract."""
-        generation = self._generation
+        await self._async_public_operation(
+            self._async_reconcile_impl,
+            "windfree reconcile",
+        )
+
+    async def _async_reconcile_impl(self) -> None:
         async with self._admission.hold(int(PollTier.RECONCILE)):
             if self._shutting_down or self._transport is None:
                 return
-            await self._async_reconcile_with_failure_locked(generation)
+            transport = self._transport
+            epoch = self._lifecycle_epoch
+            generation = self._generation
+            await self._async_reconcile_with_failure_locked(
+                generation,
+                transport,
+                epoch,
+            )
 
     async def _async_reconcile_with_failure_locked(
         self,
         generation: int,
+        transport: WindFreeTransport,
+        epoch: int,
     ) -> None:
         try:
-            await self._async_reconcile_locked()
+            await self._async_reconcile_locked(
+                transport,
+                epoch,
+                generation,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            self._require_operation_epoch(epoch, transport)
             self._reconcile_deadline = self._monotonic() + 5.0
             classification = self._fatal_classification(error)
             error = None
@@ -963,8 +1186,17 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                     generation,
                 )
 
-    async def _async_reconcile_locked(self) -> None:
-        payloads = {path: await self._async_read(path) for path in RECONCILE_PATHS}
+    async def _async_reconcile_locked(
+        self,
+        transport: WindFreeTransport,
+        epoch: int,
+        generation: int,
+    ) -> None:
+        payloads = {
+            path: await self._async_read_from(transport, path)
+            for path in RECONCILE_PATHS
+        }
+        self._require_operation_epoch(epoch, transport)
         tree = payloads["/device/0"]
         new_resources = {
             path: value
@@ -1023,7 +1255,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                 identity=identity,
                 contract=contract,
                 update_source=UpdateSource.RECONCILE,
-                generation=self._generation,
+                generation=generation,
             )
         )
         self._reconcile_deadline = self._monotonic() + _RECONCILE_PERIOD
@@ -1155,7 +1387,23 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
 
     async def async_run_reconnect_attempt(self) -> None:
         """Attempt one stored-port generation, then bounded-range discovery."""
+        await self._async_public_operation(
+            self._async_run_reconnect_attempt_impl,
+            "windfree reconnect attempt",
+        )
+
+    async def _async_run_reconnect_attempt_impl(self) -> None:
+        async with self._generation_lock:
+            await self._async_run_reconnect_attempt_locked()
+
+    async def _async_run_reconnect_attempt_locked(self) -> None:
         if self._shutting_down or self._authentication_rejected:
+            return
+        if not await self._async_drain_inactive_transports():
+            await self._async_reconnect_failure(
+                max(self._generation_attempt, self._generation),
+                TransportError("transport_close_failed"),
+            )
             return
         self._generation_attempt = max(
             self._generation_attempt,
@@ -1516,21 +1764,28 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         if self._terminated or self._shutting_down:
             del operation, kind, value
             raise CommandRejected("command_unavailable") from None
-        completion = asyncio.get_running_loop().create_future()
-        self._command_completions.add(completion)
         task = self.hass.async_create_task(
             self._async_command_worker(operation, kind, value),
             "windfree command",
         )
-        self._command_tasks.add(task)
+        completion = self._track_command_task(task)
         try:
             outcome = await asyncio.shield(task)
         except asyncio.CancelledError as cancelled:
+            current = asyncio.current_task()
+            cancellation_count = current.cancelling() if current is not None else 0
             task.cancel(*cancelled.args)
             try:
                 await asyncio.shield(task)
             except Exception:
                 pass
+            except asyncio.CancelledError:
+                if current is not None and current.cancelling() > cancellation_count:
+                    del operation, kind, value, cancelled
+                    raise
+                cancellation_args = cancelled.args
+                del operation, kind, value, cancelled
+                raise asyncio.CancelledError(*cancellation_args) from None
             del operation, kind, value, cancelled
             raise
         else:
@@ -1542,10 +1797,8 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                 del operation, kind, value, outcome
                 raise CommandRejected(error) from None
         finally:
-            self._command_tasks.discard(task)
-            self._command_completions.discard(completion)
-            if not completion.done():
-                completion.set_result(None)
+            if task.done():
+                self._finish_command_task(task, completion)
 
     async def async_command(self, kind: CommandKind, value: object) -> None:
         """Serialize, authoritatively verify, and then publish one command."""
