@@ -83,6 +83,60 @@ _ALL_HVAC_MODES = frozenset(HvacMode)
 _AUTO_ALIASES = frozenset({"Auto", "AI Auto"})
 
 
+def _immutable_payload(*_args: object, **_kwargs: object) -> None:
+    raise TypeError("command payload is immutable")
+
+
+class _FrozenDict(dict[object, object]):
+    """A CBOR-compatible dictionary that rejects mutation."""
+
+    __setitem__ = _immutable_payload
+    __delitem__ = _immutable_payload
+    clear = _immutable_payload
+    pop = _immutable_payload
+    popitem = _immutable_payload
+    setdefault = _immutable_payload
+    update = _immutable_payload
+    __ior__ = _immutable_payload
+
+    def __copy__(self) -> _FrozenDict:
+        return self
+
+    def __deepcopy__(self, _memo: object) -> _FrozenDict:
+        return self
+
+
+class _FrozenList(list[object]):
+    """A CBOR-compatible list that rejects mutation."""
+
+    __setitem__ = _immutable_payload
+    __delitem__ = _immutable_payload
+    append = _immutable_payload
+    clear = _immutable_payload
+    extend = _immutable_payload
+    insert = _immutable_payload
+    pop = _immutable_payload
+    remove = _immutable_payload
+    reverse = _immutable_payload
+    sort = _immutable_payload
+    __iadd__ = _immutable_payload
+    __imul__ = _immutable_payload
+
+    def __copy__(self) -> _FrozenList:
+        return self
+
+    def __deepcopy__(self, _memo: object) -> _FrozenList:
+        return self
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _FrozenDict((key, _freeze(item)) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return _FrozenList(_freeze(item) for item in value)
+    return value
+
+
 class CommandKind(StrEnum):
     """Safe, live-verified write surfaces."""
 
@@ -105,6 +159,9 @@ class DeviceCommand:
     payload: Mapping[str, object]
     requested: object
     related_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", _freeze(self.payload))
 
 
 def _unsupported() -> UnsupportedDevice:
@@ -153,7 +210,10 @@ def _non_negative_int(value: object) -> int | None:
     if isinstance(value, int):
         return value if value >= 0 else None
     if isinstance(value, str) and value.isascii() and value.isdecimal():
-        return int(value)
+        try:
+            return int(value)
+        except ValueError:
+            return None
     return None
 
 
@@ -268,6 +328,13 @@ def _parse_temperature(
     return parsed
 
 
+def _whole_temperature(value: object) -> float | None:
+    parsed = _parse_temperature(value, minimum=16, maximum=30)
+    if parsed is None or isinstance(value, bool) or not parsed.is_integer():
+        return None
+    return parsed
+
+
 def _parse_filter(resource: Mapping[str, object]) -> FilterState:
     capacity = _positive_int(resource.get("x.com.samsung.da.filterCapacity"))
     used = _non_negative_int(resource.get("x.com.samsung.da.filterUsage"))
@@ -300,31 +367,34 @@ def _parse_energy(resource: Mapping[str, object]) -> EnergyState:
     return EnergyState(cumulative_kwh=kilowatt_hours)
 
 
-def _parse_alarms(resource: Mapping[str, object]) -> AlarmState:
+def _parse_alarms(resource: Mapping[str, object]) -> AlarmState | None:
     items = resource.get(TEMPERATURE_ITEMS_FIELD)
     if not isinstance(items, list):
-        return AlarmState()
+        return None
 
     device_code: str | None = None
     filter_code: str | None = None
     for item in items:
         mapped = _mapping(item)
         if mapped is None:
-            continue
+            return None
         state = mapped.get("x.com.samsung.da.state")
         code = mapped.get("x.com.samsung.da.code")
         alarm_type = mapped.get("x.com.samsung.da.alarmType")
         if (
             not isinstance(state, str)
-            or state.casefold() != "active"
             or not isinstance(code, str)
             or not code
             or not isinstance(alarm_type, str)
+            or state not in {"Active", "Deleted"}
+            or alarm_type not in {"Device", "Filter"}
         ):
+            return None
+        if state == "Deleted":
             continue
-        if alarm_type.casefold() == "filter" and filter_code is None:
+        if alarm_type == "Filter" and filter_code is None:
             filter_code = code
-        elif alarm_type.casefold() == "device" and device_code is None:
+        elif alarm_type == "Device" and device_code is None:
             device_code = code
 
     return AlarmState(
@@ -384,7 +454,11 @@ def parse_device_state(
         previous.climate.preset_mode,
     )
 
-    alarms = _parse_alarms(_resource(resources, ALARMS_PATH))
+    alarm_resource = _mapping(resources.get(ALARMS_PATH))
+    parsed_alarms = (
+        _parse_alarms(alarm_resource) if alarm_resource is not None else None
+    )
+    alarms = parsed_alarms if parsed_alarms is not None else previous.alarms
     filter_state = _parse_filter(_resource(resources, FILTER_PATH))
     if alarms.filter_alarm and not filter_state.attention:
         filter_state = replace(filter_state, attention=True)
@@ -428,6 +502,23 @@ def _numeric_equals(value: object, expected: float) -> bool:
     return parsed is not None and parsed == expected
 
 
+def _valid_hvac_mode_value(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 1
+        and value[0] in _AUTO_ALIASES | frozenset(mode.value for mode in HvacMode)
+    )
+
+
+def _valid_enum_value[EnumT: (FanMode, SwingMode, PresetMode)](
+    value: object,
+    enum_type: type[EnumT],
+) -> bool:
+    return isinstance(value, str) and value in frozenset(
+        member.value for member in enum_type
+    )
+
+
 def _identity_is_supported(identity: DeviceIdentity) -> bool:
     return (
         identity.model == SUPPORTED_MODEL
@@ -455,6 +546,8 @@ def _validate_live_resources(
         mode.value for mode in HvacMode
     ):
         return False
+    if not _valid_hvac_mode_value(hvac_mode.get(MODES_FIELD)):
+        return False
     if temperature is None:
         return False
     if not (
@@ -462,22 +555,32 @@ def _validate_live_resources(
         and _numeric_equals(temperature.get(TEMPERATURE_MAXIMUM_FIELD), 30)
         and _numeric_equals(temperature.get(TEMPERATURE_INCREMENT_FIELD), 1)
         and temperature.get(TEMPERATURE_UNIT_FIELD) == "Celsius"
-        and _finite_float(temperature.get(TEMPERATURE_DESIRED_FIELD)) is not None
+        and _whole_temperature(temperature.get(TEMPERATURE_DESIRED_FIELD)) is not None
     ):
         return False
     if _string_set(fan.get(SUPPORTED_MODES_FIELD)) != frozenset(
         mode.value for mode in FanMode
     ):
         return False
+    if not _valid_enum_value(fan.get(MODES_FIELD), FanMode):
+        return False
     if _string_set(swing.get(SUPPORTED_MODES_FIELD)) != frozenset(
         mode.value for mode in SwingMode
     ):
+        return False
+    if not _valid_enum_value(swing.get(MODES_FIELD), SwingMode):
         return False
     if _string_set(preset.get(SUPPORTED_MODES_FIELD)) != frozenset(
         mode.value for mode in PresetMode
     ):
         return False
+    if not _valid_enum_value(preset.get(MODES_FIELD), PresetMode):
+        return False
     if _string_set(light.get("supportedModes")) != frozenset({"On", "Off"}):
+        return False
+    if _on_off(light.get("mode")) is None:
+        return False
+    if _on_off(auto_clean.get(SETTING_STATUS_FIELD)) is None:
         return False
     return _string_set(auto_clean.get(SUPPORTED_SETTING_STATUS_FIELD)) == frozenset(
         {"On", "Off"}
@@ -539,13 +642,10 @@ def _require_enum[EnumT: (HvacMode, FanMode, SwingMode, PresetMode)](
 
 
 def _require_temperature(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("invalid command value")
     parsed = _finite_float(value)
-    if (
-        parsed is None
-        or isinstance(value, bool)
-        or not 16 <= parsed <= 30
-        or not parsed.is_integer()
-    ):
+    if parsed is None or not 16 <= parsed <= 30 or not parsed.is_integer():
         raise ValueError("invalid command value")
     return parsed
 
@@ -566,6 +666,11 @@ def _temperature_payload(
     for item in items:
         mapped = _mapping(item)
         if mapped is not None and mapped.get(TEMPERATURE_ID_FIELD) == "0":
+            if (
+                not isinstance(item, dict)
+                or _whole_temperature(mapped.get(TEMPERATURE_DESIRED_FIELD)) is None
+            ):
+                raise ValueError("fresh aggregate is invalid")
             item[TEMPERATURE_DESIRED_FIELD] = f"{desired:.1f}"
             return payload
     raise ValueError("fresh aggregate is invalid")
@@ -609,7 +714,7 @@ def build_command(
             kind=kind,
             path=TEMPERATURE_PATH,
             payload=_temperature_payload(fresh_aggregate, requested),
-            requested=value,
+            requested=requested,
             related_paths=(TEMPERATURE_PATH,),
         )
     if kind is CommandKind.FAN:

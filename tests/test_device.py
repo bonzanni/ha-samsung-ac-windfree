@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
+import cbor2
 import pytest
 
 from custom_components.samsung_ac_windfree.device import (
@@ -140,6 +141,10 @@ def test_humidity_is_direct_integer_percentage_with_zero_sentinel(
     expected: int | None,
 ) -> None:
     assert parse_humidity(raw) == expected
+
+
+def test_humidity_rejects_oversized_decimal_string_without_raising() -> None:
+    assert parse_humidity("9" * 5000) is None
 
 
 def test_device_state_parses_every_live_mapping() -> None:
@@ -329,6 +334,24 @@ def test_current_limit_is_read_only_opaque_state_without_units(
     assert parsed.current_limit_level == expected_level
 
 
+def test_state_parser_rejects_oversized_decimal_fields_without_raising() -> None:
+    resources = state_resources()
+    oversized = "9" * 5000
+    resources["/filter/airdustfilter/vs/0"].update(
+        {
+            "x.com.samsung.da.filterCapacity": oversized,
+            "x.com.samsung.da.filterUsage": oversized,
+        }
+    )
+    resources["/electriccurrent/vs/0"]["x.com.samsung.da.level"] = oversized
+
+    parsed = parse_device_state(resources, WindFreeData.empty())
+
+    assert parsed.filter.capacity is None
+    assert parsed.filter.used is None
+    assert parsed.current_limit_level is None
+
+
 def test_malformed_optional_resources_degrade_without_raising() -> None:
     resources = {path: {} for path in state_resources()}
     previous = replace(
@@ -349,6 +372,66 @@ def test_malformed_optional_resources_degrade_without_raising() -> None:
     assert parsed.filter.used is None
     assert parsed.energy.cumulative_kwh is None
     assert parsed.current_limit_level is None
+
+
+@pytest.mark.parametrize(
+    "alarm_resource",
+    [
+        {},
+        {"x.com.samsung.da.items": "bad"},
+        {"x.com.samsung.da.items": [{}]},
+    ],
+)
+def test_malformed_alarm_resource_preserves_previous_alarm_state(
+    alarm_resource: dict[str, object],
+) -> None:
+    resources = state_resources()
+    resources["/alarms/vs/0"] = alarm_resource
+    previous = replace(
+        WindFreeData.empty(),
+        alarms=replace(
+            WindFreeData.empty().alarms,
+            problem=True,
+            active_code="previous-code",
+            filter_alarm=True,
+        ),
+    )
+
+    parsed = parse_device_state(resources, previous)
+
+    assert parsed.alarms is previous.alarms
+    assert parsed.filter.attention is True
+
+
+def test_missing_alarm_resource_preserves_previous_alarm_state() -> None:
+    resources = state_resources()
+    del resources["/alarms/vs/0"]
+    previous = replace(
+        WindFreeData.empty(),
+        alarms=replace(
+            WindFreeData.empty().alarms,
+            problem=True,
+            active_code="previous-code",
+        ),
+    )
+
+    assert parse_device_state(resources, previous).alarms is previous.alarms
+
+
+def test_valid_empty_alarm_items_clear_previous_alarm_state() -> None:
+    resources = state_resources()
+    resources["/alarms/vs/0"]["x.com.samsung.da.items"] = []
+    previous = replace(
+        WindFreeData.empty(),
+        alarms=replace(
+            WindFreeData.empty().alarms,
+            problem=True,
+            active_code="previous-code",
+            filter_alarm=True,
+        ),
+    )
+
+    assert parse_device_state(resources, previous).alarms == type(previous.alarms)()
 
 
 def test_validate_contract_accepts_exact_live_safe_write_contract() -> None:
@@ -396,6 +479,54 @@ def test_validate_contract_fails_closed_on_safe_write_resource_drift(
 ) -> None:
     resources = state_resources()
     del resources[path][field]
+
+    with pytest.raises(CapabilityMismatch, match="capability_mismatch"):
+        validate_contract(parse_identity(*identity_parts()), resources, compatibility())
+
+
+@pytest.mark.parametrize(
+    ("path", "field", "malformed"),
+    [
+        (HVAC_MODE_PATH, "x.com.samsung.da.modes", None),
+        (HVAC_MODE_PATH, "x.com.samsung.da.modes", "Cool"),
+        (HVAC_MODE_PATH, "x.com.samsung.da.modes", ["Unknown"]),
+        (FAN_PATH, "x.com.samsung.da.modes", None),
+        (FAN_PATH, "x.com.samsung.da.modes", ["0"]),
+        (FAN_PATH, "x.com.samsung.da.modes", "5"),
+        (SWING_PATH, "x.com.samsung.da.modes", None),
+        (SWING_PATH, "x.com.samsung.da.modes", ["Fix"]),
+        (SWING_PATH, "x.com.samsung.da.modes", "Unknown"),
+        (PRESET_PATH, "x.com.samsung.da.modes", None),
+        (PRESET_PATH, "x.com.samsung.da.modes", ["Off"]),
+        (PRESET_PATH, "x.com.samsung.da.modes", "Unknown"),
+        (DISPLAY_LIGHT_PATH, "mode", None),
+        (DISPLAY_LIGHT_PATH, "mode", True),
+        (DISPLAY_LIGHT_PATH, "mode", "Unknown"),
+        (AUTO_CLEAN_PATH, "x.com.samsung.da.settingStatus", None),
+        (AUTO_CLEAN_PATH, "x.com.samsung.da.settingStatus", True),
+        (AUTO_CLEAN_PATH, "x.com.samsung.da.settingStatus", "Unknown"),
+    ],
+)
+def test_validate_contract_requires_authoritative_readback_shape(
+    path: str,
+    field: str,
+    malformed: object,
+) -> None:
+    resources = state_resources()
+    if malformed is None:
+        del resources[path][field]
+    else:
+        resources[path][field] = malformed
+
+    with pytest.raises(CapabilityMismatch, match="capability_mismatch"):
+        validate_contract(parse_identity(*identity_parts()), resources, compatibility())
+
+
+def test_validate_contract_rejects_non_whole_temperature_readback() -> None:
+    resources = state_resources()
+    resources[TEMPERATURE_PATH]["x.com.samsung.da.items"][0][  # type: ignore[index]
+        "x.com.samsung.da.desired"
+    ] = "26.5"
 
     with pytest.raises(CapabilityMismatch, match="capability_mismatch"):
         validate_contract(parse_identity(*identity_parts()), resources, compatibility())
@@ -541,6 +672,28 @@ def test_temperature_builder_copies_fresh_aggregate_and_only_changes_desired() -
 
 
 @pytest.mark.parametrize(
+    "existing",
+    [None, True, "nan", "31.0", "26.5", object()],
+)
+def test_temperature_builder_requires_valid_existing_desired_field(
+    existing: object,
+) -> None:
+    aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
+    item = aggregate["x.com.samsung.da.items"][0]  # type: ignore[index]
+    if existing is None:
+        del item["x.com.samsung.da.desired"]
+    else:
+        item["x.com.samsung.da.desired"] = existing
+
+    with pytest.raises(ValueError, match="fresh aggregate"):
+        build_command(
+            CommandKind.TEMPERATURE,
+            27,
+            fresh_aggregate=aggregate,
+        )
+
+
+@pytest.mark.parametrize(
     "aggregate",
     [
         {},
@@ -585,7 +738,17 @@ def test_temperature_builder_rejects_immutable_nested_item() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    [15, 31, 26.5, True, math.nan, math.inf, 10**1000],
+    [
+        15,
+        31,
+        26.5,
+        True,
+        math.nan,
+        math.inf,
+        10**1000,
+        "27",
+        "2.7e1",
+    ],
 )
 def test_temperature_builder_rejects_out_of_contract_values(
     value: object,
@@ -596,6 +759,18 @@ def test_temperature_builder_rejects_out_of_contract_values(
             value,
             fresh_aggregate=state_resources()[TEMPERATURE_PATH],
         )
+
+
+@pytest.mark.parametrize("value", [16, 27, 30.0])
+def test_temperature_builder_normalizes_requested_to_float(value: object) -> None:
+    command = build_command(
+        CommandKind.TEMPERATURE,
+        value,
+        fresh_aggregate=state_resources()[TEMPERATURE_PATH],
+    )
+
+    assert type(command.requested) is float
+    assert command.requested == float(value)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -635,6 +810,46 @@ def test_auto_verification_accepts_auto_and_ai_auto_equivalence() -> None:
         command,
         {HVAC_MODE_PATH: {"x.com.samsung.da.modes": ["Cool"]}},
     )
+
+
+def test_command_payload_is_recursively_immutable_and_cbor_encodable() -> None:
+    aggregate = copy.deepcopy(state_resources()[TEMPERATURE_PATH])
+    command = build_command(
+        CommandKind.TEMPERATURE,
+        27,
+        fresh_aggregate=aggregate,
+    )
+
+    with pytest.raises(TypeError):
+        command.payload["new"] = "value"  # type: ignore[index]
+    items = command.payload["x.com.samsung.da.items"]
+    with pytest.raises(TypeError):
+        items.append({})  # type: ignore[union-attr]
+    with pytest.raises(TypeError):
+        items[0]["x.com.samsung.da.desired"] = "28.0"  # type: ignore[index]
+
+    expected = copy.deepcopy(aggregate)
+    expected["x.com.samsung.da.items"][0][  # type: ignore[index]
+        "x.com.samsung.da.desired"
+    ] = "27.0"
+    assert cbor2.loads(cbor2.dumps(command.payload)) == expected
+
+
+def test_hvac_payload_nested_modes_are_immutable_and_cbor_encodable() -> None:
+    command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
+    modes = command.payload["x.com.samsung.da.modes"]
+
+    with pytest.raises(TypeError):
+        modes.append("Heat")  # type: ignore[union-attr]
+    assert cbor2.loads(cbor2.dumps(command.payload)) == {
+        "x.com.samsung.da.modes": ["Cool"]
+    }
+
+
+def test_immutable_command_payload_is_safe_to_deepcopy() -> None:
+    command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
+
+    assert copy.deepcopy(command.payload) is command.payload
 
 
 def test_temperature_verification_accepts_numeric_equivalence() -> None:
