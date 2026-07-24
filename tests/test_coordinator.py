@@ -1761,6 +1761,30 @@ async def test_scheduler_rechecks_deadline_and_priority_after_admission(
     assert calls == [hot]
 
 
+async def test_scheduler_is_a_home_assistant_background_task(
+    hass,
+    credentials,
+    resource_representations,
+    compatibility,
+) -> None:
+    instance = WindFreeCoordinator(
+        hass,
+        host="device.invalid",
+        port=49154,
+        credentials=credentials,
+        compatibility=compatibility,
+        transport_factory=FakeTransportFactory(resource_representations),
+        observe_wait=0,
+        start_scheduler=True,
+    )
+
+    await instance.async_start()
+
+    assert instance._scheduler_task in hass._background_tasks
+    assert instance._scheduler_task not in hass._tasks
+    await instance.async_shutdown()
+
+
 async def test_real_scheduler_processes_failure_warm_and_reconcile(
     hass,
     credentials,

@@ -931,7 +931,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         ):
             self._initialize_deadlines()
             if self._start_scheduler:
-                self._scheduler_task = self.hass.async_create_task(
+                self._scheduler_task = self.hass.async_create_background_task(
                     self._async_scheduler_loop(),
                     "windfree scheduler",
                 )
