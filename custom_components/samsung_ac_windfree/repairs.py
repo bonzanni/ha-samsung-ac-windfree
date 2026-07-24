@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -21,6 +22,7 @@ _BOOTSTRAP_UNAVAILABLE = "bootstrap_unavailable"
 _RESOURCE_CONTRACT_CHANGED = "resource_contract_changed"
 _UNSUPPORTED_IDENTITY = "unsupported_identity_after_update"
 _PORT_RANGE_EXHAUSTED = "port_range_exhausted"
+_REPAIR_STATE_DATA = f"{DOMAIN}_private_repair_state"
 
 
 class RuntimeHealth(Protocol):
@@ -30,6 +32,45 @@ class RuntimeHealth(Protocol):
     resource_contract_changed: bool
     unsupported_identity_after_update: bool
     port_range_exhausted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryRepairState:
+    authentication_rejected: bool | None = None
+    resource_contract_changed: bool | None = None
+    unsupported_identity_after_update: bool | None = None
+    port_range_exhausted: bool | None = None
+    certificate_expiring: bool | None = None
+
+
+@dataclass(slots=True)
+class _RepairStateStore:
+    entries: dict[str, _EntryRepairState]
+    pending: set[str]
+
+
+def _store(hass: HomeAssistant) -> _RepairStateStore:
+    existing = hass.data.get(_REPAIR_STATE_DATA)
+    if isinstance(existing, _RepairStateStore):
+        return existing
+    created = _RepairStateStore(
+        {},
+        {
+            entry.entry_id
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if entry.disabled_by is None
+        },
+    )
+    hass.data[_REPAIR_STATE_DATA] = created
+    return created
+
+
+def _relevant_entry_ids(
+    hass: HomeAssistant,
+    store: _RepairStateStore,
+) -> set[str]:
+    del hass
+    return set(store.entries) | store.pending
 
 
 def _sync_issue(
@@ -54,40 +95,114 @@ def _sync_issue(
     )
 
 
+def _sync_aggregate_issue(
+    hass: HomeAssistant,
+    store: _RepairStateStore,
+    issue_id: str,
+    field: str,
+    *,
+    fixable: bool,
+    severity: ir.IssueSeverity,
+) -> None:
+    relevant = _relevant_entry_ids(hass, store)
+    values = [
+        getattr(store.entries.get(entry_id, _EntryRepairState()), field)
+        for entry_id in relevant
+    ]
+    if any(value is True for value in values):
+        active: bool | None = True
+    elif not relevant or all(value is False for value in values):
+        active = False
+    else:
+        active = None
+    if active is not None:
+        _sync_issue(
+            hass,
+            issue_id,
+            active,
+            fixable=fixable,
+            severity=severity,
+        )
+
+
+def _sync_entry_aggregates(
+    hass: HomeAssistant,
+    store: _RepairStateStore,
+) -> None:
+    for issue_id, field, fixable, severity in (
+        (
+            _AUTHENTICATION_REJECTED,
+            "authentication_rejected",
+            True,
+            ir.IssueSeverity.ERROR,
+        ),
+        (
+            _RESOURCE_CONTRACT_CHANGED,
+            "resource_contract_changed",
+            False,
+            ir.IssueSeverity.ERROR,
+        ),
+        (
+            _UNSUPPORTED_IDENTITY,
+            "unsupported_identity_after_update",
+            False,
+            ir.IssueSeverity.ERROR,
+        ),
+        (
+            _PORT_RANGE_EXHAUSTED,
+            "port_range_exhausted",
+            False,
+            ir.IssueSeverity.ERROR,
+        ),
+        (
+            _CERTIFICATE_EXPIRING,
+            "certificate_expiring",
+            True,
+            ir.IssueSeverity.WARNING,
+        ),
+    ):
+        _sync_aggregate_issue(
+            hass,
+            store,
+            issue_id,
+            field,
+            fixable=fixable,
+            severity=severity,
+        )
+
+
 def async_sync_runtime_issues(
     hass: HomeAssistant,
+    entry_id: str,
     health: RuntimeHealth,
 ) -> None:
     """Synchronize fixed runtime issue transitions without device I/O."""
 
-    _sync_issue(
-        hass,
-        _AUTHENTICATION_REJECTED,
-        health.authentication_rejected,
-        fixable=True,
-        severity=ir.IssueSeverity.ERROR,
+    store = _store(hass)
+    store.pending.discard(entry_id)
+    prior = store.entries.get(entry_id, _EntryRepairState())
+    store.entries[entry_id] = replace(
+        prior,
+        authentication_rejected=bool(health.authentication_rejected),
+        resource_contract_changed=bool(health.resource_contract_changed),
+        unsupported_identity_after_update=bool(
+            health.unsupported_identity_after_update
+        ),
+        port_range_exhausted=bool(health.port_range_exhausted),
     )
-    _sync_issue(
-        hass,
-        _RESOURCE_CONTRACT_CHANGED,
-        health.resource_contract_changed,
-        fixable=False,
-        severity=ir.IssueSeverity.ERROR,
-    )
-    _sync_issue(
-        hass,
-        _UNSUPPORTED_IDENTITY,
-        health.unsupported_identity_after_update,
-        fixable=False,
-        severity=ir.IssueSeverity.ERROR,
-    )
-    _sync_issue(
-        hass,
-        _PORT_RANGE_EXHAUSTED,
-        health.port_range_exhausted,
-        fixable=False,
-        severity=ir.IssueSeverity.ERROR,
-    )
+    _sync_entry_aggregates(hass, store)
+
+
+def async_remove_entry_issues(
+    hass: HomeAssistant,
+    entry_id: str,
+) -> None:
+    """Forget one successfully unloaded entry and recompute aggregates."""
+
+    store = _store(hass)
+    store.entries.pop(entry_id, None)
+    store.pending.discard(entry_id)
+    _sync_entry_aggregates(hass, store)
 
 
 def async_sync_bootstrap_issue(
@@ -114,6 +229,7 @@ def async_sync_bootstrap_issue(
 
 def async_sync_certificate_issue(
     hass: HomeAssistant,
+    entry_id: str,
     expires: datetime | None,
     *,
     now: datetime,
@@ -126,24 +242,38 @@ def async_sync_certificate_issue(
         and now.tzinfo is not None
         and expires - now <= CERT_REPAIR_WINDOW
     )
-    _sync_issue(
-        hass,
-        _CERTIFICATE_EXPIRING,
-        active,
-        fixable=True,
-        severity=ir.IssueSeverity.WARNING,
+    store = _store(hass)
+    store.pending.discard(entry_id)
+    prior = store.entries.get(entry_id, _EntryRepairState())
+    store.entries[entry_id] = replace(
+        prior,
+        certificate_expiring=active,
     )
+    _sync_entry_aggregates(hass, store)
 
 
-def _is_expiring(data: Mapping[str, object], now: datetime) -> bool:
+def _affected_entry_ids(
+    hass: HomeAssistant,
+    field: str,
+) -> set[str]:
+    store = _store(hass)
+    relevant = _relevant_entry_ids(hass, store)
+    return {
+        entry_id
+        for entry_id in relevant
+        if getattr(store.entries.get(entry_id, _EntryRepairState()), field) is True
+    }
+
+
+def _certificate_expiration(data: Mapping[str, object]) -> datetime | None:
     value = data.get("not_after")
     if not isinstance(value, str):
-        return False
+        return None
     try:
         expires = datetime.fromisoformat(value)
     except ValueError:
-        return False
-    return expires.tzinfo is not None and expires - now <= CERT_REPAIR_WINDOW
+        return None
+    return expires if expires.tzinfo is not None else None
 
 
 class _UnknownRepairFlow(RepairsFlow):
@@ -181,11 +311,16 @@ class CertificateExpiryRepairFlow(RepairsFlow):
                 data_schema=vol.Schema({}),
             )
         now = dt_util.utcnow()
-        entries = [
-            entry
-            for entry in self.hass.config_entries.async_entries(DOMAIN)
-            if _is_expiring(entry.data, now)
-        ]
+        configured = self.hass.config_entries.async_entries(DOMAIN)
+        for entry in configured:
+            async_sync_certificate_issue(
+                self.hass,
+                entry.entry_id,
+                _certificate_expiration(entry.data),
+                now=now,
+            )
+        affected = _affected_entry_ids(self.hass, "certificate_expiring")
+        entries = [entry for entry in configured if entry.entry_id in affected]
         if not entries:
             ir.async_delete_issue(
                 self.hass,
@@ -223,7 +358,12 @@ class AuthenticationRejectedRepairFlow(RepairsFlow):
                 step_id="confirm",
                 data_schema=vol.Schema({}),
             )
-        entries = list(self.hass.config_entries.async_entries(DOMAIN))
+        affected = _affected_entry_ids(self.hass, "authentication_rejected")
+        entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if entry.entry_id in affected
+        ]
         if not entries:
             ir.async_delete_issue(self.hass, DOMAIN, _AUTHENTICATION_REJECTED)
             return self.async_abort(reason="issue_resolved")

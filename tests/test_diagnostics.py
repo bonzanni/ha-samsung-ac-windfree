@@ -23,6 +23,7 @@ from custom_components.samsung_ac_windfree.diagnostics import (
 )
 from custom_components.samsung_ac_windfree.models import UpdateSource, WindFreeData
 from custom_components.samsung_ac_windfree.repairs import (
+    async_remove_entry_issues,
     async_sync_bootstrap_issue,
     async_sync_certificate_issue,
     async_sync_runtime_issues,
@@ -246,6 +247,8 @@ async def test_runtime_repairs_create_once_and_delete_on_recovery(
     coordinator,
 ) -> None:
     registry = ir.async_get(hass)
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
     active = replace(
         coordinator.health,
         authentication_rejected=True,
@@ -254,8 +257,8 @@ async def test_runtime_repairs_create_once_and_delete_on_recovery(
         port_range_exhausted=True,
     )
 
-    async_sync_runtime_issues(hass, active)
-    async_sync_runtime_issues(hass, active)
+    async_sync_runtime_issues(hass, entry.entry_id, active)
+    async_sync_runtime_issues(hass, entry.entry_id, active)
 
     expected = {
         "authentication_rejected",
@@ -279,7 +282,7 @@ async def test_runtime_repairs_create_once_and_delete_on_recovery(
         resource_contract_changed=False,
         port_range_exhausted=False,
     )
-    async_sync_runtime_issues(hass, recovered)
+    async_sync_runtime_issues(hass, entry.entry_id, recovered)
 
     assert all(registry.async_get_issue(DOMAIN, item) is None for item in expected)
 
@@ -297,7 +300,9 @@ async def test_entry_listener_synchronizes_runtime_transitions(
         return MagicMock()
 
     coordinator.async_add_listener = MagicMock(side_effect=add_listener)
-    lifecycle = _EntryLifecycle(coordinator, MagicMock())
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
+    lifecycle = _EntryLifecycle(entry.entry_id, coordinator, MagicMock())
     lifecycle.attach()
     assert callback is not None
 
@@ -335,8 +340,15 @@ async def test_bootstrap_repairs_are_mutually_exclusive_and_recover(hass) -> Non
 async def test_certificate_repair_boundary_and_recovery(hass) -> None:
     registry = ir.async_get(hass)
     now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = MockConfigEntry(domain=DOMAIN, data={})
+    entry.add_to_hass(hass)
 
-    async_sync_certificate_issue(hass, now + timedelta(days=90), now=now)
+    async_sync_certificate_issue(
+        hass,
+        entry.entry_id,
+        now + timedelta(days=90),
+        now=now,
+    )
     issue = registry.async_get_issue(DOMAIN, "certificate_expiring")
     assert issue is not None
     assert issue.is_fixable
@@ -345,7 +357,90 @@ async def test_certificate_repair_boundary_and_recovery(hass) -> None:
 
     async_sync_certificate_issue(
         hass,
+        entry.entry_id,
         now + timedelta(days=90, microseconds=1),
+        now=now,
+    )
+    assert registry.async_get_issue(DOMAIN, "certificate_expiring") is None
+
+
+async def test_multi_entry_runtime_issue_aggregates_and_unload_recomputes(
+    hass,
+    coordinator,
+) -> None:
+    registry = ir.async_get(hass)
+    healthy_entry = MockConfigEntry(domain=DOMAIN, data={})
+    unhealthy_entry = MockConfigEntry(domain=DOMAIN, data={})
+    healthy_entry.add_to_hass(hass)
+    unhealthy_entry.add_to_hass(hass)
+    healthy = coordinator.health
+    unhealthy = replace(healthy, authentication_rejected=True)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "authentication_rejected",
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="authentication_rejected",
+    )
+
+    async_sync_runtime_issues(hass, healthy_entry.entry_id, healthy)
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
+
+    async_sync_runtime_issues(hass, unhealthy_entry.entry_id, unhealthy)
+    async_sync_runtime_issues(hass, healthy_entry.entry_id, healthy)
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
+
+    async_remove_entry_issues(hass, unhealthy_entry.entry_id)
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is None
+
+
+async def test_multi_entry_certificate_issue_waits_for_all_entries(
+    hass,
+) -> None:
+    registry = ir.async_get(hass)
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    first = MockConfigEntry(domain=DOMAIN, data={})
+    second = MockConfigEntry(domain=DOMAIN, data={})
+    first.add_to_hass(hass)
+    second.add_to_hass(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "certificate_expiring",
+        is_fixable=True,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="certificate_expiring",
+    )
+
+    async_sync_certificate_issue(
+        hass,
+        first.entry_id,
+        now + timedelta(days=120),
+        now=now,
+    )
+    assert registry.async_get_issue(DOMAIN, "certificate_expiring") is not None
+
+    async_sync_certificate_issue(
+        hass,
+        second.entry_id,
+        now + timedelta(days=30),
+        now=now,
+    )
+    async_sync_certificate_issue(
+        hass,
+        first.entry_id,
+        now + timedelta(days=120),
+        now=now,
+    )
+    assert registry.async_get_issue(DOMAIN, "certificate_expiring") is not None
+
+    async_sync_certificate_issue(
+        hass,
+        second.entry_id,
+        now + timedelta(days=120),
         now=now,
     )
     assert registry.async_get_issue(DOMAIN, "certificate_expiring") is None

@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -814,6 +815,52 @@ async def test_failed_platform_unload_keeps_coordinator_running(
         assert not await async_unload_entry(hass, entry)
 
     coordinator.async_shutdown.assert_not_awaited()
+
+
+async def test_successful_unload_removes_only_its_private_repair_state(
+    hass,
+    credentials,
+) -> None:
+    from custom_components.samsung_ac_windfree import async_unload_entry
+    from custom_components.samsung_ac_windfree.repairs import (
+        _store,
+        async_sync_runtime_issues,
+    )
+
+    healthy_entry = _entry(credentials)
+    unhealthy_entry = _entry(credentials)
+    healthy_entry.add_to_hass(hass)
+    unhealthy_entry.add_to_hass(hass)
+    healthy = SimpleNamespace(
+        authentication_rejected=False,
+        resource_contract_changed=False,
+        unsupported_identity_after_update=False,
+        port_range_exhausted=False,
+    )
+    unhealthy = SimpleNamespace(
+        authentication_rejected=True,
+        resource_contract_changed=False,
+        unsupported_identity_after_update=False,
+        port_range_exhausted=False,
+    )
+    async_sync_runtime_issues(hass, healthy_entry.entry_id, healthy)
+    async_sync_runtime_issues(hass, unhealthy_entry.entry_id, unhealthy)
+    coordinator = MagicMock()
+    coordinator.async_shutdown = AsyncMock()
+    unhealthy_entry.runtime_data = coordinator
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await async_unload_entry(hass, unhealthy_entry)
+
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "authentication_rejected") is None
+    store = _store(hass)
+    assert unhealthy_entry.entry_id not in store.entries
+    assert unhealthy_entry.entry_id not in store.pending
+    coordinator.async_shutdown.assert_awaited_once_with()
 
 
 async def test_update_listener_reloads_entry(hass, credentials) -> None:

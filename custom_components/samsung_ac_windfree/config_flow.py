@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,10 @@ _BOOTSTRAP_ERRORS = frozenset(
         "bootstrap_invalid_material",
     }
 )
+_BOOTSTRAP_REPORTER: ContextVar[object | None] = ContextVar(
+    "windfree_bootstrap_reporter",
+    default=None,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +79,12 @@ class SetupValidationError(WindFreeError):
 
 class _ValidationCleanupError(Exception):
     """Internal marker for a validation session that could not close."""
+
+
+def _report_bootstrap(status: str) -> None:
+    reporter = _BOOTSTRAP_REPORTER.get()
+    if callable(reporter):
+        reporter(status)
 
 
 async def async_resolve_host(hass: HomeAssistant, host: str) -> None:
@@ -145,22 +156,29 @@ async def _async_validate_pipeline(
             error = None
             return _ValidationFailure("cannot_resolve")
 
+        _report_bootstrap("attempted")
         try:
             async with asyncio.timeout(BOOTSTRAP_TIMEOUT):
                 credentials = await async_bootstrap_credentials(hass)
         except TimeoutError:
+            _report_bootstrap("unavailable")
             return _ValidationFailure("fetch_timeout")
         except asyncio.CancelledError:
             raise
         except BootstrapError as error:
             key = _bootstrap_error_key(error)
+            _report_bootstrap(
+                "pin_changed" if key == "bootstrap_pin_mismatch" else "unavailable"
+            )
             error.__traceback__ = None
             error = None
             return _ValidationFailure(key)
         except Exception as error:
+            _report_bootstrap("unavailable")
             error.__traceback__ = None
             error = None
             return _ValidationFailure("bootstrap_unavailable")
+        _report_bootstrap("succeeded")
 
         try:
             async with asyncio.timeout(SWEEP_TIMEOUT):
@@ -341,6 +359,26 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._validation_task: asyncio.Task[ValidatedSetup] | None = None
         self._validated: ValidatedSetup | None = None
         self._error: str | None = None
+        self._bootstrap_status = "not_attempted"
+
+    def _note_bootstrap(self, status: str) -> None:
+        self._bootstrap_status = status
+        if status == "succeeded":
+            async_sync_bootstrap_issue(self.hass, None)
+        elif status == "pin_changed":
+            async_sync_bootstrap_issue(self.hass, "bootstrap_pin_mismatch")
+        elif status == "unavailable":
+            async_sync_bootstrap_issue(self.hass, "bootstrap_unavailable")
+
+    async def _async_validate_with_tracking(self) -> ValidatedSetup:
+        token = _BOOTSTRAP_REPORTER.set(self._note_bootstrap)
+        try:
+            validated = await async_validate_setup(self.hass, self._host)
+        finally:
+            _BOOTSTRAP_REPORTER.reset(token)
+        if self._bootstrap_status == "not_attempted":
+            self._note_bootstrap("succeeded")
+        return validated
 
     def _host_form(
         self,
@@ -366,8 +404,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._operation = operation
         self._validated = None
         self._error = None
+        self._bootstrap_status = "not_attempted"
         self._validation_task = self.hass.async_create_task(
-            async_validate_setup(self.hass, self._host),
+            self._async_validate_with_tracking(),
             "windfree config validation",
         )
         return self.async_show_progress(
@@ -445,19 +484,20 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             raise
         except BaseException as error:
             self._error = _flow_error(error)
+            if self._bootstrap_status == "not_attempted":
+                if isinstance(error, BootstrapError):
+                    key = _bootstrap_error_key(error)
+                    self._note_bootstrap(
+                        "pin_changed"
+                        if key == "bootstrap_pin_mismatch"
+                        else "unavailable"
+                    )
+                elif self._error == "fetch_timeout":
+                    self._note_bootstrap("unavailable")
             error.__traceback__ = None
             error = None
         finally:
             self._validation_task = None
-        if self._error in {"bootstrap_pin_mismatch", "bootstrap_unavailable"}:
-            async_sync_bootstrap_issue(self.hass, self._error)
-        elif self._validated is not None or self._error in {
-            "bootstrap_invalid_material",
-            "cannot_connect",
-            "unsupported_device",
-            "capability_mismatch",
-        }:
-            async_sync_bootstrap_issue(self.hass, None)
         return self.async_show_progress_done(next_step_id="finish")
 
     async def async_step_finish(

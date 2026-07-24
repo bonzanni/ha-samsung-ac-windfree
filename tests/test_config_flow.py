@@ -218,6 +218,236 @@ async def test_bootstrap_flow_issue_transitions_and_success_recovery(
     assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
 
 
+@pytest.mark.parametrize(
+    ("bootstrap_error", "expected_issue"),
+    [
+        (TimeoutError(), "bootstrap_unavailable"),
+        (RuntimeError("dependency unavailable"), "bootstrap_unavailable"),
+        (
+            BootstrapError("bootstrap_pin_mismatch: changed"),
+            "bootstrap_pin_changed",
+        ),
+    ],
+)
+async def test_actual_bootstrap_failures_update_repairs(
+    hass,
+    bootstrap_error,
+    expected_issue,
+) -> None:
+    registry = ir.async_get(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "bootstrap_pin_changed",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="bootstrap_pin_changed",
+    )
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
+            new=AsyncMock(),
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_bootstrap_credentials",
+            new=AsyncMock(side_effect=bootstrap_error),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await _finish_progress(hass, result)
+
+    assert registry.async_get_issue(DOMAIN, expected_issue) is not None
+    other = (
+        "bootstrap_unavailable"
+        if expected_issue == "bootstrap_pin_changed"
+        else "bootstrap_pin_changed"
+    )
+    assert registry.async_get_issue(DOMAIN, other) is None
+
+
+@pytest.mark.parametrize("later_failure", ["sweep", "read"])
+async def test_verified_bootstrap_clears_issues_before_later_failure(
+    hass,
+    credentials,
+    later_failure,
+) -> None:
+    registry = ir.async_get(hass)
+    for issue_id in ("bootstrap_pin_changed", "bootstrap_unavailable"):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key=issue_id,
+        )
+    transport = AsyncMock()
+    if later_failure == "read":
+        transport.async_get.side_effect = TimeoutError
+        discover = AsyncMock(return_value=(49154, transport))
+    else:
+        discover = AsyncMock(side_effect=TimeoutError)
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
+            new=AsyncMock(),
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_bootstrap_credentials",
+            new=AsyncMock(return_value=credentials),
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_discover_transport",
+            new=discover,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await _finish_progress(hass, result)
+
+    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
+    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+    if later_failure == "read":
+        transport.async_close.assert_awaited_once_with()
+
+
+async def test_failure_before_bootstrap_preserves_existing_issue(hass) -> None:
+    registry = ir.async_get(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "bootstrap_pin_changed",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="bootstrap_pin_changed",
+    )
+    bootstrap = AsyncMock()
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
+            new=AsyncMock(side_effect=OSError("dns unavailable")),
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_bootstrap_credentials",
+            new=bootstrap,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await _finish_progress(hass, result)
+
+    bootstrap.assert_not_awaited()
+    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
+    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+
+
+async def test_overall_timeout_before_bootstrap_preserves_issue(hass) -> None:
+    registry = ir.async_get(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "bootstrap_unavailable",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="bootstrap_unavailable",
+    )
+    bootstrap = AsyncMock()
+
+    async def blocked_resolve(*_args):
+        await asyncio.Event().wait()
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.SETUP_TIMEOUT",
+            0.001,
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
+            blocked_resolve,
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_bootstrap_credentials",
+            new=bootstrap,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await _finish_progress(hass, result)
+
+    bootstrap.assert_not_awaited()
+    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is not None
+
+
+async def test_bootstrap_cancellation_preserves_existing_issue(hass) -> None:
+    registry = ir.async_get(hass)
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "bootstrap_pin_changed",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="bootstrap_pin_changed",
+    )
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def blocked_bootstrap(_hass):
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
+            new=AsyncMock(),
+        ),
+        patch(
+            "custom_components.samsung_ac_windfree.config_flow."
+            "async_bootstrap_credentials",
+            blocked_bootstrap,
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": config_entries.SOURCE_USER},
+            data={"host": HOST},
+        )
+        await started.wait()
+        hass.config_entries.flow.async_abort(result["flow_id"])
+        await hass.async_block_till_done()
+
+    assert cleaned.is_set()
+    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
+    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+
+
 async def test_duplicate_device_aborts_after_local_validation(
     hass, validated_setup
 ) -> None:

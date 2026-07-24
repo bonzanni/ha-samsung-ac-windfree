@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -147,6 +149,20 @@ async def test_authentication_repair_confirms_reauth_without_private_data(
     )
     entry.add_to_hass(hass)
     entry.async_start_reauth = MagicMock()
+    from custom_components.samsung_ac_windfree.repairs import (
+        async_sync_runtime_issues,
+    )
+
+    async_sync_runtime_issues(
+        hass,
+        entry.entry_id,
+        SimpleNamespace(
+            authentication_rejected=True,
+            resource_contract_changed=False,
+            unsupported_identity_after_update=False,
+            port_range_exhausted=False,
+        ),
+    )
     flow = await async_create_fix_flow(hass, "authentication_rejected", None)
     flow.hass = hass
 
@@ -159,3 +175,81 @@ async def test_authentication_repair_confirms_reauth_without_private_data(
     assert "192.0.2.10" not in repr(result)
     assert "00000000-0000-4000-8000-000000000001" not in repr(result)
     assert "PRIVATE KEY" not in repr(result)
+
+
+async def test_repair_flows_reauthenticate_only_affected_entries(hass) -> None:
+    from custom_components.samsung_ac_windfree.coordinator import CoordinatorHealth
+    from custom_components.samsung_ac_windfree.models import UpdateSource
+    from custom_components.samsung_ac_windfree.repairs import (
+        async_create_fix_flow,
+        async_sync_certificate_issue,
+        async_sync_runtime_issues,
+    )
+
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    affected = MockConfigEntry(
+        domain=DOMAIN,
+        data={"not_after": (now + timedelta(days=30)).isoformat()},
+    )
+    healthy = MockConfigEntry(
+        domain=DOMAIN,
+        data={"not_after": (now + timedelta(days=120)).isoformat()},
+    )
+    affected.add_to_hass(hass)
+    healthy.add_to_hass(hass)
+    affected.async_start_reauth = MagicMock()
+    healthy.async_start_reauth = MagicMock()
+    base = CoordinatorHealth(
+        available=False,
+        generation=1,
+        connection_reason=None,
+        failure_count=0,
+        reconnect_attempts=0,
+        reconnect_delay_seconds=0,
+        authentication_rejected=False,
+        port_range_exhausted=False,
+        resource_contract_changed=False,
+        unsupported_identity_after_update=False,
+        source=UpdateSource.NONE,
+        hot_age_seconds=0,
+        poll_count=0,
+        observe_count=0,
+        reconcile_count=0,
+        command_count=0,
+        latency_under_100ms=0,
+        latency_under_500ms=0,
+        latency_under_1s=0,
+        latency_at_least_1s=0,
+    )
+    async_sync_runtime_issues(
+        hass,
+        affected.entry_id,
+        replace(base, authentication_rejected=True),
+    )
+    async_sync_runtime_issues(hass, healthy.entry_id, base)
+    async_sync_certificate_issue(
+        hass,
+        affected.entry_id,
+        now + timedelta(days=30),
+        now=now,
+    )
+    async_sync_certificate_issue(
+        hass,
+        healthy.entry_id,
+        now + timedelta(days=120),
+        now=now,
+    )
+
+    auth_flow = await async_create_fix_flow(hass, "authentication_rejected", None)
+    auth_flow.hass = hass
+    await auth_flow.async_step_confirm({})
+    with patch(
+        "custom_components.samsung_ac_windfree.repairs.dt_util.utcnow",
+        return_value=now,
+    ):
+        cert_flow = await async_create_fix_flow(hass, "certificate_expiring", None)
+        cert_flow.hass = hass
+        await cert_flow.async_step_confirm({})
+
+    assert affected.async_start_reauth.call_count == 2
+    healthy.async_start_reauth.assert_not_called()

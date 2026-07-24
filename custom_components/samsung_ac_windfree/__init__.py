@@ -27,6 +27,7 @@ from .models import (
     UnsupportedDevice,
 )
 from .repairs import (
+    async_remove_entry_issues,
     async_sync_certificate_issue,
     async_sync_runtime_issues,
 )
@@ -55,6 +56,7 @@ class _ShutdownOutcome:
 
 @dataclass(slots=True)
 class _EntryLifecycle:
+    entry_id: str
     coordinator: WindFreeCoordinator
     start_reauth: Callable[[], None]
     unsubscribe: Callable[[], None] | None = None
@@ -66,6 +68,7 @@ class _EntryLifecycle:
 
         async_sync_runtime_issues(
             self.coordinator.hass,
+            self.entry_id,
             self.coordinator.health,
         )
         if (
@@ -263,6 +266,12 @@ async def async_setup_entry(
     starts, expires = validity
     validity = None
     now = dt_util.utcnow()
+    async_sync_certificate_issue(
+        hass,
+        entry.entry_id,
+        expires,
+        now=now,
+    )
     if starts > now:
         host = ""
         credentials = None
@@ -278,8 +287,6 @@ async def async_setup_entry(
         del host, credentials, starts, expires, now, entry
         raise ConfigEntryAuthFailed("credentials_expired") from None
 
-    async_sync_certificate_issue(hass, expires, now=now)
-
     coordinator = WindFreeCoordinator(
         hass,
         host=host,
@@ -291,12 +298,13 @@ async def async_setup_entry(
     cancellation_args: tuple[object, ...] | None = None
     try:
         await coordinator.async_start()
-        async_sync_runtime_issues(hass, coordinator.health)
+        async_sync_runtime_issues(hass, entry.entry_id, coordinator.health)
         if coordinator.authentication_rejected:
             raise AuthenticationRejected("authentication_rejected")
         entry.runtime_data = coordinator
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         lifecycle = _EntryLifecycle(
+            entry.entry_id,
             coordinator,
             partial(entry.async_start_reauth, hass),
         )
@@ -309,6 +317,7 @@ async def async_setup_entry(
         cancelled = None
         failure = "cancelled"
     except AuthenticationRejected as error:
+        async_sync_runtime_issues(hass, entry.entry_id, coordinator.health)
         error.__traceback__ = None
         error = None
         failure = "authentication_rejected"
@@ -401,6 +410,8 @@ async def async_unload_entry(
     shutdown = await _async_shutdown_cancellation_safe(hass, coordinator)
     cancellation_args = shutdown.cancellation_args
     completed = shutdown.completed
+    if completed:
+        async_remove_entry_issues(hass, entry.entry_id)
     shutdown = None
     lifecycle = None
     coordinator = None
