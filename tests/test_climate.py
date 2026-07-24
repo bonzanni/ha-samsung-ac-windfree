@@ -3,16 +3,24 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from types import MappingProxyType
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+import voluptuous as vol
 from homeassistant.components.climate import (
+    ATTR_FAN_MODE,
+    ATTR_HVAC_MODE,
+    ATTR_PRESET_MODE,
+    ATTR_SWING_MODE,
     ATTR_TEMPERATURE,
     ClimateEntityFeature,
     HVACMode,
 )
-from homeassistant.const import UnitOfTemperature
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import ATTR_ENTITY_ID, Platform, UnitOfTemperature
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.samsung_ac_windfree.climate import (
@@ -82,6 +90,42 @@ def climate(coordinator: MagicMock) -> WindFreeClimate:
     return WindFreeClimate(coordinator)
 
 
+def _climate_traceback_locals(error: BaseException) -> str:
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        if (
+            traceback.tb_frame.f_globals.get("__name__")
+            == "custom_components.samsung_ac_windfree.climate"
+        ):
+            values.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    return "\n".join(values)
+
+
+@pytest.fixture
+async def live_climate_entity(
+    hass: HomeAssistant,
+    coordinator: MagicMock,
+) -> tuple[str, MagicMock]:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Samsung WindFree AC",
+        unique_id=coordinator.data.identity.device_id,
+        state=ConfigEntryState.LOADED,
+    )
+    entry.runtime_data = coordinator
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "climate", {})
+    await hass.config_entries.async_forward_entry_setups(entry, [Platform.CLIMATE])
+    await hass.async_block_till_done()
+    entity_ids = hass.states.async_entity_ids("climate")
+    assert len(entity_ids) == 1
+    yield entity_ids[0], coordinator
+    for entity in tuple(hass.data["climate"].entities):
+        await entity.async_remove()
+
+
 async def test_platform_adds_exactly_one_climate_entity(coordinator) -> None:
     entry = MockConfigEntry(domain=DOMAIN, unique_id="entry-device")
     entry.runtime_data = coordinator
@@ -140,6 +184,34 @@ def test_supported_features_are_exact(climate) -> None:
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
     )
+
+
+def test_mapping_tables_and_advertised_lists_are_isolated(coordinator) -> None:
+    first = WindFreeClimate(coordinator)
+    second = WindFreeClimate(coordinator)
+
+    with pytest.raises(TypeError):
+        HVAC_TO_HA[HvacMode.COOL] = HVACMode.HEAT  # type: ignore[index]
+    with pytest.raises(TypeError):
+        FAN_TO_HA[FanMode.AUTO] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        SWING_TO_HA[SwingMode.FIXED] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        PRESET_TO_HA[PresetMode.NONE] = "mutated"  # type: ignore[index]
+
+    first.hvac_modes.append(HVACMode.HEAT_COOL)
+    first.fan_modes.append("mutated")
+    first.swing_modes.append("mutated")
+    first.preset_modes.append("mutated")
+
+    assert HVACMode.HEAT_COOL not in second.hvac_modes
+    assert "mutated" not in second.fan_modes
+    assert "mutated" not in second.swing_modes
+    assert "mutated" not in second.preset_modes
+    assert first.hvac_modes is not second.hvac_modes
+    assert first.fan_modes is not second.fan_modes
+    assert first.swing_modes is not second.swing_modes
+    assert first.preset_modes is not second.preset_modes
 
 
 @pytest.mark.parametrize(
@@ -434,3 +506,178 @@ async def test_cancellation_is_preserved(climate, coordinator) -> None:
 
     with pytest.raises(asyncio.CancelledError, match="climate_cancelled"):
         await climate.async_set_fan_mode("low")
+
+
+async def test_rejection_traceback_does_not_retain_raw_error_or_call(
+    climate, coordinator
+) -> None:
+    secret = "192.0.2.60 PRIVATE-LIVE-REJECTION"
+    coordinator.async_command = AsyncMock(side_effect=CommandRejected(secret))
+
+    with pytest.raises(HomeAssistantError) as caught:
+        await climate.async_set_fan_mode("low")
+
+    assert caught.value.translation_key == "command_failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    locals_text = _climate_traceback_locals(caught.value)
+    assert secret not in locals_text
+    assert "CommandRejected" not in locals_text
+    assert "async_command" not in locals_text
+    assert "FanMode.LOW" not in locals_text
+
+
+async def test_invalid_caller_value_is_scrubbed_from_traceback(
+    climate, coordinator
+) -> None:
+    secret = "192.0.2.60 PRIVATE-CALLER-VALUE"
+
+    with pytest.raises(HomeAssistantError) as caught:
+        await climate.async_set_fan_mode(secret)
+
+    assert caught.value.translation_key == "invalid_command"
+    assert secret not in _climate_traceback_locals(caught.value)
+
+
+async def test_cancellation_traceback_scrubs_call_and_preserves_exact_args(
+    climate, coordinator
+) -> None:
+    secret = "192.0.2.60 PRIVATE-CANCEL"
+    coordinator.async_command = AsyncMock(
+        side_effect=asyncio.CancelledError(secret, 17)
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await climate.async_set_fan_mode("low")
+
+    assert caught.value.args == (secret, 17)
+    locals_text = _climate_traceback_locals(caught.value)
+    assert secret not in locals_text
+    assert "async_command" not in locals_text
+    assert "FanMode.LOW" not in locals_text
+
+
+async def test_real_platform_projects_state(live_climate_entity, hass) -> None:
+    entity_id, _coordinator = live_climate_entity
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == HVACMode.OFF
+    assert state.attributes["current_temperature"] == 26
+    assert state.attributes["temperature"] == 26
+    assert state.attributes["current_humidity"] == 36
+    assert state.attributes["fan_mode"] == "auto"
+    assert state.attributes["fan_modes"] == list(FAN_TO_HA.values())
+    assert state.attributes["swing_mode"] == "fixed"
+    assert state.attributes["swing_modes"] == list(SWING_TO_HA.values())
+    assert state.attributes["preset_mode"] == "none"
+    assert state.attributes["preset_modes"] == list(PRESET_TO_HA.values())
+    assert "hvac_action" not in state.attributes
+
+
+@pytest.mark.parametrize(
+    ("service", "data", "coordinator_method", "expected"),
+    [
+        (
+            "set_hvac_mode",
+            {ATTR_HVAC_MODE: "heat"},
+            "async_set_hvac_mode",
+            call(HvacMode.HEAT),
+        ),
+        (
+            "set_hvac_mode",
+            {ATTR_HVAC_MODE: "cool"},
+            "async_set_hvac_mode",
+            call(HvacMode.COOL),
+        ),
+        ("turn_on", {}, "async_turn_on", call()),
+        ("turn_off", {}, "async_turn_off", call()),
+        (
+            "set_temperature",
+            {ATTR_TEMPERATURE: 27},
+            "async_command",
+            call(CommandKind.TEMPERATURE, 27.0),
+        ),
+        (
+            "set_fan_mode",
+            {ATTR_FAN_MODE: "high"},
+            "async_command",
+            call(CommandKind.FAN, FanMode.HIGH),
+        ),
+        (
+            "set_swing_mode",
+            {ATTR_SWING_MODE: "both"},
+            "async_command",
+            call(CommandKind.SWING, SwingMode.BOTH),
+        ),
+        (
+            "set_preset_mode",
+            {ATTR_PRESET_MODE: "windfree"},
+            "async_command",
+            call(CommandKind.PRESET, PresetMode.WINDFREE),
+        ),
+    ],
+)
+async def test_real_climate_services_delegate_once(
+    live_climate_entity,
+    hass,
+    service,
+    data,
+    coordinator_method,
+    expected,
+) -> None:
+    entity_id, coordinator = live_climate_entity
+    target = getattr(coordinator, coordinator_method)
+
+    await hass.services.async_call(
+        "climate",
+        service,
+        {ATTR_ENTITY_ID: entity_id, **data},
+        blocking=True,
+    )
+
+    assert target.await_count == 1
+    assert target.await_args == expected
+    other_methods = {
+        coordinator.async_command,
+        coordinator.async_set_hvac_mode,
+        coordinator.async_turn_on,
+        coordinator.async_turn_off,
+    } - {target}
+    for other in other_methods:
+        other.assert_not_awaited()
+
+
+async def test_real_service_schema_rejects_invalid_mode_before_entity(
+    live_climate_entity, hass
+) -> None:
+    entity_id, coordinator = live_climate_entity
+
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            "climate",
+            "set_hvac_mode",
+            {ATTR_ENTITY_ID: entity_id, ATTR_HVAC_MODE: "warmest"},
+            blocking=True,
+        )
+
+    coordinator.async_set_hvac_mode.assert_not_awaited()
+
+
+async def test_real_unavailable_entity_is_not_called(live_climate_entity, hass) -> None:
+    entity_id, coordinator = live_climate_entity
+    coordinator.data = replace(coordinator.data, available=False)
+    listener = coordinator.async_add_listener.call_args.args[0]
+    listener()
+    await hass.async_block_till_done()
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == "unavailable"
+
+    await hass.services.async_call(
+        "climate",
+        "set_fan_mode",
+        {ATTR_ENTITY_ID: entity_id, ATTR_FAN_MODE: "low"},
+        blocking=True,
+    )
+
+    coordinator.async_command.assert_not_awaited()

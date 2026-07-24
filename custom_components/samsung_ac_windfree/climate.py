@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
-from typing import Any, ClassVar
+from types import MappingProxyType
+from typing import Any
 
 from homeassistant.components.climate import (
     ATTR_TEMPERATURE,
@@ -31,41 +32,53 @@ from .models import (
     SwingMode,
 )
 
-HVAC_TO_HA = {
-    HvacMode.AUTO: HVACMode.AUTO,
-    HvacMode.COOL: HVACMode.COOL,
-    HvacMode.DRY: HVACMode.DRY,
-    HvacMode.FAN: HVACMode.FAN_ONLY,
-    HvacMode.HEAT: HVACMode.HEAT,
-}
-FAN_TO_HA = {
-    FanMode.AUTO: "auto",
-    FanMode.LOW: "low",
-    FanMode.MEDIUM: "medium",
-    FanMode.HIGH: "high",
-    FanMode.TURBO: "turbo",
-}
-SWING_TO_HA = {
-    SwingMode.FIXED: "fixed",
-    SwingMode.VERTICAL: "vertical",
-    SwingMode.HORIZONTAL: "horizontal",
-    SwingMode.BOTH: "both",
-}
-PRESET_TO_HA = {
-    PresetMode.NONE: "none",
-    PresetMode.QUIET: "quiet",
-    PresetMode.SMART: "smart",
-    PresetMode.BOOST: "boost",
-    PresetMode.WINDFREE: "windfree",
-    PresetMode.WINDFREE_SLEEP: "windfree_sleep",
-    PresetMode.SLEEP: "sleep",
-    PresetMode.DRY_COMFORT: "dry_comfort",
-}
+HVAC_TO_HA = MappingProxyType(
+    {
+        HvacMode.AUTO: HVACMode.AUTO,
+        HvacMode.COOL: HVACMode.COOL,
+        HvacMode.DRY: HVACMode.DRY,
+        HvacMode.FAN: HVACMode.FAN_ONLY,
+        HvacMode.HEAT: HVACMode.HEAT,
+    }
+)
+FAN_TO_HA = MappingProxyType(
+    {
+        FanMode.AUTO: "auto",
+        FanMode.LOW: "low",
+        FanMode.MEDIUM: "medium",
+        FanMode.HIGH: "high",
+        FanMode.TURBO: "turbo",
+    }
+)
+SWING_TO_HA = MappingProxyType(
+    {
+        SwingMode.FIXED: "fixed",
+        SwingMode.VERTICAL: "vertical",
+        SwingMode.HORIZONTAL: "horizontal",
+        SwingMode.BOTH: "both",
+    }
+)
+PRESET_TO_HA = MappingProxyType(
+    {
+        PresetMode.NONE: "none",
+        PresetMode.QUIET: "quiet",
+        PresetMode.SMART: "smart",
+        PresetMode.BOOST: "boost",
+        PresetMode.WINDFREE: "windfree",
+        PresetMode.WINDFREE_SLEEP: "windfree_sleep",
+        PresetMode.SLEEP: "sleep",
+        PresetMode.DRY_COMFORT: "dry_comfort",
+    }
+)
 
-_HA_TO_HVAC = {value: key for key, value in HVAC_TO_HA.items()}
-_HA_TO_FAN = {value: key for key, value in FAN_TO_HA.items()}
-_HA_TO_SWING = {value: key for key, value in SWING_TO_HA.items()}
-_HA_TO_PRESET = {value: key for key, value in PRESET_TO_HA.items()}
+_HA_TO_HVAC = MappingProxyType({value: key for key, value in HVAC_TO_HA.items()})
+_HA_TO_FAN = MappingProxyType({value: key for key, value in FAN_TO_HA.items()})
+_HA_TO_SWING = MappingProxyType({value: key for key, value in SWING_TO_HA.items()})
+_HA_TO_PRESET = MappingProxyType({value: key for key, value in PRESET_TO_HA.items()})
+_HVAC_MODES = (HVACMode.OFF, *HVAC_TO_HA.values())
+_FAN_MODES = tuple(FAN_TO_HA.values())
+_SWING_MODES = tuple(SWING_TO_HA.values())
+_PRESET_MODES = tuple(PRESET_TO_HA.values())
 _MODE_GATED = frozenset(
     {
         CommandKind.TEMPERATURE,
@@ -83,6 +96,20 @@ def _translated_error(key: str) -> HomeAssistantError:
     )
 
 
+def _raise_translated(key: str) -> None:
+    try:
+        raise _translated_error(key) from None
+    finally:
+        key = ""
+
+
+def _raise_cancelled(args: tuple[object, ...]) -> None:
+    try:
+        raise asyncio.CancelledError(*args) from None
+    finally:
+        args = ()
+
+
 class WindFreeClimate(WindFreeEntity, ClimateEntity):
     """Expose local state and delegate every write to the coordinator."""
 
@@ -91,13 +118,6 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
     _attr_min_temp = 16.0
     _attr_max_temp = 30.0
     _attr_target_temperature_step = 1.0
-    _attr_hvac_modes: ClassVar[list[HVACMode]] = [
-        HVACMode.OFF,
-        *HVAC_TO_HA.values(),
-    ]
-    _attr_fan_modes: ClassVar[list[str]] = list(FAN_TO_HA.values())
-    _attr_swing_modes: ClassVar[list[str]] = list(SWING_TO_HA.values())
-    _attr_preset_modes: ClassVar[list[str]] = list(PRESET_TO_HA.values())
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.FAN_MODE
@@ -113,6 +133,10 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
 
         climate = self.coordinator.data.climate
         return HVAC_TO_HA[climate.mode] if climate.power else HVACMode.OFF
+
+    @property
+    def hvac_modes(self) -> list[HVACMode]:
+        return list(_HVAC_MODES)
 
     @property
     def current_temperature(self) -> float | None:
@@ -131,12 +155,24 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
         return FAN_TO_HA[self.coordinator.data.climate.fan_mode]
 
     @property
+    def fan_modes(self) -> list[str]:
+        return list(_FAN_MODES)
+
+    @property
     def swing_mode(self) -> str:
         return SWING_TO_HA[self.coordinator.data.climate.swing_mode]
 
     @property
+    def swing_modes(self) -> list[str]:
+        return list(_SWING_MODES)
+
+    @property
     def preset_mode(self) -> str:
         return PRESET_TO_HA[self.coordinator.data.climate.preset_mode]
+
+    @property
+    def preset_modes(self) -> list[str]:
+        return list(_PRESET_MODES)
 
     def _require_compatible(self, kind: CommandKind) -> None:
         if kind not in _MODE_GATED:
@@ -145,18 +181,22 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
         if kind.value not in self.coordinator.data.contract.mode_controls.get(
             mode, frozenset()
         ):
-            raise _translated_error("command_incompatible") from None
+            _raise_translated("command_incompatible")
 
     async def _async_delegate(
         self,
-        operation: Callable[..., Awaitable[None]],
+        operation: Callable[..., Awaitable[None]] | None,
         *args: object,
     ) -> None:
         failure: str | None = None
+        cancellation_args: tuple[object, ...] | None = None
         try:
+            assert operation is not None
             await operation(*args)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as error:
+            cancellation_args = error.args
+            error.__traceback__ = None
+            error = None
         except CommandRejected as error:
             category = str(error)
             failure = (
@@ -169,24 +209,44 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
                 }
                 else "command_failed"
             )
+            category = None
             error.__traceback__ = None
             error = None
+        operation = None
+        args = ()
+        if cancellation_args is not None:
+            try:
+                _raise_cancelled(cancellation_args)
+            finally:
+                cancellation_args = None
         if failure is not None:
-            raise _translated_error(failure) from None
+            try:
+                _raise_translated(failure)
+            finally:
+                failure = None
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if not isinstance(hvac_mode, HVACMode):
-            raise _translated_error("invalid_command") from None
+            hvac_mode = HVACMode.OFF
+            _raise_translated("invalid_command")
         if hvac_mode is HVACMode.OFF:
-            await self._async_delegate(self.coordinator.async_turn_off)
+            try:
+                await self._async_delegate(self.coordinator.async_turn_off)
+            finally:
+                hvac_mode = HVACMode.OFF
             return
         domain_mode = _HA_TO_HVAC.get(hvac_mode)
         if domain_mode is None:
-            raise _translated_error("invalid_command") from None
-        await self._async_delegate(
-            self.coordinator.async_set_hvac_mode,
-            domain_mode,
-        )
+            hvac_mode = HVACMode.OFF
+            _raise_translated("invalid_command")
+        try:
+            await self._async_delegate(
+                self.coordinator.async_set_hvac_mode,
+                domain_mode,
+            )
+        finally:
+            hvac_mode = HVACMode.OFF
+            domain_mode = None
 
     async def async_turn_on(self) -> None:
         await self._async_delegate(self.coordinator.async_turn_on)
@@ -203,46 +263,67 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
             or not math.isfinite(value)
             or not float(value).is_integer()
         ):
-            raise _translated_error("invalid_temperature") from None
-        self._require_compatible(CommandKind.TEMPERATURE)
-        await self._async_delegate(
-            self.coordinator.async_command,
-            CommandKind.TEMPERATURE,
-            float(value),
-        )
+            value = None
+            kwargs.clear()
+            _raise_translated("invalid_temperature")
+        try:
+            self._require_compatible(CommandKind.TEMPERATURE)
+            await self._async_delegate(
+                self.coordinator.async_command,
+                CommandKind.TEMPERATURE,
+                float(value),
+            )
+        finally:
+            value = None
+            kwargs.clear()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         value = _HA_TO_FAN.get(fan_mode) if isinstance(fan_mode, str) else None
         if value is None:
-            raise _translated_error("invalid_command") from None
-        self._require_compatible(CommandKind.FAN)
-        await self._async_delegate(
-            self.coordinator.async_command,
-            CommandKind.FAN,
-            value,
-        )
+            fan_mode = ""
+            _raise_translated("invalid_command")
+        try:
+            self._require_compatible(CommandKind.FAN)
+            await self._async_delegate(
+                self.coordinator.async_command,
+                CommandKind.FAN,
+                value,
+            )
+        finally:
+            fan_mode = ""
+            value = None
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         value = _HA_TO_SWING.get(swing_mode) if isinstance(swing_mode, str) else None
         if value is None:
-            raise _translated_error("invalid_command") from None
-        self._require_compatible(CommandKind.SWING)
-        await self._async_delegate(
-            self.coordinator.async_command,
-            CommandKind.SWING,
-            value,
-        )
+            swing_mode = ""
+            _raise_translated("invalid_command")
+        try:
+            self._require_compatible(CommandKind.SWING)
+            await self._async_delegate(
+                self.coordinator.async_command,
+                CommandKind.SWING,
+                value,
+            )
+        finally:
+            swing_mode = ""
+            value = None
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         value = _HA_TO_PRESET.get(preset_mode) if isinstance(preset_mode, str) else None
         if value is None:
-            raise _translated_error("invalid_command") from None
-        self._require_compatible(CommandKind.PRESET)
-        await self._async_delegate(
-            self.coordinator.async_command,
-            CommandKind.PRESET,
-            value,
-        )
+            preset_mode = ""
+            _raise_translated("invalid_command")
+        try:
+            self._require_compatible(CommandKind.PRESET)
+            await self._async_delegate(
+                self.coordinator.async_command,
+                CommandKind.PRESET,
+                value,
+            )
+        finally:
+            preset_mode = ""
+            value = None
 
 
 async def async_setup_entry(
