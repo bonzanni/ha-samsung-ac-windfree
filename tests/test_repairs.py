@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.components.repairs import repairs_flow_manager
+from homeassistant.config_entries import ConfigEntryDisabler
 from homeassistant.data_entry_flow import FlowResultType, UnknownStep
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.setup import async_setup_component
@@ -253,3 +254,71 @@ async def test_repair_flows_reauthenticate_only_affected_entries(hass) -> None:
 
     assert affected.async_start_reauth.call_count == 2
     healthy.async_start_reauth.assert_not_called()
+
+
+async def test_disabled_entry_is_purged_and_never_selected_by_fix_flows(
+    hass,
+) -> None:
+    from custom_components.samsung_ac_windfree.coordinator import CoordinatorHealth
+    from custom_components.samsung_ac_windfree.models import UpdateSource
+    from custom_components.samsung_ac_windfree.repairs import (
+        async_create_fix_flow,
+        async_sync_certificate_issue,
+        async_sync_runtime_issues,
+    )
+
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        disabled_by=ConfigEntryDisabler.USER,
+        data={"not_after": (now + timedelta(days=30)).isoformat()},
+    )
+    entry.add_to_hass(hass)
+    entry.async_start_reauth = MagicMock()
+    health = CoordinatorHealth(
+        available=False,
+        generation=1,
+        connection_reason=None,
+        failure_count=0,
+        reconnect_attempts=0,
+        reconnect_delay_seconds=0,
+        authentication_rejected=True,
+        port_range_exhausted=False,
+        resource_contract_changed=False,
+        unsupported_identity_after_update=False,
+        source=UpdateSource.NONE,
+        hot_age_seconds=0,
+        poll_count=0,
+        observe_count=0,
+        reconcile_count=0,
+        command_count=0,
+        latency_under_100ms=0,
+        latency_under_500ms=0,
+        latency_under_1s=0,
+        latency_at_least_1s=0,
+    )
+    async_sync_runtime_issues(hass, entry.entry_id, health)
+    async_sync_certificate_issue(
+        hass,
+        entry.entry_id,
+        now + timedelta(days=30),
+        now=now,
+    )
+
+    auth_flow = await async_create_fix_flow(hass, "authentication_rejected", None)
+    auth_flow.hass = hass
+    auth_result = await auth_flow.async_step_confirm({})
+    with patch(
+        "custom_components.samsung_ac_windfree.repairs.dt_util.utcnow",
+        return_value=now,
+    ):
+        cert_flow = await async_create_fix_flow(hass, "certificate_expiring", None)
+        cert_flow.hass = hass
+        cert_result = await cert_flow.async_step_confirm({})
+
+    assert auth_result["type"] is FlowResultType.ABORT
+    assert cert_result["type"] is FlowResultType.ABORT
+    entry.async_start_reauth.assert_not_called()
+    registry = ir.async_get(hass)
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is None
+    assert registry.async_get_issue(DOMAIN, "certificate_expiring") is None

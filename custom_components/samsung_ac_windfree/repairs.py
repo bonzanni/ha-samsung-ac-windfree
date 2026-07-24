@@ -46,21 +46,20 @@ class _EntryRepairState:
 @dataclass(slots=True)
 class _RepairStateStore:
     entries: dict[str, _EntryRepairState]
-    pending: set[str]
+    runtime_pending: set[str]
+    certificate_pending: set[str]
 
 
 def _store(hass: HomeAssistant) -> _RepairStateStore:
     existing = hass.data.get(_REPAIR_STATE_DATA)
     if isinstance(existing, _RepairStateStore):
         return existing
-    created = _RepairStateStore(
-        {},
-        {
-            entry.entry_id
-            for entry in hass.config_entries.async_entries(DOMAIN)
-            if entry.disabled_by is None
-        },
-    )
+    pending = {
+        entry.entry_id
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.disabled_by is None
+    }
+    created = _RepairStateStore({}, set(pending), set(pending))
     hass.data[_REPAIR_STATE_DATA] = created
     return created
 
@@ -70,7 +69,7 @@ def _relevant_entry_ids(
     store: _RepairStateStore,
 ) -> set[str]:
     del hass
-    return set(store.entries) | store.pending
+    return set(store.entries) | store.runtime_pending | store.certificate_pending
 
 
 def _sync_issue(
@@ -109,12 +108,19 @@ def _sync_aggregate_issue(
         getattr(store.entries.get(entry_id, _EntryRepairState()), field)
         for entry_id in relevant
     ]
+    pending = (
+        store.certificate_pending
+        if field == "certificate_expiring"
+        else store.runtime_pending
+    )
     if any(value is True for value in values):
         active: bool | None = True
-    elif not relevant or all(value is False for value in values):
+    elif not relevant:
         active = False
-    else:
+    elif relevant & pending or not all(value is False for value in values):
         active = None
+    else:
+        active = False
     if active is not None:
         _sync_issue(
             hass,
@@ -179,7 +185,7 @@ def async_sync_runtime_issues(
     """Synchronize fixed runtime issue transitions without device I/O."""
 
     store = _store(hass)
-    store.pending.discard(entry_id)
+    store.runtime_pending.discard(entry_id)
     prior = store.entries.get(entry_id, _EntryRepairState())
     store.entries[entry_id] = replace(
         prior,
@@ -193,15 +199,36 @@ def async_sync_runtime_issues(
     _sync_entry_aggregates(hass, store)
 
 
-def async_remove_entry_issues(
+def async_handle_entry_unload(
+    hass: HomeAssistant,
+    entry_id: str,
+    *,
+    enabled: bool,
+) -> None:
+    """Preserve enabled reload state, or purge a disabled entry."""
+
+    store = _store(hass)
+    if enabled:
+        store.entries.setdefault(entry_id, _EntryRepairState())
+        store.runtime_pending.add(entry_id)
+        store.certificate_pending.add(entry_id)
+    else:
+        store.entries.pop(entry_id, None)
+        store.runtime_pending.discard(entry_id)
+        store.certificate_pending.discard(entry_id)
+    _sync_entry_aggregates(hass, store)
+
+
+def async_purge_entry_issues(
     hass: HomeAssistant,
     entry_id: str,
 ) -> None:
-    """Forget one successfully unloaded entry and recompute aggregates."""
+    """Permanently remove all private repair state for one entry."""
 
     store = _store(hass)
     store.entries.pop(entry_id, None)
-    store.pending.discard(entry_id)
+    store.runtime_pending.discard(entry_id)
+    store.certificate_pending.discard(entry_id)
     _sync_entry_aggregates(hass, store)
 
 
@@ -243,7 +270,7 @@ def async_sync_certificate_issue(
         and expires - now <= CERT_REPAIR_WINDOW
     )
     store = _store(hass)
-    store.pending.discard(entry_id)
+    store.certificate_pending.discard(entry_id)
     prior = store.entries.get(entry_id, _EntryRepairState())
     store.entries[entry_id] = replace(
         prior,
@@ -263,6 +290,28 @@ def _affected_entry_ids(
         for entry_id in relevant
         if getattr(store.entries.get(entry_id, _EntryRepairState()), field) is True
     }
+
+
+def _enabled_configured_entries(hass: HomeAssistant) -> list:
+    store = _store(hass)
+    enabled = []
+    changed = False
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.disabled_by is None:
+            enabled.append(entry)
+            continue
+        if (
+            entry.entry_id in store.entries
+            or entry.entry_id in store.runtime_pending
+            or entry.entry_id in store.certificate_pending
+        ):
+            store.entries.pop(entry.entry_id, None)
+            store.runtime_pending.discard(entry.entry_id)
+            store.certificate_pending.discard(entry.entry_id)
+            changed = True
+    if changed:
+        _sync_entry_aggregates(hass, store)
+    return enabled
 
 
 def _certificate_expiration(data: Mapping[str, object]) -> datetime | None:
@@ -311,7 +360,7 @@ class CertificateExpiryRepairFlow(RepairsFlow):
                 data_schema=vol.Schema({}),
             )
         now = dt_util.utcnow()
-        configured = self.hass.config_entries.async_entries(DOMAIN)
+        configured = _enabled_configured_entries(self.hass)
         for entry in configured:
             async_sync_certificate_issue(
                 self.hass,
@@ -358,12 +407,9 @@ class AuthenticationRejectedRepairFlow(RepairsFlow):
                 step_id="confirm",
                 data_schema=vol.Schema({}),
             )
+        configured = _enabled_configured_entries(self.hass)
         affected = _affected_entry_ids(self.hass, "authentication_rejected")
-        entries = [
-            entry
-            for entry in self.hass.config_entries.async_entries(DOMAIN)
-            if entry.entry_id in affected
-        ]
+        entries = [entry for entry in configured if entry.entry_id in affected]
         if not entries:
             ir.async_delete_issue(self.hass, DOMAIN, _AUTHENTICATION_REJECTED)
             return self.async_abort(reason="issue_resolved")

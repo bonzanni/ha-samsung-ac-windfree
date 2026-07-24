@@ -23,7 +23,7 @@ from custom_components.samsung_ac_windfree.diagnostics import (
 )
 from custom_components.samsung_ac_windfree.models import UpdateSource, WindFreeData
 from custom_components.samsung_ac_windfree.repairs import (
-    async_remove_entry_issues,
+    async_purge_entry_issues,
     async_sync_bootstrap_issue,
     async_sync_certificate_issue,
     async_sync_runtime_issues,
@@ -392,7 +392,7 @@ async def test_multi_entry_runtime_issue_aggregates_and_unload_recomputes(
     async_sync_runtime_issues(hass, healthy_entry.entry_id, healthy)
     assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
 
-    async_remove_entry_issues(hass, unhealthy_entry.entry_id)
+    async_purge_entry_issues(hass, unhealthy_entry.entry_id)
     assert registry.async_get_issue(DOMAIN, "authentication_rejected") is None
 
 

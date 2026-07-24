@@ -27,7 +27,8 @@ from .models import (
     UnsupportedDevice,
 )
 from .repairs import (
-    async_remove_entry_issues,
+    async_handle_entry_unload,
+    async_purge_entry_issues,
     async_sync_certificate_issue,
     async_sync_runtime_issues,
 )
@@ -411,7 +412,11 @@ async def async_unload_entry(
     cancellation_args = shutdown.cancellation_args
     completed = shutdown.completed
     if completed:
-        async_remove_entry_issues(hass, entry.entry_id)
+        async_handle_entry_unload(
+            hass,
+            entry.entry_id,
+            enabled=entry.disabled_by is None,
+        )
     shutdown = None
     lifecycle = None
     coordinator = None
@@ -425,6 +430,15 @@ async def async_unload_entry(
     if not completed:
         raise ConfigEntryError("unload_failed") from None
     return True
+
+
+async def async_remove_entry(
+    hass: HomeAssistant,
+    entry: WindFreeConfigEntry,
+) -> None:
+    """Purge private repair state after permanent config-entry removal."""
+
+    async_purge_entry_issues(hass, entry.entry_id)
 
 
 async def async_migrate_entry(

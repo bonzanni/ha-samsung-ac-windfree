@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.config_entries import (
     ConfigEntryAuthFailed,
+    ConfigEntryDisabler,
     ConfigEntryError,
     ConfigEntryNotReady,
 )
@@ -817,6 +818,49 @@ async def test_failed_platform_unload_keeps_coordinator_running(
     coordinator.async_shutdown.assert_not_awaited()
 
 
+async def test_failed_unload_retains_active_private_repair_state(
+    hass,
+    credentials,
+) -> None:
+    from custom_components.samsung_ac_windfree import async_unload_entry
+    from custom_components.samsung_ac_windfree.repairs import (
+        _store,
+        async_sync_runtime_issues,
+    )
+
+    entry = _entry(credentials)
+    entry.add_to_hass(hass)
+    async_sync_runtime_issues(
+        hass,
+        entry.entry_id,
+        SimpleNamespace(
+            authentication_rejected=True,
+            resource_contract_changed=False,
+            unsupported_identity_after_update=False,
+            port_range_exhausted=False,
+        ),
+    )
+    coordinator = MagicMock()
+    coordinator.async_shutdown = AsyncMock()
+    entry.runtime_data = coordinator
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=False),
+    ):
+        assert not await async_unload_entry(hass, entry)
+
+    store = _store(hass)
+    assert store.entries[entry.entry_id].authentication_rejected is True
+    assert entry.entry_id not in store.runtime_pending
+    assert (
+        ir.async_get(hass).async_get_issue(DOMAIN, "authentication_rejected")
+        is not None
+    )
+    coordinator.async_shutdown.assert_not_awaited()
+
+
 async def test_successful_unload_removes_only_its_private_repair_state(
     hass,
     credentials,
@@ -828,7 +872,13 @@ async def test_successful_unload_removes_only_its_private_repair_state(
     )
 
     healthy_entry = _entry(credentials)
-    unhealthy_entry = _entry(credentials)
+    unhealthy_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=DEVICE_ID,
+        data=_entry_data(credentials),
+        version=1,
+        disabled_by=ConfigEntryDisabler.USER,
+    )
     healthy_entry.add_to_hass(hass)
     unhealthy_entry.add_to_hass(hass)
     healthy = SimpleNamespace(
@@ -859,8 +909,121 @@ async def test_successful_unload_removes_only_its_private_repair_state(
     assert ir.async_get(hass).async_get_issue(DOMAIN, "authentication_rejected") is None
     store = _store(hass)
     assert unhealthy_entry.entry_id not in store.entries
-    assert unhealthy_entry.entry_id not in store.pending
+    assert unhealthy_entry.entry_id not in store.runtime_pending
+    assert unhealthy_entry.entry_id not in store.certificate_pending
     coordinator.async_shutdown.assert_awaited_once_with()
+
+
+async def test_enabled_reload_preserves_issue_until_runtime_is_evaluated(
+    hass,
+    credentials,
+) -> None:
+    from custom_components.samsung_ac_windfree import (
+        async_setup_entry,
+        async_unload_entry,
+    )
+    from custom_components.samsung_ac_windfree.repairs import (
+        _store,
+        async_sync_runtime_issues,
+    )
+
+    entry = _entry(credentials)
+    entry.add_to_hass(hass)
+    rejected = SimpleNamespace(
+        authentication_rejected=True,
+        resource_contract_changed=False,
+        unsupported_identity_after_update=False,
+        port_range_exhausted=False,
+    )
+    async_sync_runtime_issues(hass, entry.entry_id, rejected)
+    old_coordinator = MagicMock()
+    old_coordinator.async_shutdown = AsyncMock()
+    entry.runtime_data = old_coordinator
+
+    with patch.object(
+        hass.config_entries,
+        "async_unload_platforms",
+        new=AsyncMock(return_value=True),
+    ):
+        assert await async_unload_entry(hass, entry)
+
+    registry = ir.async_get(hass)
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
+    store = _store(hass)
+    assert entry.entry_id in store.runtime_pending
+    assert entry.entry_id in store.certificate_pending
+
+    failed = MagicMock()
+    failed.async_start = AsyncMock(side_effect=RuntimeError("offline"))
+    failed.async_shutdown = AsyncMock()
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=failed,
+        ),
+        pytest.raises(ConfigEntryNotReady, match="setup_failed"),
+    ):
+        await async_setup_entry(hass, entry)
+
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is not None
+    assert entry.entry_id in store.runtime_pending
+
+    healthy = MagicMock()
+    healthy.async_start = AsyncMock()
+    healthy.async_shutdown = AsyncMock()
+    healthy.async_add_listener.return_value = MagicMock()
+    healthy.authentication_rejected = False
+    healthy.health.authentication_rejected = False
+    healthy.health.resource_contract_changed = False
+    healthy.health.unsupported_identity_after_update = False
+    healthy.health.port_range_exhausted = False
+    with (
+        patch(
+            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
+            return_value=healthy,
+        ),
+        patch.object(
+            hass.config_entries,
+            "async_forward_entry_setups",
+            new=AsyncMock(),
+        ),
+    ):
+        assert await async_setup_entry(hass, entry)
+
+    assert registry.async_get_issue(DOMAIN, "authentication_rejected") is None
+    assert entry.entry_id not in store.runtime_pending
+
+
+async def test_permanent_entry_removal_purges_private_repair_state(
+    hass,
+    credentials,
+) -> None:
+    from custom_components.samsung_ac_windfree import async_remove_entry
+    from custom_components.samsung_ac_windfree.repairs import (
+        _store,
+        async_sync_runtime_issues,
+    )
+
+    entry = _entry(credentials)
+    entry.add_to_hass(hass)
+    async_sync_runtime_issues(
+        hass,
+        entry.entry_id,
+        SimpleNamespace(
+            authentication_rejected=True,
+            resource_contract_changed=False,
+            unsupported_identity_after_update=False,
+            port_range_exhausted=False,
+        ),
+    )
+
+    await async_remove_entry(hass, entry)
+
+    store = _store(hass)
+    assert entry.entry_id not in store.entries
+    assert entry.entry_id not in store.runtime_pending
+    assert entry.entry_id not in store.certificate_pending
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "authentication_rejected") is None
 
 
 async def test_update_listener_reloads_entry(hass, credentials) -> None:
