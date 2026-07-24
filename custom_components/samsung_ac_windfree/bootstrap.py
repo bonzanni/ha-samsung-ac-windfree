@@ -46,6 +46,12 @@ _PEM_BLOCK = re.compile(
     rb"[A-Za-z0-9+/=\r\n]+"
     rb"-----END \1-----\r?\n?"
 )
+_OPENSSL_FRIENDLY_NAME = re.compile(rb"    friendlyName: [\x20-\x7e]+")
+_OPENSSL_LOCAL_KEY_ID = re.compile(
+    rb"    localKeyID: [0-9A-Fa-f]{2}(?: [0-9A-Fa-f]{2})* *"
+)
+_OPENSSL_DISTINGUISHED_NAME = re.compile(rb"(?:subject|issuer)=[\x20-\x7e]+")
+_MAX_OPENSSL_METADATA_SIZE = 1024
 _UUID_OU = re.compile(
     r"uuid:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
@@ -278,11 +284,28 @@ def _has_exact_name_attributes(actual: x509.Name, expected: x509.Name) -> bool:
     )
 
 
+def _is_openssl_metadata(gap: bytes) -> bool:
+    """Accept only the bounded OpenSSL PKCS#12 annotations in the pinned file."""
+    if len(gap) > _MAX_OPENSSL_METADATA_SIZE:
+        return False
+    lines = [line for line in gap.replace(b"\r\n", b"\n").split(b"\n") if line]
+    if not lines or lines[0] != b"Bag Attributes":
+        return False
+    return all(
+        line == b"Key Attributes: <No Attributes>"
+        or _OPENSSL_FRIENDLY_NAME.fullmatch(line) is not None
+        or _OPENSSL_LOCAL_KEY_ID.fullmatch(line) is not None
+        or _OPENSSL_DISTINGUISHED_NAME.fullmatch(line) is not None
+        for line in lines[1:]
+    )
+
+
 def _parse_exact_pem(data: bytes) -> tuple[bytes, tuple[bytes, ...]]:
     blocks: list[tuple[bytes, bytes]] = []
     position = 0
     for match in _PEM_BLOCK.finditer(data):
-        if data[position : match.start()].strip():
+        gap = data[position : match.start()]
+        if gap.strip() and not _is_openssl_metadata(gap):
             raise _invalid_material()
         blocks.append((match.group(1), match.group(0)))
         position = match.end()

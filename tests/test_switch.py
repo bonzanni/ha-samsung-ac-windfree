@@ -39,7 +39,7 @@ def coordinator() -> MagicMock:
             device_id=DEVICE_ID,
             model="AR60F12C1AWNEU",
             device_type="oic.d.airconditioner",
-            firmware="TP1X_DA-AC-RAC-01001_001",
+            firmware="TP1X_DA-AC-RAC-01001_0000",
             platform="TizenRT 4.0",
         ),
         auto_clean=True,
@@ -116,9 +116,21 @@ def test_switches_project_snapshot_without_io(switches, coordinator) -> None:
 
     assert switches["auto_clean"].is_on is True
     assert switches["display_light"].is_on is False
-    assert switches["auto_clean"].available
+    assert not switches["auto_clean"].available
     assert switches["display_light"].available
     coordinator.async_command.assert_not_awaited()
+
+
+def test_auto_clean_is_available_only_while_operating(
+    switches,
+    coordinator,
+) -> None:
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, power=True),
+    )
+
+    assert switches["auto_clean"].available
 
 
 @pytest.mark.parametrize("key", ["auto_clean", "display_light"])
@@ -181,6 +193,13 @@ async def test_switch_cancellation_preserves_args_and_scrubs_traceback(
 
 async def test_real_switch_services_delegate_once(live_switches, hass) -> None:
     entities, coordinator = live_switches
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, power=True),
+    )
+    for registered in coordinator.async_add_listener.call_args_list:
+        registered.args[0]()
+    await hass.async_block_till_done()
 
     await hass.services.async_call(
         Platform.SWITCH,
@@ -205,11 +224,12 @@ async def test_real_switch_state_tracks_coordinator_and_availability(
     live_switches, hass
 ) -> None:
     entities, coordinator = live_switches
-    assert hass.states.get(entities["auto_clean"]).state == "on"  # type: ignore[union-attr]
+    assert hass.states.get(entities["auto_clean"]).state == "unavailable"  # type: ignore[union-attr]
     assert hass.states.get(entities["display_light"]).state == "off"  # type: ignore[union-attr]
 
     coordinator.data = replace(
         coordinator.data,
+        climate=replace(coordinator.data.climate, power=True),
         auto_clean=False,
         display_light=None,
     )

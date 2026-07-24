@@ -46,6 +46,7 @@ from .models import (
     CommandRejected,
     Credentials,
     HvacMode,
+    PresetMode,
     UnsupportedDevice,
     UpdateSource,
     WindFreeData,
@@ -75,6 +76,14 @@ WARM_PATHS = (
 )
 COLD_PATHS = (FILTER_PATH, CURRENT_LIMIT_PATH)
 RECONCILE_PATHS = ("/oic/d", "/oic/p", "/device/0")
+MODE_SETTLE_SECONDS = 2.0
+
+_PRESETS_BY_MODE = {
+    HvacMode.COOL: frozenset(
+        preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
+    ),
+    HvacMode.DRY: frozenset({PresetMode.NONE, PresetMode.DRY_COMFORT}),
+}
 
 _OBSERVE_PATHS = HOT_PATHS + WARM_PATHS
 _ALL_WRITE_PATHS = frozenset(
@@ -1635,7 +1644,11 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         ):
             raise asyncio.CancelledError
 
-    def _validate_command_allowed(self, kind: CommandKind) -> None:
+    def _validate_command_allowed(
+        self,
+        kind: CommandKind,
+        value: object,
+    ) -> None:
         if self._shutting_down or self._transport is None:
             raise CommandRejected("command_unavailable")
         probe = build_command(
@@ -1660,6 +1673,12 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                 self.data.climate.mode, frozenset()
             )
         ):
+            raise CommandRejected("command_incompatible")
+        if kind is CommandKind.PRESET and value not in _PRESETS_BY_MODE.get(
+            self.data.climate.mode, frozenset()
+        ):
+            raise CommandRejected("command_incompatible")
+        if kind is CommandKind.AUTO_CLEAN and not self.data.climate.power:
             raise CommandRejected("command_incompatible")
 
     async def _wait_for_observe(
@@ -1691,7 +1710,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         previous: WindFreeData | None = None,
     ) -> WindFreeData:
         self._require_command_epoch(epoch)
-        self._validate_command_allowed(kind)
+        self._validate_command_allowed(kind, value)
         authoritative: Mapping[str, object] | None = None
         fresh = (
             await self._async_read(TEMPERATURE_PATH)
@@ -1864,6 +1883,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
                             await self._async_command_locked(kind, value, epoch)
                         elif operation == "set_mode":
                             await self._async_set_hvac_mode_locked(value, epoch)
+                            await self._sleep(MODE_SETTLE_SECONDS)
                         elif operation == "turn_on":
                             await self._async_turn_on_locked(epoch)
                         else:

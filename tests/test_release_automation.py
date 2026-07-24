@@ -215,6 +215,9 @@ def test_changelog_release_evidence_is_counts_only() -> None:
     verification = changelog.split(marker, 1)[1]
     assert "local automated tests:" in verification
     assert "coverage:" in verification
-    assert "live AC gate: pending" in verification
+    assert "direct live AC identity/read/write/restoration matrix: passed" in (
+        verification
+    )
+    assert "Home Assistant production-console smoke: pending" in verification
     forbidden = ("192.168.", "uuid:", "BEGIN PRIVATE KEY", "/power/vs/")
     assert not any(value in verification for value in forbidden)

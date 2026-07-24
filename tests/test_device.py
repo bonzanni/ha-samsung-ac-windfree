@@ -61,20 +61,32 @@ def test_identity_parses_exact_supported_contract() -> None:
     assert identity.device_id == "00000000-0000-4000-8000-000000000001"
     assert identity.model == "AR60F12C1AWNEU"
     assert identity.device_type == "oic.d.airconditioner"
-    assert identity.firmware == "TP1X_DA-AC-RAC-01001_001"
+    assert identity.firmware == "TP1X_DA-AC-RAC-01001_0000"
     assert identity.platform == "TizenRT 4.0"
 
 
 @pytest.mark.parametrize(
     ("part", "field", "replacement"),
     [
-        ("oic_d", "mnmo", "AR60F12C1AWOTHER"),
         ("oic_d", "rt", ["oic.d.light"]),
-        ("oic_p", "mnpv", "TizenRT 3.0"),
+        ("oic_p", "mnpv", "SYSTEM 1.0"),
+        ("oic_p", "mnos", "TizenRT 3.0"),
+        ("oic_p", "mnfv", "ARA-KR-OLDER"),
         (
             "device_0",
             "/information/vs/0",
-            {"x.com.samsung.da.description": "OTHER_001"},
+            {
+                "x.com.samsung.da.description": "OTHER_001",
+                "x.com.samsung.da.modelNum": "OTHER_001|SANITIZED",
+            },
+        ),
+        (
+            "device_0",
+            "/information/vs/0",
+            {
+                "x.com.samsung.da.description": "TP1X_DA-AC-RAC-01001_0000",
+                "x.com.samsung.da.modelNum": "OTHER_001|SANITIZED",
+            },
         ),
     ],
 )
@@ -94,9 +106,10 @@ def test_identity_rejects_each_exact_product_gate(
     ("part", "field", "replacement"),
     [
         ("oic_d", "di", ""),
-        ("oic_d", "mnmo", True),
         ("oic_d", "rt", "oic.d.airconditioner"),
         ("oic_p", "mnpv", None),
+        ("oic_p", "mnos", None),
+        ("oic_p", "mnfv", None),
         ("device_0", "/information/vs/0", []),
     ],
 )
@@ -454,9 +467,9 @@ def test_validate_contract_accepts_exact_live_safe_write_contract() -> None:
     assert contract.mode_controls == {
         HvacMode.AUTO: frozenset(),
         HvacMode.COOL: frozenset({"temperature", "fan", "swing", "preset"}),
-        HvacMode.DRY: frozenset(),
+        HvacMode.DRY: frozenset({"preset"}),
         HvacMode.FAN: frozenset(),
-        HvacMode.HEAT: frozenset(),
+        HvacMode.HEAT: frozenset({"temperature"}),
     }
 
 

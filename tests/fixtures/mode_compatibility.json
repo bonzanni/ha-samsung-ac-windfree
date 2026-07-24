@@ -5,8 +5,8 @@
   "by_mode": {
     "Auto": [],
     "Cool": ["temperature", "fan", "swing", "preset"],
-    "Dry": [],
+    "Dry": ["preset"],
     "Fan": [],
-    "Heat": []
+    "Heat": ["temperature"]
   }
 }

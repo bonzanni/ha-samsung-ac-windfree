@@ -334,6 +334,67 @@ def test_bundle_rejects_malformed_extra_or_missing_pem_blocks(
         validate_bundle(data, pins=pins)
 
 
+def test_bundle_accepts_pinned_openssl_bag_metadata(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+) -> None:
+    key_metadata = (
+        b"Bag Attributes\n"
+        b"    friendlyName: synthetic key\n"
+        b"    localKeyID: 01 02 AB CD    \n"
+        b"Key Attributes: <No Attributes>\n"
+    )
+    certificate_metadata = (
+        b"Bag Attributes\n"
+        b"    friendlyName: synthetic certificate\n"
+        b"subject=C = KR, O = Samsung Electronics\n"
+        b"issuer=C = KR, O = Samsung Electronics\n"
+    )
+    data = bootstrap_inputs.bundle_bytes
+    data = data.replace(
+        b"-----BEGIN PRIVATE KEY-----",
+        key_metadata + b"-----BEGIN PRIVATE KEY-----",
+        1,
+    )
+    data = data.replace(
+        b"-----BEGIN CERTIFICATE-----",
+        certificate_metadata + b"-----BEGIN CERTIFICATE-----",
+    )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    validate_bundle(data, pins=pins)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        b"arbitrary metadata\n",
+        b"Bag Attributes\n    secretField: unexpected\n",
+        b"Bag Attributes\n    localKeyID: not-hex\n",
+    ],
+)
+def test_bundle_rejects_unrecognized_interstitial_metadata(
+    bootstrap_inputs: BootstrapInputs,
+    bootstrap_pins: BootstrapPins,
+    metadata: bytes,
+) -> None:
+    data = bootstrap_inputs.bundle_bytes.replace(
+        b"-----BEGIN PRIVATE KEY-----",
+        metadata + b"-----BEGIN PRIVATE KEY-----",
+        1,
+    )
+    pins = replace(
+        bootstrap_pins,
+        bundle_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+    with pytest.raises(BootstrapError, match="bootstrap_invalid_material"):
+        validate_bundle(data, pins=pins)
+
+
 def test_bundle_rejects_wrong_rsa_modulus(
     bootstrap_inputs: BootstrapInputs,
     bootstrap_pins: BootstrapPins,

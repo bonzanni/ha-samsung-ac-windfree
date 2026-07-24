@@ -27,6 +27,8 @@ from custom_components.samsung_ac_windfree.const import (
     SUPPORTED_FIRMWARE_PREFIX,
     SUPPORTED_MODEL,
     SUPPORTED_PLATFORM,
+    SUPPORTED_PLATFORM_FIRMWARE,
+    SUPPORTED_PRODUCT_VERSION,
 )
 from custom_components.samsung_ac_windfree.models import Credentials, UnsupportedDevice
 
@@ -86,6 +88,8 @@ def test_fixed_product_contract() -> None:
     assert SUPPORTED_DEVICE_TYPE == "oic.d.airconditioner"
     assert SUPPORTED_FIRMWARE_PREFIX == "TP1X_DA-AC-RAC-01001"
     assert SUPPORTED_PLATFORM == "TizenRT 4.0"
+    assert SUPPORTED_PRODUCT_VERSION == "SYSTEM 2.0"
+    assert SUPPORTED_PLATFORM_FIRMWARE == "ARA-KR-TP1-25-ARXX00_11260401"
     assert PROBE_PORTS == tuple(range(49152, 49161))
 
 
@@ -1602,7 +1606,8 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
 
     for phrase in (
         "AR60F12C1AWNEU",
-        "TP1X_DA-AC-RAC-01001_001",
+        "TP1X_DA-AC-RAC-01001_0000",
+        "does not report the consumer SKU",
         "fully local after setup",
         "unofficial certificate",
         "Home Assistant backups",
@@ -1672,7 +1677,7 @@ def test_release_metadata_matches_manifest_and_supported_scope() -> None:
     assert "## [0.1.0]" in changelog
     for phrase in (
         "AR60F12C1AWNEU",
-        "TP1X_DA-AC-RAC-01001_001",
+        "TP1X_DA-AC-RAC-01001_0000",
         "SmartThings",
         "Older models",
         "multi-device",

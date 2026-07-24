@@ -39,7 +39,7 @@ def coordinator() -> MagicMock:
             device_id=DEVICE_ID,
             model="AR60F12C1AWNEU",
             device_type="oic.d.airconditioner",
-            firmware="TP1X_DA-AC-RAC-01001_001",
+            firmware="TP1X_DA-AC-RAC-01001_0000",
             platform="TizenRT 4.0",
         ),
         filter=FilterState(attention=False),

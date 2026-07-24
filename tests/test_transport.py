@@ -290,6 +290,106 @@ async def test_get_decodes_complete_block2_result_and_normalizes_path(
     ]
 
 
+async def test_get_normalizes_live_ocf_device_directory(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+) -> None:
+    directory = [
+        {"rt": ["x.com.samsung.da.device"], "if": ["oic.if.baseline"]},
+        {
+            "href": "/power/vs/0",
+            "rep": {"x.com.samsung.da.power": "On"},
+        },
+        {
+            "href": "/mode/vs/0",
+            "rep": {"x.com.samsung.da.modes": ["Cool"]},
+        },
+    ]
+    session = FakeSession(
+        {
+            **encoded_resources,
+            "/device/0": cbor2.dumps(directory),
+        }
+    )
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    assert await transport.async_get("/device/0") == {
+        "/power/vs/0": {"x.com.samsung.da.power": "On"},
+        "/mode/vs/0": {"x.com.samsung.da.modes": ["Cool"]},
+    }
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [
+        [
+            {"rt": ["device"], "if": ["baseline"]},
+            {"href": "/power/vs/0", "rep": {}},
+            {"href": "/power/vs/0", "rep": {}},
+        ],
+        [
+            {"rt": ["device"], "if": ["baseline"]},
+            {"href": "/power/vs/0"},
+        ],
+        [
+            {"rt": ["device"], "if": ["baseline"]},
+            {"href": "power/vs/0", "rep": {}},
+        ],
+        [
+            {"rt": ["device"], "if": ["baseline"]},
+            {"href": "/power/vs/0", "rep": {1: "invalid"}},
+        ],
+        [
+            {"rt": ["device"], "if": ["baseline"]},
+            {"href": "/power/vs/0", "rep": {}, "unexpected": True},
+        ],
+        [
+            {"href": "/power/vs/0", "rep": {}},
+            {"rt": ["device"], "if": ["baseline"]},
+        ],
+    ],
+    ids=[
+        "duplicate-href",
+        "missing-representation",
+        "relative-href",
+        "non-string-representation-key",
+        "unexpected-envelope-key",
+        "descriptor-not-first",
+    ],
+)
+async def test_get_rejects_malformed_ocf_device_directory(
+    hass: HomeAssistant,
+    credentials: Credentials,
+    encoded_resources: dict[str, bytes],
+    directory: list[dict[object, object]],
+) -> None:
+    session = FakeSession(
+        {
+            **encoded_resources,
+            "/device/0": cbor2.dumps(directory),
+        }
+    )
+    transport = WindFreeTransport(
+        hass,
+        host="192.0.2.10",
+        port=49154,
+        credentials=credentials,
+        session_factory=lambda **_kwargs: session,
+    )
+    await transport.async_connect()
+
+    with pytest.raises(TransportError, match="transport_get_invalid_response"):
+        await transport.async_get("/device/0")
+
+
 @pytest.mark.parametrize(
     "raw_payload",
     [

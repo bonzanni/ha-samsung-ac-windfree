@@ -30,6 +30,7 @@ _POST_CHANGED = 68
 _CLOSE_TIMEOUT = COAP_READ_TIMEOUT
 _REQUEST_INTERVAL = 1.0 / RATE_LIMIT_RPS
 _MAX_CBOR_PAYLOAD = 64 * 1024
+_MAX_DEVICE_RESOURCES = 128
 _FATAL_ALERTS_BY_CODE = {
     42: "bad_certificate",
     43: "unsupported_certificate",
@@ -189,13 +190,65 @@ def _is_representation(value: object) -> bool:
     return isinstance(value, Mapping) and all(isinstance(key, str) for key in value)
 
 
-def _decode_representation(payload: bytes) -> Representation | _CallFailure:
+def _is_string_sequence(value: object) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and all(isinstance(item, str) for item in value)
+    )
+
+
+def _normalize_device_directory(
+    value: object,
+) -> Representation | _CallFailure:
+    if _is_representation(value):
+        return value
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or not 2 <= len(value) <= _MAX_DEVICE_RESOURCES + 1
+    ):
+        return _CallFailure(None)
+    descriptor = value[0]
+    if (
+        not isinstance(descriptor, Mapping)
+        or set(descriptor) != {"rt", "if"}
+        or not _is_string_sequence(descriptor.get("rt"))
+        or not _is_string_sequence(descriptor.get("if"))
+    ):
+        return _CallFailure(None)
+
+    resources: dict[str, object] = {}
+    for envelope in value[1:]:
+        if not isinstance(envelope, Mapping) or set(envelope) != {"href", "rep"}:
+            return _CallFailure(None)
+        href = envelope.get("href")
+        representation = envelope.get("rep")
+        if (
+            not isinstance(href, str)
+            or not href.startswith("/")
+            or "/" + "/".join(_path_segments(href)) != href
+            or href in resources
+            or not _is_representation(representation)
+        ):
+            return _CallFailure(None)
+        resources[href] = representation
+    return resources
+
+
+def _decode_representation(
+    payload: bytes,
+    *,
+    device_directory: bool = False,
+) -> Representation | _CallFailure:
     if len(payload) > _MAX_CBOR_PAYLOAD:
         return _CallFailure(None)
     try:
         decoded = cbor2.loads(payload)
     except Exception:
         return _CallFailure(None)
+    if device_directory:
+        return _normalize_device_directory(decoded)
     if not _is_representation(decoded):
         return _CallFailure(None)
     return decoded
@@ -472,7 +525,10 @@ class WindFreeTransport:
                     "transport_get_rejected",
                     coap_code=code,
                 )
-            representation = _decode_representation(payload)
+            representation = _decode_representation(
+                payload,
+                device_directory=segments == ("device", "0"),
+            )
             if isinstance(representation, _CallFailure):
                 return _PublicFailure("transport_get_invalid_response")
             return representation

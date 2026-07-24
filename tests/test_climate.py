@@ -57,7 +57,7 @@ def coordinator() -> MagicMock:
             device_id="00000000-0000-4000-8000-000000000001",
             model="AR60F12C1AWNEU",
             device_type="oic.d.airconditioner",
-            firmware="TP1X_DA-AC-RAC-01001_001",
+            firmware="TP1X_DA-AC-RAC-01001_0000",
             platform="TizenRT 4.0",
         ),
         climate=ClimateState(
@@ -70,9 +70,9 @@ def coordinator() -> MagicMock:
                 {
                     HvacMode.AUTO: frozenset(),
                     HvacMode.COOL: frozenset({"temperature", "fan", "swing", "preset"}),
-                    HvacMode.DRY: frozenset(),
+                    HvacMode.DRY: frozenset({"preset"}),
                     HvacMode.FAN: frozenset(),
-                    HvacMode.HEAT: frozenset(),
+                    HvacMode.HEAT: frozenset({"temperature"}),
                 }
             )
         ),
@@ -167,7 +167,11 @@ def test_climate_exposes_complete_local_state(climate, coordinator) -> None:
     assert climate.swing_mode == "fixed"
     assert climate.swing_modes == list(SWING_TO_HA.values())
     assert climate.preset_mode == "none"
-    assert climate.preset_modes == list(PRESET_TO_HA.values())
+    assert climate.preset_modes == [
+        value
+        for preset, value in PRESET_TO_HA.items()
+        if preset is not PresetMode.DRY_COMFORT
+    ]
     assert climate.temperature_unit is UnitOfTemperature.CELSIUS
     assert climate.min_temp == 16
     assert climate.max_temp == 30
@@ -459,6 +463,50 @@ async def test_matrix_incompatible_control_is_rejected_before_transport(
     coordinator.async_command.assert_not_awaited()
 
 
+async def test_preset_modes_and_values_follow_live_mode_contract(
+    climate,
+    coordinator,
+) -> None:
+    with pytest.raises(HomeAssistantError) as caught:
+        await climate.async_set_preset_mode("dry_comfort")
+    assert caught.value.translation_key == "command_incompatible"
+    coordinator.async_command.assert_not_awaited()
+
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, mode=HvacMode.DRY),
+    )
+    assert climate.preset_modes == ["none", "dry_comfort"]
+
+    with pytest.raises(HomeAssistantError) as caught:
+        await climate.async_set_preset_mode("quiet")
+    assert caught.value.translation_key == "command_incompatible"
+    coordinator.async_command.assert_not_awaited()
+
+    await climate.async_set_preset_mode("dry_comfort")
+    coordinator.async_command.assert_awaited_once_with(
+        CommandKind.PRESET,
+        PresetMode.DRY_COMFORT,
+    )
+
+
+async def test_heat_mode_allows_target_temperature(
+    climate,
+    coordinator,
+) -> None:
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, mode=HvacMode.HEAT),
+    )
+
+    await climate.async_set_temperature(**{ATTR_TEMPERATURE: 25})
+
+    coordinator.async_command.assert_awaited_once_with(
+        CommandKind.TEMPERATURE,
+        25.0,
+    )
+
+
 async def test_matrix_uses_remembered_mode_while_power_is_off(
     climate, coordinator
 ) -> None:
@@ -570,7 +618,11 @@ async def test_real_platform_projects_state(live_climate_entity, hass) -> None:
     assert state.attributes["swing_mode"] == "fixed"
     assert state.attributes["swing_modes"] == list(SWING_TO_HA.values())
     assert state.attributes["preset_mode"] == "none"
-    assert state.attributes["preset_modes"] == list(PRESET_TO_HA.values())
+    assert state.attributes["preset_modes"] == [
+        value
+        for preset, value in PRESET_TO_HA.items()
+        if preset is not PresetMode.DRY_COMFORT
+    ]
     assert "hvac_action" not in state.attributes
 
 

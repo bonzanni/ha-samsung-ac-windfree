@@ -29,6 +29,7 @@ from custom_components.samsung_ac_windfree.models import (
     AuthenticationRejected,
     CommandRejected,
     HvacMode,
+    PresetMode,
     UpdateSource,
 )
 from custom_components.samsung_ac_windfree.transport import TransportError
@@ -553,6 +554,16 @@ async def test_off_to_mode_is_one_serial_mode_then_power_operation(
     assert coordinator.data.climate.mode is HvacMode.HEAT
 
 
+async def test_successful_mode_change_observes_live_firmware_settle_time(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    before = coordinator._monotonic()
+
+    await coordinator.async_set_hvac_mode(HvacMode.HEAT)
+
+    assert coordinator._monotonic() - before == 2.0
+
+
 async def test_power_failure_retains_verified_remembered_mode(
     coordinator: WindFreeCoordinator,
 ) -> None:
@@ -621,10 +632,34 @@ async def test_mode_incompatible_command_is_rejected_without_io(
     coordinator.transport.async_post.assert_not_awaited()
 
 
+async def test_preset_values_are_mode_specific_and_fail_before_io(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    with pytest.raises(CommandRejected, match="command_incompatible"):
+        await coordinator.async_command(CommandKind.PRESET, PresetMode.DRY_COMFORT)
+    coordinator.transport.async_post.assert_not_awaited()
+
+    await coordinator.async_set_hvac_mode(HvacMode.DRY)
+    coordinator.transport.reset_mock()
+    await coordinator.async_command(CommandKind.PRESET, PresetMode.DRY_COMFORT)
+    coordinator.transport.async_post.assert_awaited_once()
+
+
+async def test_auto_clean_is_rejected_without_io_while_power_is_off(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    assert not coordinator.data.climate.power
+
+    with pytest.raises(CommandRejected, match="command_incompatible"):
+        await coordinator.async_command(CommandKind.AUTO_CLEAN, False)
+
+    coordinator.transport.async_post.assert_not_awaited()
+
+
 async def test_identity_drift_disables_all_writes(
     coordinator: WindFreeCoordinator,
 ) -> None:
-    coordinator.transport_factory.resources["/oic/d"]["mnmo"] = "other"
+    coordinator.transport_factory.resources["/oic/p"]["mnos"] = "TizenRT 3.0"
     await coordinator.async_reconcile()
     assert coordinator.identity_drift
     assert coordinator.health.unsupported_identity_after_update

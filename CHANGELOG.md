@@ -7,7 +7,8 @@ All notable changes to this project are documented in this file.
 ### Supported
 
 - Exact Samsung WindFree model `AR60F12C1AWNEU`, verified with reported firmware
-  `TP1X_DA-AC-RAC-01001_001` on TizenRT 4.0.
+  `TP1X_DA-AC-RAC-01001_0000` on TizenRT 4.0 and its exact local product
+  fingerprint.
 - Host-only setup with a one-time pinned certificate bootstrap and fully local
   authenticated runtime; SmartThings is not required.
 - Climate power, auto/cool/dry/fan/heat modes, current and target temperature,
@@ -26,15 +27,17 @@ All notable changes to this project are documented in this file.
   firmware updates, and owner-account management.
 - Automatic discovery and multi-device entries; configure each supported air
   conditioner by host.
-- Undocumented command combinations. Temperature, fan, swing, and preset writes
-  are rejected outside the verified Cool-mode contract.
+- Undocumented command combinations. Temperature is verified in Cool and Heat;
+  fan/swing and general presets in Cool; DryComfort in Dry; auto-clean while
+  operating. Other combinations are rejected before local I/O.
 
 ### Verification
 
-- local automated tests: 744 passed
-- coverage: 95.21%, passed
+- local automated tests: 770 passed
+- coverage: 95.24%, passed
 - local dependency contract: 3 passed
 - architecture import smoke: 2 of 2 passed
 - hassfest: 1 integration checked, 0 invalid
 - HACS: pending CI
-- live AC gate: pending authorized production-console run
+- direct live AC identity/read/write/restoration matrix: passed
+- Home Assistant production-console smoke: pending configuration

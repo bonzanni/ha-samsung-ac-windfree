@@ -80,7 +80,14 @@ class WindFreeSwitch(WindFreeEntity, SwitchEntity):
     def available(self) -> bool:
         """Require both coordinator health and a valid setting value."""
 
-        return super().available and self.is_on is not None
+        return (
+            super().available
+            and self.is_on is not None
+            and (
+                self.entity_description.key != "auto_clean"
+                or self.coordinator.data.climate.power
+            )
+        )
 
     async def _async_set(self, value: bool) -> None:
         kind: CommandKind | None = _COMMAND_KIND[self.entity_description.key]

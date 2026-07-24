@@ -732,7 +732,7 @@ def test_validation_phase_budgets_fit_inside_overall_timeout() -> None:
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
-        ("older_model", "unsupported_device"),
+        ("older_fingerprint", "unsupported_device"),
         ("missing_required_resource", "capability_mismatch"),
     ],
 )
@@ -750,8 +750,8 @@ async def test_validate_setup_rejects_non_exact_identity_or_contract(
 
     resources = copy.deepcopy(resource_representations)
     device_tree = _aggregate_device_tree(resources)
-    if mutation == "older_model":
-        resources["/oic/d"]["mnmo"] = "AR12-OLDER"
+    if mutation == "older_fingerprint":
+        resources["/oic/p"]["mnos"] = "TizenRT 3.0"
     else:
         device_tree.pop("/power/vs/0")
     transport = AsyncMock()

@@ -40,6 +40,16 @@ pytest-homeassistant-custom-component, Ruff, hassfest, and HACS validation.
   files.
 - Only the exact model and firmware combination is supported; do not add older
   Samsung protocols or fallback mappings.
+
+Live-validation amendment (2026-07-24): the exact unit reports
+`TP1X_DA-AC-RAC-01001_0000`, `SYSTEM 2.0`, `TizenRT 4.0`, and platform firmware
+`ARA-KR-TP1-25-ARXX00_11260401`. Its `/device/0` response is one `if`/`rt`
+descriptor followed by 39 `href`/`rep` envelopes. The consumer SKU is not
+present in the local OCF payload; `AR60F12C1AWNEU` remains the manually verified
+support label, while code gates the exact locally provable fingerprint and
+resource contract. Earlier plan examples that put the consumer SKU in
+`/oic/d.mnmo`, treat `/oic/p.mnpv` as the OS, use firmware suffix `_001`, or
+model `/device/0` as an already path-keyed map are superseded by this amendment.
 - One DTLS session per config entry, at most two logical requests per second,
   and one serialized foreground command.
 - A CoAP `2.04 Changed` is acknowledgement only; publish success after

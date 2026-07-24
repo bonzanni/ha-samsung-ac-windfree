@@ -80,7 +80,14 @@ _HA_TO_PRESET = MappingProxyType({value: key for key, value in PRESET_TO_HA.item
 _HVAC_MODES = (HVACMode.OFF, *HVAC_TO_HA.values())
 _FAN_MODES = tuple(FAN_TO_HA.values())
 _SWING_MODES = tuple(SWING_TO_HA.values())
-_PRESET_MODES = tuple(PRESET_TO_HA.values())
+_PRESETS_BY_MODE = MappingProxyType(
+    {
+        HvacMode.COOL: tuple(
+            preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
+        ),
+        HvacMode.DRY: (PresetMode.NONE, PresetMode.DRY_COMFORT),
+    }
+)
 _MODE_GATED = frozenset(
     {
         CommandKind.TEMPERATURE,
@@ -174,15 +181,27 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
 
     @property
     def preset_modes(self) -> list[str]:
-        return list(_PRESET_MODES)
+        return [
+            PRESET_TO_HA[preset]
+            for preset in _PRESETS_BY_MODE.get(
+                self.coordinator.data.climate.mode,
+                (),
+            )
+        ]
 
-    def _require_compatible(self, kind: CommandKind) -> None:
+    def _require_compatible(
+        self,
+        kind: CommandKind,
+        value: object = None,
+    ) -> None:
         if kind not in _MODE_GATED:
             return
         mode = self.coordinator.data.climate.mode
         if kind.value not in self.coordinator.data.contract.mode_controls.get(
             mode, frozenset()
         ):
+            _raise_translated("command_incompatible")
+        if kind is CommandKind.PRESET and value not in _PRESETS_BY_MODE.get(mode, ()):
             _raise_translated("command_incompatible")
 
     async def _async_delegate(
@@ -317,7 +336,7 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
             preset_mode = ""
             _raise_translated("invalid_command")
         try:
-            self._require_compatible(CommandKind.PRESET)
+            self._require_compatible(CommandKind.PRESET, value)
             await self._async_delegate(
                 self.coordinator.async_command,
                 CommandKind.PRESET,

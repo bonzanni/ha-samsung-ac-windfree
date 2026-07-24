@@ -40,9 +40,9 @@ _COMPATIBILITY: Mapping[str, object] = {
     "by_mode": {
         "Auto": [],
         "Cool": ["temperature", "fan", "swing", "preset"],
-        "Dry": [],
+        "Dry": ["preset"],
         "Fan": [],
-        "Heat": [],
+        "Heat": ["temperature"],
     },
 }
 _LIFECYCLE_DATA = f"{DOMAIN}_entry_lifecycle"

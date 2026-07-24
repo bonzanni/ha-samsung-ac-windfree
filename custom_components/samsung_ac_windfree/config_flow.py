@@ -39,9 +39,9 @@ _COMPATIBILITY: Mapping[str, object] = {
     "by_mode": {
         "Auto": [],
         "Cool": ["temperature", "fan", "swing", "preset"],
-        "Dry": [],
+        "Dry": ["preset"],
         "Fan": [],
-        "Heat": [],
+        "Heat": ["temperature"],
     },
 }
 _BOOTSTRAP_ERRORS = frozenset(
@@ -60,7 +60,7 @@ _BOOTSTRAP_REPORTER: ContextVar[object | None] = ContextVar(
 
 @dataclass(frozen=True, slots=True)
 class ValidatedSetup:
-    """One locally authenticated and exact-model-validated setup."""
+    """One locally authenticated and exact-fingerprint-validated setup."""
 
     host: str
     port: int

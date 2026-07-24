@@ -26,15 +26,20 @@ and firmware combination:
 - Consumer model: `AR60F12C1AWNEU`
 - OCF device type: `oic.d.airconditioner`
 - Firmware description prefix: `TP1X_DA-AC-RAC-01001`
-- Platform: Tizen Lite / TizenRT 4.0
+- Live firmware: `TP1X_DA-AC-RAC-01001_0000`
+- Product version: `SYSTEM 2.0`
+- Platform: `TizenRT 4.0`
+- Platform firmware: `ARA-KR-TP1-25-ARXX00_11260401`
 - OCF endpoint: DTLS 1.2 over a discovered UDP port in `49152` through `49160`
 - Live target port observed during research: `49154`
 
-The integration must require all four identity checks: the exact consumer
-model `AR60F12C1AWNEU`, OCF device type, firmware-description prefix, and
-platform. A model that shares the firmware prefix but has another consumer
-model number is not accepted. Unsupported devices receive a translated
-config-flow error.
+Live implementation validation established that this OCF firmware does not
+report the consumer SKU anywhere in `/oic/d`, `/oic/p`, or the 39 resource
+representations. The SKU is therefore a manually verified support label, not a
+locally provable field. The integration requires the exact locally reported
+device type, product version, OS, platform firmware, firmware-description
+family, matching model-number firmware component, and capability contract.
+Unsupported fingerprints receive a translated config-flow error.
 
 ### Non-goals
 
@@ -132,8 +137,9 @@ On the first setup:
    SHA-1 signature required by the device trust chain.
 9. Sweep UDP ports `49152` through `49160`, establish authenticated DTLS, and
    require successful reads of `/oic/d`, `/oic/p`, and `/device/0`.
-10. Verify the device type, model, firmware family, and live capability
-    contract before creating the config entry.
+10. Verify the exact local product fingerprint, firmware family, and live
+    capability contract before creating the config entry. The consumer SKU is
+    not asserted from a field the device does not expose.
 11. Only after local authentication and identity validation succeed, atomically
     persist the generated client private key, client certificate chain,
     discovered port, host, and sanitized identity metadata.
@@ -311,9 +317,10 @@ Responsibilities:
 - Publish immutable, typed `WindFreeData`
 - Track availability, latency, update source, failure counts, and resource
   coverage
-- Revalidate all four identity gates—exact model, device type, firmware prefix,
-  and platform—and the required safe-write resource contract during startup and
-  every full reconciliation
+- Revalidate the exact locally provable product fingerprint—device type,
+  product version, OS, platform firmware, firmware/model-number consistency—
+  and the required safe-write resource contract during startup and every full
+  reconciliation
 
 If firmware drift removes or changes a required resource, the coordinator
 disables only the affected controls, retains safe readable entities, and
@@ -435,14 +442,18 @@ only when its combination is present in the sanitized compatibility matrix
 derived from live evidence. Version 1 must not infer undocumented
 combinations.
 
-Before release, live probes must verify at least:
+The completed release probes establish this conservative matrix:
 
-- Whether target temperature is writable in Auto, Cool, Dry, Fan, and Heat
-- Supported fan codes in each HVAC mode
-- Supported airflow values in each HVAC mode
-- Valid HVAC-mode combinations for Quiet, Smart, Speed, Nano, NanoSleep,
-  Sleep, and DryComfort
-- Whether changing HVAC mode clears or coerces an active preset
+- target temperature: Cool and Heat;
+- fan codes Auto, Low, Medium, High, and Turbo: Cool;
+- airflow Fix, vertical, horizontal, and both: Cool;
+- Off, Quiet, Smart, Speed, Nano, NanoSleep, and Sleep presets: Cool;
+- Off and DryComfort presets: Dry;
+- Auto and Fan: mode selection only;
+- display light: power-independent;
+- auto-clean: only while operating;
+- two seconds of settling after a mode change before another power/mode
+  transition.
 
 Unsupported combinations raise a translated error without sending a request.
 If the device nevertheless coerces a previously verified combination, normal
@@ -456,17 +467,17 @@ and raw production payloads are intentionally omitted.
 
 | Capability | Resource and request shape | Live result |
 | --- | --- | --- |
-| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact consumer model, device type, and firmware family confirmed |
+| Device discovery | GET `/oic/res`, `/oic/d`, `/oic/p`, `/device/0` | `2.05`; exact local fingerprint, device type, firmware family, and 39-resource contract confirmed; consumer SKU is not reported |
 | Standard power path | POST `/power/0` with `{"value": false}` | `4.04`; must not be used |
 | Power | POST `/power/vs/0` with `{"x.com.samsung.da.power": "On"}` | `2.04`, OBSERVE, authoritative read-back `On`; restored `Off` |
 | HVAC mode | POST `/mode/vs/0` with `{"x.com.samsung.da.modes": ["<mode>"]}` | With power Off, Auto, Cool, Dry, Fan, and Heat each persisted and read back; restored Cool |
 | Temperatures | GET `/temperatures/vs/0` aggregate `items` | Current, desired, min 16, max 30, step 1, Celsius |
-| Target temperature | Read/modify/write the aggregate `items` list with desired changed | 26 to 27 °C persisted, notified, and restored to 26 °C |
-| Fan | POST `/wind/strength/vs/0` with scalar mode code | Auto to Low persisted and restored; supported codes 0 through 4 map to Auto through Turbo |
-| Airflow | POST `/wind/direction/vs/0` with scalar direction | Horizontal persisted and restored; Fix, vertical, horizontal, and both advertised |
-| Special mode | POST `/mode/convenient/vs/0` with scalar mode | Quiet, Smart, Speed, Nano, NanoSleep, Sleep, and DryComfort each persisted; restored Off |
+| Target temperature | Read/modify/write the aggregate `items` list with desired changed | 26 to 25 °C persisted in both Cool and Heat, notified, and restored to 26 °C |
+| Fan | POST `/wind/strength/vs/0` with scalar mode code | Codes 0 through 4 (Auto through Turbo) each persisted in Cool and were restored |
+| Airflow | POST `/wind/direction/vs/0` with scalar direction | Fix, vertical, horizontal, and both each persisted in Cool and were restored |
+| Special mode | POST `/mode/convenient/vs/0` with scalar mode | Off, Quiet, Smart, Speed, Nano, NanoSleep, and Sleep persisted in Cool; DryComfort was rejected in Cool and persisted in Dry; restored Off |
 | Display light | POST `/light/vs/0` with `{"mode": "On\|Off"}` | Both values persisted, notified, and restored |
-| Auto-clean setting | POST `/option/autoclean/vs/0` with setting status | Both values persisted, notified, and restored |
+| Auto-clean setting | POST `/option/autoclean/vs/0` with setting status | Both values persisted while Cool/on; writes while powered off were rejected; restored On |
 | Air purification | POST advertised On value | Returned `2.04` but remained Off; exclude |
 | Mute once | POST advertised On value | Returned `2.04` but remained Off; exclude |
 | Humidity | GET `/humidity/vs/0` | Primary field stayed zero; alternate `fivepercentHumidity` field returned direct percentage-like values, including 36 and 40 |
@@ -476,6 +487,10 @@ and raw production payloads are intentionally omitted.
 | Current limit | GET `/electriccurrent/vs/0` | Enabled state and levels 3 through 9 readable; units and safe write semantics unknown |
 | Push | OBSERVE on hot and warm resources | Immediate notifications observed for power, mode, temperature, fan, airflow, preset, light, auto-clean, and energy changes |
 | Restoration | Final authoritative reads | Power Off, mode Cool, target 26 °C, fan Auto, airflow Fix, preset Off, display light On, auto-clean On |
+
+Mode changes require a two-second firmware settle interval before a following
+power or mode command. Without it, an immediate transition away from Auto can
+be rejected even after authoritative Auto read-back.
 
 ## Home Assistant Entity Model
 
@@ -558,8 +573,9 @@ boundaries.
 | Binary sensor | `current_limit_enabled` | Diagnostic, disabled | Read-only current-limit state |
 | Sensor | `current_limit_level` | Diagnostic, disabled | Read-only opaque level |
 
-Device information carries the consumer model, manufacturer, firmware, and
-hardware platform. Firmware fields do not become standalone entities.
+Device information carries the manually verified supported-model label,
+manufacturer, locally reported firmware, and hardware platform. Firmware fields
+do not become standalone entities.
 
 The energy entity uses native unit kWh, `SensorDeviceClass.ENERGY`,
 `SensorStateClass.TOTAL_INCREASING`, and a precision that preserves the source
@@ -615,8 +631,8 @@ Validation:
 - Sweep OCF ports
 - Authenticate locally
 - Read identity and resource tree
-- Reject non-air-conditioners, any consumer model other than
-  `AR60F12C1AWNEU`, and unsupported firmware/platform combinations
+- Reject non-air-conditioners and any local product, firmware, platform, or
+  capability fingerprint other than the exact tested contract
 - Set the OCF device identifier as the unique ID
 
 Every network operation has its own bounded timeout: 5 seconds for host
@@ -657,7 +673,7 @@ Diagnostics are an explicit allowlist and perform zero device I/O.
 Allowed:
 
 - Integration and dependency versions
-- Supported exact-model and firmware-family label
+- Supported manually verified model and exact local-fingerprint label
 - Connection state and generation
 - Last update success and source
 - Poll and OBSERVE health
@@ -743,7 +759,7 @@ Required test groups:
 - Config flow success and all failure branches
 - Config-flow progress, DNS/fetch/sweep/read and overall timeout arithmetic,
   reuse of the successful swept session, and cancellation cleanup
-- Unsupported device, exact-model, and firmware-family rejection
+- Unsupported device, exact-fingerprint, and firmware-family rejection
 - Exact consumer-model rejection even when the firmware prefix matches
 - Duplicate detection, reconfigure, and reauthentication
 - Coordinator polling tiers, OBSERVE merges, generation isolation, reconnects,
@@ -836,7 +852,7 @@ The implementation is ready for its first release only when:
     representative reversible writes, unload, restart, internet-blocked
     polling, scoped SHA-1 DTLS compatibility, stored-port failure recovery, and
     exact state restoration.
-11. The exact-model gate, mode/control compatibility matrix, fatal-auth
+11. The exact local-fingerprint gate, mode/control compatibility matrix, fatal-auth
     discriminator, and firmware-drift behavior are covered by automated tests.
 
 ## References

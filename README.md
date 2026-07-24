@@ -21,16 +21,18 @@ restarts, and reloads are fully local after setup.
 This release is built and live-tested for exactly:
 
 - Model: `AR60F12C1AWNEU`
-- Reported firmware: `TP1X_DA-AC-RAC-01001_001`
+- Reported firmware: `TP1X_DA-AC-RAC-01001_0000`
 - Platform: `TizenRT 4.0`
+- Product/platform fingerprint: `SYSTEM 2.0` /
+  `ARA-KR-TP1-25-ARXX00_11260401`
 - Device class: Samsung residential air conditioner
 
-The integration validates the model, platform, firmware family, local identity,
+Samsung's local OCF payload does not report the consumer SKU. The model above
+was verified from the unit and its manual; the integration validates the exact
+locally reported product/platform fingerprint, firmware family, device type,
 resource shapes, enumerations, and command compatibility before creating an
-entry. Only the firmware above is claimed as supported. A later patch revision
-sharing the `TP1X_DA-AC-RAC-01001` family may pass validation if its complete
-resource contract remains identical, but it is unverified until explicitly
-listed here. Older models and older firmware families are not supported.
+entry. Only the hardware and firmware above are claimed as supported. Older
+models and older firmware families are not supported.
 
 ## Installation
 
@@ -97,10 +99,12 @@ Climate controls include:
 - presets `none`, `quiet`, `smart`, `boost`, `windfree`,
   `windfree_sleep`, `sleep`, and `dry_comfort`.
 
-The live contract allows temperature, fan, swing, and preset writes only while
-the device is in Cool mode. Power, HVAC mode, display light, and auto clean
-remain available in every mode. Home Assistant rejects incompatible commands
-instead of guessing at undocumented behavior.
+The live contract allows fan and swing writes in Cool mode, target-temperature
+writes in Cool and Heat, the seven general presets in Cool, and
+`dry_comfort`/`none` in Dry. Auto-clean is writable only while the unit is
+operating. Power, HVAC mode, and display light remain general controls. Home
+Assistant rejects incompatible commands instead of guessing at undocumented
+behavior, and waits two seconds after a mode change for the firmware to settle.
 
 Additional entities are:
 
@@ -138,8 +142,10 @@ reconnect or restart.
   energy tariff, schedule, firmware update, or owner-account management.
 - Local protocol compatibility can change after a Samsung firmware update.
 - The device may accept only a small number of authenticated local clients.
-- Heating is exposed as `heat`, but the verified contract does not permit target
-  temperature, fan, swing, or preset writes while Heat is active.
+- Heating is exposed as `heat` with verified whole-degree target-temperature
+  control. Fan, swing, and preset writes remain unavailable in Heat.
+- An immediate transition away from Auto can be rejected by the firmware; the
+  integration applies the live-verified two-second settle interval.
 
 ## Troubleshooting
 

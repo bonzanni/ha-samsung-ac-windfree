@@ -13,6 +13,8 @@ from .const import (
     SUPPORTED_FIRMWARE_PREFIX,
     SUPPORTED_MODEL,
     SUPPORTED_PLATFORM,
+    SUPPORTED_PLATFORM_FIRMWARE,
+    SUPPORTED_PRODUCT_VERSION,
 )
 from .models import (
     AlarmState,
@@ -311,32 +313,45 @@ def parse_identity(
     """Parse and enforce the exact four-gate product identity."""
 
     device_id = oic_d.get("di")
-    model = oic_d.get("mnmo")
     device_types = oic_d.get("rt")
-    platform = oic_p.get("mnpv")
+    product_version = oic_p.get("mnpv")
+    platform = oic_p.get("mnos")
+    platform_firmware = oic_p.get("mnfv")
     information = _mapping(device_0.get("/information/vs/0"))
     firmware = (
         information.get("x.com.samsung.da.description")
         if information is not None
         else None
     )
+    model_number = (
+        information.get("x.com.samsung.da.modelNum")
+        if information is not None
+        else None
+    )
+    model_firmware, separator, model_discriminator = (
+        model_number.partition("|") if isinstance(model_number, str) else ("", "", "")
+    )
 
     if (
         not _is_string(device_id)
         or not device_id
-        or model != SUPPORTED_MODEL
         or not _is_sequence(device_types)
         or not all(isinstance(item, str) for item in device_types)
         or SUPPORTED_DEVICE_TYPE not in device_types
+        or product_version != SUPPORTED_PRODUCT_VERSION
         or platform != SUPPORTED_PLATFORM
+        or platform_firmware != SUPPORTED_PLATFORM_FIRMWARE
         or not _is_string(firmware)
         or not firmware.startswith(SUPPORTED_FIRMWARE_PREFIX)
+        or separator != "|"
+        or model_firmware != firmware
+        or not model_discriminator
     ):
         raise _unsupported()
 
     return DeviceIdentity(
         device_id=device_id,
-        model=model,
+        model=SUPPORTED_MODEL,
         device_type=SUPPORTED_DEVICE_TYPE,
         firmware=firmware,
         platform=platform,
