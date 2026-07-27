@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - 2026-07-28
+
+### Added
+
+- Brand images shipped inside the integration
+  (`custom_components/samsung_ac_windfree/brand/`), so Home Assistant shows the
+  integration's own icon instead of a placeholder. Home Assistant 2026.3.0 and
+  later serve local brand images through the brands proxy and prefer them over
+  the CDN; the previous route, a pull request against `home-assistant/brands`
+  under `custom_integrations/`, is no longer accepted. The existing 2026.7.3
+  minimum already satisfies this, so no version floor change was needed.
+- Icons carry no Samsung wordmark or logo. See
+  `docs/superpowers/specs/2026-07-28-brand-icons-design.md`.
+
 ## [0.1.0] - 2026-07-24
 
 ### Supported

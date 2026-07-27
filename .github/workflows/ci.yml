@@ -112,7 +112,6 @@ jobs:
         with:
           category: integration
           comment: false
-          ignore: brands
 
   beta-canary:
     name: Scheduled HA beta canary

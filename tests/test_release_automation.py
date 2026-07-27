@@ -189,7 +189,9 @@ def test_workflow_uses_required_validation_actions_and_no_secrets() -> None:
     assert "pull_request_target" not in rendered
     hacs = _workflow()["jobs"]["hacs"]
     assert hacs["steps"][-1]["with"]["comment"] is False
-    assert hacs["steps"][-1]["with"]["ignore"] == "brands"
+    # Brands are shipped in-tree at custom_components/<domain>/brand/, so the
+    # HACS brands check must run rather than be ignored.
+    assert "ignore" not in hacs["steps"][-1]["with"]
 
 
 def test_pin_canary_reads_release_constants_without_importing_home_assistant() -> None:

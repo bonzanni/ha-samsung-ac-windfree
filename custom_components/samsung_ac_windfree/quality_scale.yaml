@@ -4,9 +4,7 @@ rules:
     status: exempt
     comment: The integration registers no custom actions.
   appropriate-polling: done
-  brands:
-    status: exempt
-    comment: This is a custom integration and is not represented in the Home Assistant brands repository.
+  brands: done
   common-modules: done
   config-flow-test-coverage: done
   config-flow: done

@@ -1724,9 +1724,9 @@ def test_release_metadata_matches_manifest_and_supported_scope() -> None:
     changelog = Path("CHANGELOG.md").read_text()
     license_text = Path("LICENSE").read_text()
 
-    assert manifest["version"] == "0.1.0"
+    assert manifest["version"] == "0.2.0"
     assert manifest["documentation"] in Path("README.md").read_text()
-    assert "## [0.1.0]" in changelog
+    assert "## [0.2.0]" in changelog
     for phrase in (
         "AR60F12C1AWNEU",
         "TP1X_DA-AC-RAC-01001_0000",
