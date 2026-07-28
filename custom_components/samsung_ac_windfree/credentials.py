@@ -19,7 +19,9 @@ from itertools import pairwise
 from typing import Any
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, padding, rsa
 
 from .models import Credentials
 
@@ -94,6 +96,63 @@ def _load_chain(data: bytes) -> list[x509.Certificate]:
     return chain
 
 
+def _verify_issued_by(child: x509.Certificate, parent: x509.Certificate) -> None:
+    """Raise unless `parent` demonstrably signed `child`.
+
+    The high-level helper dispatches on the certificate's own algorithm and key
+    type, which is what makes this fail closed. But it refuses SHA-1 outright,
+    and this device's chain is entirely SHA-1, so an unsupported-algorithm
+    result falls through to an explicit check rather than being treated as
+    either success or failure.
+
+    The fallback dispatches on the issuer's actual key type. Assuming a scheme
+    would be a fail-open hole: verifying an EC signature with RSA arguments
+    raises TypeError, which is indistinguishable from "unsupported" and would
+    let a forged signature through.
+    """
+
+    if child.issuer != parent.subject:
+        raise CredentialError(ERROR_INVALID_CHAIN)
+
+    try:
+        child.verify_directly_issued_by(parent)
+        return
+    except InvalidSignature:
+        raise CredentialError(ERROR_INVALID_CHAIN) from None
+    except ValueError:
+        pass  # algorithm unsupported by the high-level API; check it explicitly
+    except Exception:
+        raise CredentialError(ERROR_INVALID_CHAIN) from None
+
+    public_key = parent.public_key()
+    algorithm = child.signature_hash_algorithm
+    if algorithm is None:
+        raise CredentialError(ERROR_INVALID_CHAIN)
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            parameters = child.signature_algorithm_parameters
+            scheme = (
+                parameters
+                if isinstance(parameters, (padding.PSS, padding.PKCS1v15))
+                else padding.PKCS1v15()
+            )
+            public_key.verify(
+                child.signature, child.tbs_certificate_bytes, scheme, algorithm
+            )
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(
+                child.signature, child.tbs_certificate_bytes, ec.ECDSA(algorithm)
+            )
+        elif isinstance(public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+            public_key.verify(child.signature, child.tbs_certificate_bytes)
+        else:
+            raise CredentialError(ERROR_INVALID_CHAIN)
+    except CredentialError:
+        raise
+    except Exception:
+        raise CredentialError(ERROR_INVALID_CHAIN) from None
+
+
 def _spki(public_key) -> bytes:
     return public_key.public_bytes(
         serialization.Encoding.DER,
@@ -142,16 +201,7 @@ def parse_uploaded_credential(
     for child, parent in pairwise(chain):
         if not (parent.not_valid_before_utc <= moment < parent.not_valid_after_utc):
             raise CredentialError(ERROR_INVALID_CHAIN)
-        try:
-            # Dispatches on the certificate's own algorithm and key type, and
-            # checks issuer/subject too. Verifying by hand would mean assuming a
-            # signature scheme: assuming RSA PKCS#1 v1.5 both accepts a bad EC
-            # signature (the TypeError looks like "unsupported") and rejects a
-            # valid RSA-PSS one.
-            child.verify_directly_issued_by(parent)
-        except Exception:
-            # Fail closed: anything we cannot positively verify is not a chain.
-            raise CredentialError(ERROR_INVALID_CHAIN) from None
+        _verify_issued_by(child, parent)
 
     return Credentials(
         client_key_pem=key_bytes.decode("ascii", "strict"),

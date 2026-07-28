@@ -313,3 +313,57 @@ async def test_oversized_upload_keeps_its_own_category(hass, leaf_pair) -> None:
     assert str(err.value) == "credentials_too_large"
     # Oversized input is still deleted, and never read into memory.
     assert sorted(uploader.consumed) == ["c", "k"]
+
+
+def _sha1_signed(subject: str, key, issuer: str, signing_key) -> x509.Certificate:
+    """Build a SHA-1 signed certificate the way the device's own chain is signed."""
+
+    from OpenSSL import crypto
+
+    provisional = _cert(subject, key, issuer=issuer, signing_key=signing_key)
+    legacy = crypto.load_certificate(
+        crypto.FILETYPE_ASN1, provisional.public_bytes(serialization.Encoding.DER)
+    )
+    legacy.sign(
+        crypto.load_privatekey(
+            crypto.FILETYPE_PEM,
+            signing_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            ),
+        ),
+        "sha1",
+    )
+    return x509.load_der_x509_certificate(
+        crypto.dump_certificate(crypto.FILETYPE_ASN1, legacy)
+    )
+
+
+def test_accepts_a_sha1_signed_chain(rsa_key) -> None:
+    """The device's real chain is entirely SHA-1.
+
+    cryptography refuses SHA-1 through verify_directly_issued_by, so rejecting
+    everything it cannot verify would reject the only chain this integration
+    will ever be given.
+    """
+
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = _cert("ca", ca_key)
+    leaf = _sha1_signed("leaf", rsa_key, "ca", ca_key)
+    result = parse_uploaded_credential(
+        _key_pem(rsa_key), _pem(leaf) + _pem(ca), now=NOW
+    )
+    assert result.client_chain_pem.count("BEGIN CERTIFICATE") == 2
+
+
+def test_rejects_a_sha1_chain_with_a_forged_signature(rsa_key) -> None:
+    """Falling back for SHA-1 must not become a way in."""
+
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    impostor = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca = _cert("ca", ca_key)
+    forged = _sha1_signed("leaf", rsa_key, "ca", impostor)
+    with pytest.raises(CredentialError) as err:
+        parse_uploaded_credential(_key_pem(rsa_key), _pem(forged) + _pem(ca), now=NOW)
+    assert str(err.value) == "credentials_invalid_chain"

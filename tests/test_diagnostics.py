@@ -30,9 +30,7 @@ from custom_components.samsung_ac_windfree.repairs import (
     async_sync_runtime_issues,
 )
 
-_SETUP_SOURCE = Path(
-    "custom_components/samsung_ac_windfree/__init__.py"
-).read_text()
+_SETUP_SOURCE = Path("custom_components/samsung_ac_windfree/__init__.py").read_text()
 
 _SECRETS = (
     "192.0.2.10",
