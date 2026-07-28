@@ -1670,10 +1670,6 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
         "reauthentication",
         "certificate expiry",
         "competing clients",
-        "BUNDLE_SHA256",
-        "update only `BUNDLE_URL`",
-        "unpinned fallback mirrors",
-        "must not be committed to Git",
         "climate.set_temperature",
         "climate.set_hvac_mode",
         "mode: heat",
@@ -1691,7 +1687,6 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
         "## Limitations",
         "## Troubleshooting",
         "## Automation examples",
-        "## Bootstrap source and pin maintenance",
     ):
         assert heading in readme
     assert "https://github.com/bonzanni/ha-samsung-ac-windfree/issues" in readme

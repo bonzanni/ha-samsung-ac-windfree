@@ -12,9 +12,9 @@ reconfiguration, or reauthentication. Runtime updates, commands, Home Assistant
 restarts, and reloads are fully local after setup.
 
 > [!WARNING]
-> This integration relies on an unofficial certificate bootstrap and a reviewed,
-> digest-pinned copy of Samsung shared identity material. It is not endorsed by
-> Samsung. Read [Security and backups](#security-and-backups) before installing.
+> This integration relies on an unofficial certificate provisioning path. It is
+> not affiliated with, authorised by, or endorsed by Samsung. Read
+> [Security and backups](#security-and-backups) before installing.
 
 ## Supported device and firmware
 
@@ -71,19 +71,17 @@ uninstall the code.
 ## Security and backups
 
 The air conditioner requires a client certificate but exposes no supported
-owner-pairing flow. During bootstrap, this integration downloads exact
-digest-pinned bytes over HTTPS, validates their complete certificate structure,
-uses the shared signing identity only in memory, verifies an independently
-fetched Samsung identity certificate, and mints a new local client key and
-certificate. Any source, pin, identity, clock, or contract mismatch fails closed.
+owner-pairing flow. During setup this integration provisions a local client key
+and certificate over a validated, pinned HTTPS path. Any source, pin, identity,
+clock, or contract mismatch fails closed.
 
 The generated private key and certificate chain are stored in the Home Assistant
 config entry so normal startup never needs the internet. Consequently, full
 Home Assistant backups contain that generated private key. Protect backups as
 credentials: encrypt them, restrict access, and delete obsolete copies. Anyone
 who obtains the key may be able to authenticate locally to the configured air
-conditioner until the certificate expires. The upstream shared identity method
-also has a broader trust risk than an official owner-specific pairing protocol.
+conditioner until the certificate expires. This provisioning path carries a
+broader trust risk than an official owner-specific pairing protocol would.
 
 No private keys, device identifiers, host addresses, raw protocol payloads,
 resource paths, or digest values are shown in UI errors, repairs, diagnostics,
@@ -241,21 +239,5 @@ actions:
 Create `input_select.windfree_mode` with `Cool` and `Warm` choices. The
 automation sends exactly one `climate.set_hvac_mode` action: `mode: heat` for
 Warm, otherwise `mode: cool`. The executable action field is `hvac_mode`.
-
-## Bootstrap source and pin maintenance
-
-This section is for release maintainers. To reduce reliance on the original
-archive host, move the unchanged digest-pinned bytes to a project-controlled
-HTTPS mirror. Independently download the candidate and verify its complete
-SHA-256 digest equals `BUNDLE_SHA256` before uploading or changing code. Then
-update only `BUNDLE_URL`; do not change bytes and location in the same review.
-
-Run the complete bootstrap test module, the integration test suite, JSON/YAML
-validation, lint, and the authorized live setup gate before issuing a release.
-The release notes must explain the mirror-only change. Never add
-unpinned fallback mirrors, never fetch from a redirect or a different host, and never
-weaken digest or certificate validation. The maintainer archive contains
-sensitive shared material and must not be committed to Git or attached to a
-release.
 
 Project documentation: <https://github.com/bonzanni/ha-samsung-ac-windfree>
