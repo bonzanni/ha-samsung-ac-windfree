@@ -10,10 +10,6 @@ class WindFreeError(Exception):
     """Base sanitized integration error."""
 
 
-class BootstrapError(WindFreeError):
-    """Pinned bootstrap failed."""
-
-
 class AuthenticationRejected(WindFreeError):
     """Credentials were repeatably rejected."""
 

@@ -21,8 +21,10 @@ from custom_components.samsung_ac_windfree.models import (
 def test_stored_value_helpers_reject_every_invalid_shape(credentials) -> None:
     from custom_components.samsung_ac_windfree import (
         _certificate_validity,
-        _stored_credentials,
         _stored_endpoint,
+    )
+    from custom_components.samsung_ac_windfree.credentials import (
+        stored_credentials as _stored_credentials,
     )
 
     valid = {
@@ -99,28 +101,6 @@ async def test_shutdown_helper_reports_child_cancellation(hass) -> None:
 
     assert not outcome.completed
     assert outcome.cancellation_args is None
-
-
-@pytest.mark.parametrize(
-    ("side_effect", "expected"),
-    [
-        (asyncio.CancelledError("reload_cancelled"), asyncio.CancelledError),
-        (RuntimeError("private reload failure"), ConfigEntryError),
-    ],
-)
-async def test_reload_sanitizes_direct_failures(hass, side_effect, expected) -> None:
-    from custom_components.samsung_ac_windfree import _async_reload_entry
-
-    entry = MockConfigEntry(domain=DOMAIN)
-    with (
-        patch.object(
-            hass.config_entries,
-            "async_reload",
-            new=AsyncMock(side_effect=side_effect),
-        ),
-        pytest.raises(expected),
-    ):
-        await _async_reload_entry(hass, entry)
 
 
 def _entry_data(credentials: Credentials) -> dict[str, object]:
@@ -320,11 +300,6 @@ async def test_validation_pipeline_sanitizes_unexpected_stage_errors(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            new=AsyncMock(return_value=credentials),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
             "async_discover_transport",
             new=discover,
         ),
@@ -333,7 +308,7 @@ async def test_validation_pipeline_sanitizes_unexpected_stage_errors(
             new=parse,
         ),
     ):
-        outcome = await _async_validate_pipeline(hass, "ac.example.test")
+        outcome = await _async_validate_pipeline(hass, "ac.example.test", credentials)
 
     expected = "capability_mismatch" if failure_stage == "parse" else "cannot_connect"
     assert outcome.error_key == expected
@@ -375,7 +350,6 @@ async def test_flow_handles_unknown_pending_cancelled_and_empty_states(hass) -> 
     flow._validation_task = hass.async_create_task(fetch_timeout())
     await asyncio.sleep(0)
     assert (await flow.async_step_validate())["type"].value == "progress_done"
-    assert flow._bootstrap_status == "unavailable"
 
     flow = ConfigFlow()
     flow.hass = hass

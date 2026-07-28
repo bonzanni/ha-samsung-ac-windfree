@@ -2,14 +2,13 @@
 
 An unofficial Home Assistant custom integration for fully local monitoring and
 control of one specifically validated Samsung WindFree air conditioner.
-SmartThings is not required. Setup asks only for the device's host or IP address;
-the secure port, local identity, capabilities, and client credentials are found
-or created automatically.
+SmartThings is not required. Setup asks for the device's host or IP address and
+a client credential you supply; the secure port, local identity, and
+capabilities are then discovered automatically.
 
-Normal communication uses authenticated DTLS/CoAP on the local network. Internet
-access is required only for a one-time internet bootstrap during initial setup,
-reconfiguration, or reauthentication. Runtime updates, commands, Home Assistant
-restarts, and reloads are fully local after setup.
+Everything is local. Communication uses authenticated DTLS/CoAP on the local
+network, and the integration never contacts the internet -- not during setup,
+reconfiguration, reauthentication, or normal operation.
 
 > [!WARNING]
 > This integration relies on an unofficial certificate provisioning path. It is
@@ -52,9 +51,14 @@ This repository is designed for installation as a custom integration:
    **Samsung WindFree AC**.
 4. Enter only the air conditioner's stable local host or IP address. A DHCP
    reservation is recommended.
-5. Keep Home Assistant connected to the internet while the one-time bootstrap
-   and local validation complete. No Samsung account, token, certificate,
-   SmartThings login, port, PIN, or other value is requested.
+5. Upload the client key and certificate chain when asked. Both are validated
+   before anything is stored: the key must match the first certificate, the
+   chain must link, and the certificate must currently be valid.
+6. Local validation then runs. No Samsung account, token, SmartThings login,
+   port, or PIN is requested, and nothing is downloaded.
+
+Obtaining a credential for a Samsung appliance is outside the scope of this
+integration and is not automated here.
 
 The device must be powered, connected to the same routed local network, and
 reachable without client isolation. Setup can take up to a few minutes while
@@ -64,24 +68,23 @@ the supported secure port range is tested.
 
 Go to **Settings > Devices & services**, open the Samsung WindFree AC entry, and
 select **Delete**. This unloads local subscriptions and removes the integration's
-entry, device, entities, and stored generated client credentials. Remove the
+entry, device, entities, and the stored client credential. Remove the
 custom integration files and restart Home Assistant if you also want to
 uninstall the code.
 
 ## Security and backups
 
 The air conditioner requires a client certificate but exposes no supported
-owner-pairing flow. During setup this integration provisions a local client key
-and certificate over a validated, pinned HTTPS path. Any source, pin, identity,
-clock, or contract mismatch fails closed.
+owner-pairing flow, so you supply one. The integration validates it and uses it;
+it does not create one, and it does not fetch anything.
 
-The generated private key and certificate chain are stored in the Home Assistant
-config entry so normal startup never needs the internet. Consequently, full
-Home Assistant backups contain that generated private key. Protect backups as
-credentials: encrypt them, restrict access, and delete obsolete copies. Anyone
-who obtains the key may be able to authenticate locally to the configured air
-conditioner until the certificate expires. This provisioning path carries a
-broader trust risk than an official owner-specific pairing protocol would.
+The uploaded private key and certificate chain are stored in the Home Assistant
+config entry, so startup is entirely local. Consequently, full
+Home Assistant backups contain that private key. Protect backups as credentials: encrypt them,
+restrict access, and delete obsolete copies. Anyone who obtains the key may be
+able to authenticate locally to the configured air conditioner until the
+certificate expires. A credential obtained outside an official owner-pairing
+protocol carries a broader trust risk than one issued by it.
 
 No private keys, device identifiers, host addresses, raw protocol payloads,
 resource paths, or digest values are shown in UI errors, repairs, diagnostics,
@@ -134,7 +137,7 @@ local read before Home Assistant reports success.
 
 If the connection drops, entities become unavailable and the coordinator retries
 with bounded exponential backoff. It re-establishes subscriptions locally; it
-does not contact SmartThings or perform certificate bootstrap during a normal
+does not contact SmartThings or any network service during a normal
 reconnect or restart.
 
 ## Limitations
@@ -159,13 +162,13 @@ Confirm the host is correct and stable, the air conditioner is awake, routing
 and firewall rules allow local UDP traffic, and Wi-Fi client isolation is off.
 Use **Reconfigure** from the integration entry after its address changes.
 
-**Bootstrap is unavailable or times out**
+**The uploaded credential is rejected**
 
 Temporarily allow Home Assistant outbound HTTPS and working DNS. Verify the host
 clock is synchronized. Retry setup; do not paste or manually supply certificate
 material.
 
-**Bootstrap pin changed**
+**The certificate has expired**
 
 Stop. This is a security boundary, not a connectivity error. Install a reviewed
 integration release with updated pins. Never disable pin checks or use an

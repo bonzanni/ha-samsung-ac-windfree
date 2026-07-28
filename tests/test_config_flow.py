@@ -7,12 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.samsung_ac_windfree.const import DOMAIN
+from custom_components.samsung_ac_windfree.credentials import CredentialError
 from custom_components.samsung_ac_windfree.models import (
-    BootstrapError,
     CapabilityMismatch,
     Credentials,
     DeviceIdentity,
@@ -86,6 +85,43 @@ def _config_flow_traceback_locals(error: BaseException) -> str:
     return "\n".join(values)
 
 
+@pytest.fixture(autouse=True)
+def uploaded_credential(credentials):
+    """Resolve the upload step to a valid credential by default.
+
+    The upload ids these tests submit do not exist in Home Assistant's file
+    store, so without this every flow would stop on the credential form. Tests
+    that care about rejection patch this target themselves.
+    """
+
+    with patch(
+        "custom_components.samsung_ac_windfree.config_flow."
+        "_async_read_uploaded_credential",
+        new=AsyncMock(return_value=credentials),
+    ) as mocked:
+        yield mocked
+
+
+KEY_UPLOAD_ID = "11111111-1111-4111-8111-111111111111"
+CHAIN_UPLOAD_ID = "22222222-2222-4222-8222-222222222222"
+
+
+async def _upload_credential(hass, result):
+    """Drive the credential upload step.
+
+    _async_read_uploaded_credential is patched in these tests, so the ids only
+    need to be distinct; equal ids are rejected and covered separately.
+    """
+
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "client_key_file": KEY_UPLOAD_ID,
+            "client_chain_file": CHAIN_UPLOAD_ID,
+        },
+    )
+
+
 async def _finish_progress(hass, result):
     await hass.async_block_till_done()
     progress = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
@@ -122,21 +158,26 @@ async def test_success_uses_progress_then_creates_secret_entry(
             context={"source": config_entries.SOURCE_USER},
             data={"host": HOST},
         )
+        # The host step now hands off to the credential upload before any work.
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "credentials"
+        result = await _upload_credential(hass, result)
         assert result["type"] is FlowResultType.SHOW_PROGRESS
         result = await _finish_progress(hass, result)
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == _entry_data(validated_setup)
     assert result["result"].unique_id == DEVICE_ID
-    assert set(validate.call_args.args) == {hass, HOST}
+    assert validate.call_args.args[0] is hass
+    assert validate.call_args.args[1] == HOST
 
 
 @pytest.mark.parametrize(
     ("error", "error_key"),
     [
-        (BootstrapError("bootstrap_unavailable: unavailable"), "bootstrap_unavailable"),
-        (BootstrapError("bootstrap_pin_mismatch: changed"), "bootstrap_pin_mismatch"),
-        (BootstrapError("invalid_clock: invalid"), "invalid_clock"),
+        (CredentialError("credentials_unreadable"), "credentials_unreadable"),
+        (CredentialError("credentials_key_mismatch"), "credentials_key_mismatch"),
+        (CredentialError("credentials_expired"), "credentials_expired"),
         (TransportError("transport_discovery_failed"), "cannot_connect"),
         (UnsupportedDevice("unsupported_device"), "unsupported_device"),
         (CapabilityMismatch("capability_mismatch"), "capability_mismatch"),
@@ -156,296 +197,13 @@ async def test_flow_maps_only_sanitized_validation_errors(
             context={"source": config_entries.SOURCE_USER},
             data={"host": HOST},
         )
+        result = await _upload_credential(hass, result)
         result = await _finish_progress(hass, result)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "credentials"
     assert result["errors"] == {"base": error_key}
     assert HOST not in repr(result["errors"])
-
-
-async def test_bootstrap_flow_issue_transitions_and_success_recovery(
-    hass,
-    validated_setup,
-) -> None:
-    registry = ir.async_get(hass)
-    validate = AsyncMock(
-        side_effect=[
-            BootstrapError("bootstrap_pin_mismatch: changed"),
-            BootstrapError("bootstrap_unavailable: unavailable"),
-            validated_setup,
-        ]
-    )
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_validate_setup",
-            validate,
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.async_setup_entry",
-            new=AsyncMock(return_value=True),
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        result = await _finish_progress(hass, result)
-        assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
-        assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
-        hass.config_entries.flow.async_abort(result["flow_id"])
-
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        result = await _finish_progress(hass, result)
-        assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
-        assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is not None
-        hass.config_entries.flow.async_abort(result["flow_id"])
-
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await _finish_progress(hass, result)
-
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
-
-
-@pytest.mark.parametrize(
-    ("bootstrap_error", "expected_issue"),
-    [
-        (TimeoutError(), "bootstrap_unavailable"),
-        (RuntimeError("dependency unavailable"), "bootstrap_unavailable"),
-        (
-            BootstrapError("bootstrap_pin_mismatch: changed"),
-            "bootstrap_pin_changed",
-        ),
-    ],
-)
-async def test_actual_bootstrap_failures_update_repairs(
-    hass,
-    bootstrap_error,
-    expected_issue,
-) -> None:
-    registry = ir.async_get(hass)
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        "bootstrap_pin_changed",
-        is_fixable=False,
-        is_persistent=True,
-        severity=ir.IssueSeverity.ERROR,
-        translation_key="bootstrap_pin_changed",
-    )
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
-            new=AsyncMock(),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            new=AsyncMock(side_effect=bootstrap_error),
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await _finish_progress(hass, result)
-
-    assert registry.async_get_issue(DOMAIN, expected_issue) is not None
-    other = (
-        "bootstrap_unavailable"
-        if expected_issue == "bootstrap_pin_changed"
-        else "bootstrap_pin_changed"
-    )
-    assert registry.async_get_issue(DOMAIN, other) is None
-
-
-@pytest.mark.parametrize("later_failure", ["sweep", "read"])
-async def test_verified_bootstrap_clears_issues_before_later_failure(
-    hass,
-    credentials,
-    later_failure,
-) -> None:
-    registry = ir.async_get(hass)
-    for issue_id in ("bootstrap_pin_changed", "bootstrap_unavailable"):
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            issue_id,
-            is_fixable=False,
-            is_persistent=True,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key=issue_id,
-        )
-    transport = AsyncMock()
-    if later_failure == "read":
-        transport.async_get.side_effect = TimeoutError
-        discover = AsyncMock(return_value=(49154, transport))
-    else:
-        discover = AsyncMock(side_effect=TimeoutError)
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
-            new=AsyncMock(),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            new=AsyncMock(return_value=credentials),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_discover_transport",
-            new=discover,
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await _finish_progress(hass, result)
-
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
-    if later_failure == "read":
-        transport.async_close.assert_awaited_once_with()
-
-
-async def test_failure_before_bootstrap_preserves_existing_issue(hass) -> None:
-    registry = ir.async_get(hass)
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        "bootstrap_pin_changed",
-        is_fixable=False,
-        is_persistent=True,
-        severity=ir.IssueSeverity.ERROR,
-        translation_key="bootstrap_pin_changed",
-    )
-    bootstrap = AsyncMock()
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
-            new=AsyncMock(side_effect=OSError("dns unavailable")),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            new=bootstrap,
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await _finish_progress(hass, result)
-
-    bootstrap.assert_not_awaited()
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
-
-
-async def test_overall_timeout_before_bootstrap_preserves_issue(hass) -> None:
-    registry = ir.async_get(hass)
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        "bootstrap_unavailable",
-        is_fixable=False,
-        is_persistent=True,
-        severity=ir.IssueSeverity.WARNING,
-        translation_key="bootstrap_unavailable",
-    )
-    bootstrap = AsyncMock()
-
-    async def blocked_resolve(*_args):
-        await asyncio.Event().wait()
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.SETUP_TIMEOUT",
-            0.001,
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
-            blocked_resolve,
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            new=bootstrap,
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await _finish_progress(hass, result)
-
-    bootstrap.assert_not_awaited()
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is not None
-
-
-async def test_bootstrap_cancellation_preserves_existing_issue(hass) -> None:
-    registry = ir.async_get(hass)
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        "bootstrap_pin_changed",
-        is_fixable=False,
-        is_persistent=True,
-        severity=ir.IssueSeverity.ERROR,
-        translation_key="bootstrap_pin_changed",
-    )
-    started = asyncio.Event()
-    cleaned = asyncio.Event()
-
-    async def blocked_bootstrap(_hass):
-        try:
-            started.set()
-            await asyncio.Event().wait()
-        finally:
-            cleaned.set()
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_resolve_host",
-            new=AsyncMock(),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            blocked_bootstrap,
-        ),
-    ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": config_entries.SOURCE_USER},
-            data={"host": HOST},
-        )
-        await started.wait()
-        hass.config_entries.flow.async_abort(result["flow_id"])
-        await hass.async_block_till_done()
-
-    assert cleaned.is_set()
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
 
 
 async def test_duplicate_device_aborts_after_local_validation(
@@ -467,6 +225,7 @@ async def test_duplicate_device_aborts_after_local_validation(
             context={"source": config_entries.SOURCE_USER},
             data={"host": HOST},
         )
+        result = await _upload_credential(hass, result)
         result = await _finish_progress(hass, result)
 
     assert result["type"] is FlowResultType.ABORT
@@ -477,7 +236,7 @@ async def test_flow_removal_cancels_progress_and_runs_validation_cleanup(hass) -
     started = asyncio.Event()
     cleaned = asyncio.Event()
 
-    async def validate(_hass, _host):
+    async def validate(_hass, _host, _credentials):
         try:
             started.set()
             await asyncio.Event().wait()
@@ -493,6 +252,8 @@ async def test_flow_removal_cancels_progress_and_runs_validation_cleanup(hass) -
             context={"source": config_entries.SOURCE_USER},
             data={"host": HOST},
         )
+        # Validation only starts once the credential has been supplied.
+        result = await _upload_credential(hass, result)
         await started.wait()
         hass.config_entries.flow.async_abort(result["flow_id"])
         await hass.async_block_till_done()
@@ -600,7 +361,7 @@ async def test_failed_reauth_preserves_old_credentials(hass, validated_setup) ->
 
     with patch(
         "custom_components.samsung_ac_windfree.config_flow.async_validate_setup",
-        new=AsyncMock(side_effect=BootstrapError("bootstrap_unavailable: unavailable")),
+        new=AsyncMock(side_effect=CredentialError("credentials_unreadable")),
     ):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
@@ -611,12 +372,15 @@ async def test_failed_reauth_preserves_old_credentials(hass, validated_setup) ->
             data=entry.data,
         )
         assert result["type"] is FlowResultType.FORM
-        assert result["data_schema"].schema == {}
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        assert {marker.schema for marker in result["data_schema"].schema} == {
+            "client_key_file",
+            "client_chain_file",
+        }
+        result = await _upload_credential(hass, result)
         result = await _finish_progress(hass, result)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {"base": "bootstrap_unavailable"}
+    assert result["errors"] == {"base": "credentials_unreadable"}
     assert dict(entry.data) == original
 
 
@@ -660,7 +424,7 @@ async def test_successful_reauth_replaces_credentials_once(
             },
             data=entry.data,
         )
-        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        result = await _upload_credential(hass, result)
         result = await _finish_progress(hass, result)
         await hass.async_block_till_done()
 
@@ -692,7 +456,8 @@ async def test_validate_setup_budgets_phases_and_reuses_swept_transport(
             resolve,
         ),
         patch(
-            "custom_components.samsung_ac_windfree.config_flow.async_bootstrap_credentials",
+            "custom_components.samsung_ac_windfree.config_flow."
+            "_async_read_uploaded_credential",
             bootstrap,
         ),
         patch(
@@ -700,7 +465,7 @@ async def test_validate_setup_budgets_phases_and_reuses_swept_transport(
             discover,
         ),
     ):
-        result = await async_validate_setup(hass, HOST)
+        result = await async_validate_setup(hass, HOST, credentials)
 
     assert isinstance(result, ValidatedSetup)
     assert result.port == 49154
@@ -716,17 +481,13 @@ async def test_validate_setup_budgets_phases_and_reuses_swept_transport(
 
 def test_validation_phase_budgets_fit_inside_overall_timeout() -> None:
     from custom_components.samsung_ac_windfree.config_flow import (
-        BOOTSTRAP_TIMEOUT,
         HOST_RESOLVE_TIMEOUT,
         IDENTITY_READ_TIMEOUT,
         SETUP_TIMEOUT,
         SWEEP_TIMEOUT,
     )
 
-    assert (
-        HOST_RESOLVE_TIMEOUT + BOOTSTRAP_TIMEOUT + SWEEP_TIMEOUT + IDENTITY_READ_TIMEOUT
-        <= SETUP_TIMEOUT
-    )
+    assert HOST_RESOLVE_TIMEOUT + SWEEP_TIMEOUT + IDENTITY_READ_TIMEOUT <= SETUP_TIMEOUT
 
 
 @pytest.mark.parametrize(
@@ -766,7 +527,7 @@ async def test_validate_setup_rejects_non_exact_identity_or_contract(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
+            "_async_read_uploaded_credential",
             new=AsyncMock(return_value=credentials),
         ),
         patch(
@@ -776,7 +537,7 @@ async def test_validate_setup_rejects_non_exact_identity_or_contract(
         ),
     ):
         with pytest.raises(SetupValidationError, match=f"^{expected}$"):
-            await async_validate_setup(hass, HOST)
+            await async_validate_setup(hass, HOST, credentials)
 
     transport.async_close.assert_awaited_once_with()
 
@@ -785,7 +546,6 @@ async def test_validate_setup_rejects_non_exact_identity_or_contract(
     ("phase", "expected"),
     [
         ("async_resolve_host", "dns_timeout"),
-        ("async_bootstrap_credentials", "fetch_timeout"),
         ("async_discover_transport", "sweep_timeout"),
     ],
 )
@@ -807,13 +567,6 @@ async def test_validate_setup_has_independent_phase_timeouts(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
-            blocked
-            if phase == "async_bootstrap_credentials"
-            else AsyncMock(return_value=credentials),
-        ),
-        patch(
-            "custom_components.samsung_ac_windfree.config_flow."
             "async_discover_transport",
             blocked
             if phase == "async_discover_transport"
@@ -823,14 +576,13 @@ async def test_validate_setup_has_independent_phase_timeouts(
             "custom_components.samsung_ac_windfree.config_flow."
             + {
                 "async_resolve_host": "HOST_RESOLVE_TIMEOUT",
-                "async_bootstrap_credentials": "BOOTSTRAP_TIMEOUT",
                 "async_discover_transport": "SWEEP_TIMEOUT",
             }[phase],
             0.001,
         ),
     ):
         with pytest.raises(SetupValidationError, match=f"^{expected}$"):
-            await async_validate_setup(hass, HOST)
+            await async_validate_setup(hass, HOST, credentials)
 
 
 async def test_validate_setup_read_timeout_closes_swept_transport(
@@ -854,7 +606,7 @@ async def test_validate_setup_read_timeout_closes_swept_transport(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
+            "_async_read_uploaded_credential",
             new=AsyncMock(return_value=credentials),
         ),
         patch(
@@ -868,12 +620,12 @@ async def test_validate_setup_read_timeout_closes_swept_transport(
         ),
     ):
         with pytest.raises(SetupValidationError, match=r"^read_timeout$"):
-            await async_validate_setup(hass, HOST)
+            await async_validate_setup(hass, HOST, credentials)
 
     transport.async_close.assert_awaited_once_with()
 
 
-async def test_validate_setup_overall_timeout_is_independent(hass) -> None:
+async def test_validate_setup_overall_timeout_is_independent(hass, credentials) -> None:
     from custom_components.samsung_ac_windfree.config_flow import (
         SetupValidationError,
         async_validate_setup,
@@ -897,7 +649,7 @@ async def test_validate_setup_overall_timeout_is_independent(hass) -> None:
         ),
     ):
         with pytest.raises(SetupValidationError, match=r"^setup_timeout$"):
-            await async_validate_setup(hass, HOST)
+            await async_validate_setup(hass, HOST, credentials)
 
 
 async def test_validate_setup_cancellation_closes_transport(hass, credentials) -> None:
@@ -918,7 +670,7 @@ async def test_validate_setup_cancellation_closes_transport(hass, credentials) -
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
+            "_async_read_uploaded_credential",
             new=AsyncMock(return_value=credentials),
         ),
         patch(
@@ -927,7 +679,7 @@ async def test_validate_setup_cancellation_closes_transport(hass, credentials) -
             new=AsyncMock(return_value=(49154, transport)),
         ),
     ):
-        task = hass.async_create_task(async_validate_setup(hass, HOST))
+        task = hass.async_create_task(async_validate_setup(hass, HOST, credentials))
         await reading.wait()
         task.cancel("flow_removed")
         with pytest.raises(asyncio.CancelledError, match="flow_removed"):
@@ -943,7 +695,7 @@ async def test_public_validate_cancellation_scrubs_host_and_internal_context(
 
     started = asyncio.Event()
 
-    async def blocked(_hass, _host):
+    async def blocked(_hass, _host, *_args):
         started.set()
         await asyncio.Event().wait()
 
@@ -952,7 +704,7 @@ async def test_public_validate_cancellation_scrubs_host_and_internal_context(
         "_async_validate_setup_outcome",
         blocked,
     ):
-        task = hass.async_create_task(async_validate_setup(hass, HOST))
+        task = hass.async_create_task(async_validate_setup(hass, HOST, credentials))
         await started.wait()
         task.cancel("public_validation_cancelled")
         with pytest.raises(
@@ -988,7 +740,7 @@ async def test_validate_setup_close_failure_is_sanitized(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
+            "_async_read_uploaded_credential",
             new=AsyncMock(return_value=credentials),
         ),
         patch(
@@ -998,7 +750,7 @@ async def test_validate_setup_close_failure_is_sanitized(
         ),
     ):
         with pytest.raises(SetupValidationError, match=r"^cannot_connect$") as caught:
-            await async_validate_setup(hass, HOST)
+            await async_validate_setup(hass, HOST, credentials)
 
     assert HOST not in repr(caught.value)
     assert credentials.client_key_pem not in repr(caught.value)
@@ -1033,7 +785,7 @@ async def test_validate_setup_cancellation_during_close_finishes_cleanup(
         ),
         patch(
             "custom_components.samsung_ac_windfree.config_flow."
-            "async_bootstrap_credentials",
+            "_async_read_uploaded_credential",
             new=AsyncMock(return_value=credentials),
         ),
         patch(
@@ -1042,7 +794,7 @@ async def test_validate_setup_cancellation_during_close_finishes_cleanup(
             new=AsyncMock(return_value=(49154, transport)),
         ),
     ):
-        task = hass.async_create_task(async_validate_setup(hass, HOST))
+        task = hass.async_create_task(async_validate_setup(hass, HOST, credentials))
         await close_started.wait()
         task.cancel("cancel_during_close")
         await asyncio.sleep(0)

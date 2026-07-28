@@ -21,6 +21,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import COMPATIBILITY, DOMAIN, PLATFORMS
 from .coordinator import WindFreeCoordinator
+from .credentials import stored_credentials
 from .models import (
     AuthenticationRejected,
     CapabilityMismatch,
@@ -28,6 +29,7 @@ from .models import (
     UnsupportedDevice,
 )
 from .repairs import (
+    async_delete_legacy_bootstrap_issues,
     async_handle_entry_unload,
     async_purge_entry_issues,
     async_sync_certificate_issue,
@@ -109,37 +111,6 @@ def _lifecycles(hass: HomeAssistant) -> dict[str, _EntryLifecycle]:
     return hass.data.setdefault(_LIFECYCLE_DATA, {})
 
 
-def _stored_credentials(data: Mapping[str, Any]) -> Credentials | None:
-    try:
-        credentials = Credentials(
-            client_key_pem=data["client_key_pem"],
-            client_chain_pem=data["client_chain_pem"],
-            not_before=data["not_before"],
-            not_after=data["not_after"],
-        )
-        if not all(
-            isinstance(value, str)
-            for value in (
-                credentials.client_key_pem,
-                credentials.client_chain_pem,
-                credentials.not_before,
-                credentials.not_after,
-            )
-        ):
-            raise ValueError
-        not_before = datetime.fromisoformat(credentials.not_before)
-        not_after = datetime.fromisoformat(credentials.not_after)
-        if (
-            not_before.tzinfo is None
-            or not_after.tzinfo is None
-            or not_before >= not_after
-        ):
-            raise ValueError
-    except KeyError, TypeError, ValueError:
-        return None
-    return credentials
-
-
 def _stored_endpoint(data: Mapping[str, Any]) -> tuple[str, int] | None:
     try:
         host = data["host"]
@@ -207,46 +178,6 @@ async def _async_shutdown_cancellation_safe(
     return _ShutdownOutcome(completed, cancellation_args)
 
 
-async def _async_reload_entry(
-    hass: HomeAssistant,
-    entry: WindFreeConfigEntry,
-) -> None:
-    """Reload an entry after its atomically updated stored data changes."""
-
-    lifecycle = _lifecycles(hass).get(entry.entry_id)
-    if lifecycle is not None:
-        lifecycle.suspend()
-    reload_failed = False
-    cancellation_args: tuple[object, ...] | None = None
-    try:
-        reloaded = await hass.config_entries.async_reload(entry.entry_id)
-        reload_failed = not reloaded
-    except asyncio.CancelledError as cancelled:
-        cancellation_args = cancelled.args
-        cancelled.__traceback__ = None
-        cancelled = None
-    except Exception as error:
-        error.__traceback__ = None
-        error = None
-        reload_failed = True
-    if (
-        reload_failed
-        and lifecycle is not None
-        and _lifecycles(hass).get(entry.entry_id) is lifecycle
-    ):
-        lifecycle.attach()
-    lifecycle = None
-    entry = None
-    del lifecycle, entry
-    if cancellation_args is not None:
-        args = cancellation_args
-        cancellation_args = None
-        del cancellation_args
-        raise asyncio.CancelledError(*args) from None
-    if reload_failed:
-        raise _translated_entry_error(ConfigEntryError, "reload_failed") from None
-
-
 async def _async_shutdown_on_home_assistant_stop(
     coordinator: WindFreeCoordinator,
     _event: Event,
@@ -262,7 +193,12 @@ async def async_setup_entry(
 ) -> bool:
     """Set up exclusively from persisted per-installation material."""
 
-    credentials = _stored_credentials(entry.data)
+    # One-time cleanup: the retired bootstrap left persistent Repairs behind,
+    # and Home Assistant re-activates those on start regardless of whether the
+    # integration still defines them.
+    async_delete_legacy_bootstrap_issues(hass)
+
+    credentials = stored_credentials(entry.data)
     if credentials is None:
         entry = None
         raise _translated_entry_error(
@@ -341,7 +277,6 @@ async def async_setup_entry(
         )
         lifecycle.attach()
         _lifecycles(hass)[entry.entry_id] = lifecycle
-        entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
         entry.async_on_unload(
             hass.bus.async_listen_once(
                 EVENT_HOMEASSISTANT_STOP,

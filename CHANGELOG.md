@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - 2026-07-28
+
+### Changed
+
+- **BREAKING:** the integration no longer creates its own client certificate.
+  Setup and reauthentication now ask for a client key and certificate chain,
+  uploaded as files, and validate them before anything is stored. Existing
+  entries keep working with their stored credential and need no action until it
+  expires.
+- Setup, reconfiguration and reauthentication are now entirely local. The
+  integration performs no network requests outside the local network at any
+  point.
+
+### Removed
+
+- The certificate provisioning path, its pinned constants, and the scheduled
+  pin canary. Obtaining a credential is outside the scope of this integration.
+- The `bootstrap_pin_changed` and `bootstrap_unavailable` repair issues. Both
+  were persistent, so this release deletes any that already exist.
+
+### Fixed
+
+- Removed a config-entry update listener that, combined with the reload helper,
+  is deprecated since Home Assistant 2026.6 and becomes an error in 2026.12.
+
 ## [0.2.0] - 2026-07-28
 
 ### Added

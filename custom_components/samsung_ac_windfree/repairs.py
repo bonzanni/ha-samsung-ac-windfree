@@ -232,26 +232,17 @@ def async_purge_entry_issues(
     _sync_entry_aggregates(hass, store)
 
 
-def async_sync_bootstrap_issue(
-    hass: HomeAssistant,
-    error_key: str | None,
-) -> None:
-    """Synchronize mutually exclusive one-time bootstrap failures."""
+def async_delete_legacy_bootstrap_issues(hass: HomeAssistant) -> None:
+    """Remove the Repairs issues the retired bootstrap used to raise.
 
-    _sync_issue(
-        hass,
-        _BOOTSTRAP_PIN_CHANGED,
-        error_key == "bootstrap_pin_mismatch",
-        fixable=False,
-        severity=ir.IssueSeverity.ERROR,
-    )
-    _sync_issue(
-        hass,
-        _BOOTSTRAP_UNAVAILABLE,
-        error_key == "bootstrap_unavailable",
-        fixable=False,
-        severity=ir.IssueSeverity.WARNING,
-    )
+    Both were created with is_persistent=True, and Home Assistant re-activates
+    persistent issues on start without checking that the integration still
+    defines them. Without this they would linger forever, eventually with no
+    translation behind them.
+    """
+
+    for issue_id in (_BOOTSTRAP_PIN_CHANGED, _BOOTSTRAP_UNAVAILABLE):
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
 def async_sync_certificate_issue(

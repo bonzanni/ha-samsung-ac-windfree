@@ -5,35 +5,55 @@ from __future__ import annotations
 import asyncio
 import socket
 from collections.abc import Mapping
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.components.file_upload import process_uploaded_file
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.selector import FileSelector, FileSelectorConfig
 
-from .bootstrap import async_bootstrap_credentials
 from .const import DOMAIN, HOST_RESOLVE_TIMEOUT, SETUP_TIMEOUT
+from .credentials import (
+    MAX_CREDENTIAL_BYTES,
+    CredentialError,
+    parse_uploaded_credential,
+    stored_credentials,
+)
 from .device import parse_identity, validate_contract
 from .models import (
-    BootstrapError,
     CapabilityMismatch,
     Credentials,
     DeviceIdentity,
     UnsupportedDevice,
     WindFreeError,
 )
-from .repairs import async_sync_bootstrap_issue
 from .transport import TransportError, WindFreeTransport, async_discover_transport
 
-BOOTSTRAP_TIMEOUT = 30.0
 SWEEP_TIMEOUT = 54.0
 IDENTITY_READ_TIMEOUT = 24.0
 
+# The stored credential fields reconfigure must never rewrite.
+_CREDENTIAL_KEYS = frozenset(
+    {"client_key_pem", "client_chain_pem", "not_before", "not_after"}
+)
+
+CONF_CLIENT_KEY_FILE = "client_key_file"
+CONF_CLIENT_CHAIN_FILE = "client_chain_file"
+
 _HOST_SCHEMA = vol.Schema({vol.Required("host"): str})
-_CONFIRM_SCHEMA = vol.Schema({})
+_CREDENTIAL_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_CLIENT_KEY_FILE): FileSelector(
+            FileSelectorConfig(accept=".pem,.key,application/x-pem-file")
+        ),
+        vol.Required(CONF_CLIENT_CHAIN_FILE): FileSelector(
+            FileSelectorConfig(accept=".pem,.crt,.cer,application/x-pem-file")
+        ),
+    }
+)
 _COMPATIBILITY: Mapping[str, object] = {
     "always_allowed": ["power", "hvac_mode", "display_light", "auto_clean"],
     "by_mode": {
@@ -44,18 +64,6 @@ _COMPATIBILITY: Mapping[str, object] = {
         "Heat": ["temperature"],
     },
 }
-_BOOTSTRAP_ERRORS = frozenset(
-    {
-        "bootstrap_unavailable",
-        "bootstrap_pin_mismatch",
-        "invalid_clock",
-        "bootstrap_invalid_material",
-    }
-)
-_BOOTSTRAP_REPORTER: ContextVar[object | None] = ContextVar(
-    "windfree_bootstrap_reporter",
-    default=None,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,12 +89,6 @@ class _ValidationCleanupError(Exception):
     """Internal marker for a validation session that could not close."""
 
 
-def _report_bootstrap(status: str) -> None:
-    reporter = _BOOTSTRAP_REPORTER.get()
-    if callable(reporter):
-        reporter(status)
-
-
 async def async_resolve_host(hass: HomeAssistant, host: str) -> None:
     """Resolve a host without exposing resolver details to callers."""
 
@@ -95,9 +97,65 @@ async def async_resolve_host(hass: HomeAssistant, host: str) -> None:
     await loop.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
 
 
-def _bootstrap_error_key(error: BootstrapError) -> str:
-    key = str(error).partition(":")[0]
-    return key if key in _BOOTSTRAP_ERRORS else "bootstrap_unavailable"
+async def _async_read_uploaded_credential(
+    hass: HomeAssistant,
+    key_id: str,
+    chain_id: str,
+) -> Credentials:
+    """Consume both uploads exactly once and validate what they contain.
+
+    process_uploaded_file is a synchronous context manager that deletes the
+    upload on exit, so both handles are consumed in a single executor call: if
+    the chain were read after a failure on the key, the second upload would be
+    left behind in Home Assistant's temporary storage.
+    """
+
+    def _consume(upload_id: str) -> bytes | None:
+        """Consume one upload, refusing to read more than a credential's worth.
+
+        The size is checked inside the context so an oversized file is still
+        deleted, and is never loaded into memory: the upload endpoint accepts
+        far larger files than this.
+        """
+
+        with process_uploaded_file(hass, upload_id) as path:
+            if path.stat().st_size > MAX_CREDENTIAL_BYTES:
+                return None
+            return path.read_bytes()
+
+    def _read() -> tuple[bytes | None, bytes | None]:
+        # Every handle is consumed even when an earlier one fails, so a rejected
+        # upload never strands a file in Home Assistant's temporary storage.
+        key_bytes: bytes | None = None
+        chain_bytes: bytes | None = None
+        try:
+            key_bytes = _consume(key_id)
+        finally:
+            if chain_id != key_id:
+                try:
+                    chain_bytes = _consume(chain_id)
+                except Exception:
+                    chain_bytes = None
+        return key_bytes, chain_bytes
+
+    if key_id == chain_id:
+        # A single handle cannot be consumed twice, but it must still be
+        # consumed once: returning early would leave the key file behind.
+        try:
+            await hass.async_add_executor_job(_read)
+        except Exception:
+            pass
+        raise CredentialError("credentials_duplicate_file")
+
+    try:
+        key_bytes, chain_bytes = await hass.async_add_executor_job(_read)
+    except Exception:
+        raise CredentialError("credentials_unreadable") from None
+
+    if key_bytes is None or chain_bytes is None:
+        raise CredentialError("credentials_unreadable")
+
+    return parse_uploaded_credential(key_bytes, chain_bytes)
 
 
 async def _async_close_validation_transport(
@@ -138,8 +196,8 @@ async def _async_close_validation_transport(
 async def _async_validate_pipeline(
     hass: HomeAssistant,
     host: str,
+    credentials: Credentials,
 ) -> ValidatedSetup | _ValidationFailure:
-    credentials: Credentials | None = None
     transport: WindFreeTransport | None = None
     payloads: dict[str, Mapping[str, object]] | None = None
     cancellation_args: tuple[object, ...] | None = None
@@ -156,30 +214,6 @@ async def _async_validate_pipeline(
             error.__traceback__ = None
             error = None
             return _ValidationFailure("cannot_resolve")
-
-        _report_bootstrap("attempted")
-        try:
-            async with asyncio.timeout(BOOTSTRAP_TIMEOUT):
-                credentials = await async_bootstrap_credentials(hass)
-        except TimeoutError:
-            _report_bootstrap("unavailable")
-            return _ValidationFailure("fetch_timeout")
-        except asyncio.CancelledError:
-            raise
-        except BootstrapError as error:
-            key = _bootstrap_error_key(error)
-            _report_bootstrap(
-                "pin_changed" if key == "bootstrap_pin_mismatch" else "unavailable"
-            )
-            error.__traceback__ = None
-            error = None
-            return _ValidationFailure(key)
-        except Exception as error:
-            _report_bootstrap("unavailable")
-            error.__traceback__ = None
-            error = None
-            return _ValidationFailure("bootstrap_unavailable")
-        _report_bootstrap("succeeded")
 
         try:
             async with asyncio.timeout(SWEEP_TIMEOUT):
@@ -266,11 +300,12 @@ async def _async_validate_pipeline(
 async def _async_validate_setup_outcome(
     hass: HomeAssistant,
     host: str,
+    credentials: Credentials,
 ) -> ValidatedSetup | _ValidationFailure:
     cancellation_args: tuple[object, ...] | None = None
     try:
         async with asyncio.timeout(SETUP_TIMEOUT):
-            return await _async_validate_pipeline(hass, host)
+            return await _async_validate_pipeline(hass, host, credentials)
     except TimeoutError:
         return _ValidationFailure("setup_timeout")
     except _ValidationCleanupError:
@@ -280,22 +315,24 @@ async def _async_validate_setup_outcome(
         cancelled.__traceback__ = None
         cancelled = None
     host = ""
+    credentials = None
     args = cancellation_args or ()
     cancellation_args = None
-    del host, cancellation_args
+    del host, credentials, cancellation_args
     raise asyncio.CancelledError(*args) from None
 
 
 async def async_validate_setup(
     hass: HomeAssistant,
     host: str,
+    credentials: Credentials,
 ) -> ValidatedSetup:
-    """Bootstrap once, authenticate locally, and enforce the exact contract."""
+    """Authenticate locally with a supplied credential and enforce the contract."""
 
     outcome: ValidatedSetup | _ValidationFailure | None = None
     cancellation_args: tuple[object, ...] | None = None
     try:
-        outcome = await _async_validate_setup_outcome(hass, host)
+        outcome = await _async_validate_setup_outcome(hass, host, credentials)
     except asyncio.CancelledError as cancelled:
         cancellation_args = cancelled.args
         cancelled.__traceback__ = None
@@ -335,8 +372,8 @@ def _entry_data(validated: ValidatedSetup) -> dict[str, Any]:
 def _flow_error(error: BaseException) -> str:
     if isinstance(error, SetupValidationError):
         return str(error)
-    if isinstance(error, BootstrapError):
-        return _bootstrap_error_key(error)
+    if isinstance(error, CredentialError):
+        return str(error)
     if isinstance(error, TransportError):
         return "cannot_connect"
     if isinstance(error, UnsupportedDevice):
@@ -360,26 +397,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._validation_task: asyncio.Task[ValidatedSetup] | None = None
         self._validated: ValidatedSetup | None = None
         self._error: str | None = None
-        self._bootstrap_status = "not_attempted"
+        self._credentials: Credentials | None = None
 
-    def _note_bootstrap(self, status: str) -> None:
-        self._bootstrap_status = status
-        if status == "succeeded":
-            async_sync_bootstrap_issue(self.hass, None)
-        elif status == "pin_changed":
-            async_sync_bootstrap_issue(self.hass, "bootstrap_pin_mismatch")
-        elif status == "unavailable":
-            async_sync_bootstrap_issue(self.hass, "bootstrap_unavailable")
-
-    async def _async_validate_with_tracking(self) -> ValidatedSetup:
-        token = _BOOTSTRAP_REPORTER.set(self._note_bootstrap)
-        try:
-            validated = await async_validate_setup(self.hass, self._host)
-        finally:
-            _BOOTSTRAP_REPORTER.reset(token)
-        if self._bootstrap_status == "not_attempted":
-            self._note_bootstrap("succeeded")
-        return validated
+    def _credential_form(
+        self,
+        step_id: str,
+        *,
+        errors: dict[str, str] | None = None,
+    ) -> ConfigFlowResult:
+        # Upload ids are single-use, so nothing is ever suggested back into the
+        # form: a retry must re-upload both files.
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=_CREDENTIAL_SCHEMA,
+            errors=errors,
+        )
 
     def _host_form(
         self,
@@ -405,9 +437,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._operation = operation
         self._validated = None
         self._error = None
-        self._bootstrap_status = "not_attempted"
+        credentials = self._credentials
+        assert credentials is not None
         self._validation_task = self.hass.async_create_task(
-            self._async_validate_with_tracking(),
+            async_validate_setup(self.hass, self._host, credentials),
             "windfree config validation",
         )
         return self.async_show_progress(
@@ -424,7 +457,30 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is None:
             return self._host_form("user")
-        return self._start_validation(user_input["host"], "user")
+        self._host = str(user_input["host"]).strip()
+        self._operation = "user"
+        return self._credential_form("credentials")
+
+    async def async_step_credentials(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Accept the uploaded client key and chain, then validate locally."""
+
+        if user_input is None:
+            return self._credential_form("credentials")
+        try:
+            self._credentials = await _async_read_uploaded_credential(
+                self.hass,
+                str(user_input[CONF_CLIENT_KEY_FILE]),
+                str(user_input[CONF_CLIENT_CHAIN_FILE]),
+            )
+        except CredentialError as error:
+            key = str(error)
+            error.__traceback__ = None
+            error = None
+            return self._credential_form("credentials", errors={"base": key})
+        return self._start_validation(self._host, self._operation)
 
     async def async_step_reconfigure(
         self,
@@ -438,6 +494,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "reconfigure",
                 suggested_host=str(entry.data["host"]),
             )
+        # A new address for the same device reuses the stored credential; the
+        # owner is not asked to upload one again, and it is never replaced.
+        stored = stored_credentials(entry.data)
+        if stored is None:
+            return self._host_form(
+                "reconfigure",
+                errors={"base": "invalid_stored_credentials"},
+                suggested_host=str(entry.data["host"]),
+            )
+        self._credentials = stored
         return self._start_validation(user_input["host"], "reconfigure")
 
     async def async_step_reauth(
@@ -453,15 +519,25 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Confirm a one-time pinned bootstrap."""
+        """Take a replacement credential for the existing entry."""
 
-        if user_input is None:
-            return self.async_show_form(
-                step_id="reauth_confirm",
-                data_schema=_CONFIRM_SCHEMA,
-            )
         entry = self._get_reauth_entry()
-        return self._start_validation(str(entry.data["host"]), "reauth")
+        self._host = str(entry.data["host"])
+        self._operation = "reauth"
+        if user_input is None:
+            return self._credential_form("reauth_confirm")
+        try:
+            self._credentials = await _async_read_uploaded_credential(
+                self.hass,
+                str(user_input[CONF_CLIENT_KEY_FILE]),
+                str(user_input[CONF_CLIENT_CHAIN_FILE]),
+            )
+        except CredentialError as error:
+            key = str(error)
+            error.__traceback__ = None
+            error = None
+            return self._credential_form("reauth_confirm", errors={"base": key})
+        return self._start_validation(self._host, "reauth")
 
     async def async_step_validate(
         self,
@@ -485,16 +561,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             raise
         except BaseException as error:
             self._error = _flow_error(error)
-            if self._bootstrap_status == "not_attempted":
-                if isinstance(error, BootstrapError):
-                    key = _bootstrap_error_key(error)
-                    self._note_bootstrap(
-                        "pin_changed"
-                        if key == "bootstrap_pin_mismatch"
-                        else "unavailable"
-                    )
-                elif self._error == "fetch_timeout":
-                    self._note_bootstrap("unavailable")
             error.__traceback__ = None
             error = None
         finally:
@@ -511,17 +577,17 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._error is not None:
             error = self._error
             self._error = None
+            self._credentials = None
             if self._operation == "reauth":
-                return self.async_show_form(
-                    step_id="reauth_confirm",
-                    data_schema=_CONFIRM_SCHEMA,
-                    errors={"base": error},
-                )
-            step_id = "reconfigure" if self._operation == "reconfigure" else "user"
+                # The uploads were consumed, so the owner must supply them
+                # again; a confirm-only form would have nothing to retry with.
+                return self._credential_form("reauth_confirm", errors={"base": error})
+            if self._operation == "user":
+                return self._credential_form("credentials", errors={"base": error})
             return self._host_form(
-                step_id,
+                "reconfigure",
                 errors={"base": error},
-                suggested_host=self._host if step_id == "reconfigure" else None,
+                suggested_host=self._host,
             )
 
         validated = self._validated
@@ -544,9 +610,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._operation == "reconfigure":
             entry = self._get_reconfigure_entry()
             self._abort_if_unique_id_mismatch()
+            # Narrow update: a wholesale data= replacement would drop any stored
+            # field this version does not know about.
             return self.async_update_reload_and_abort(
                 entry,
-                data=data,
+                data_updates={
+                    key: value
+                    for key, value in data.items()
+                    if key not in _CREDENTIAL_KEYS
+                },
                 reason="reconfigure_successful",
             )
 

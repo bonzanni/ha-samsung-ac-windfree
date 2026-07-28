@@ -140,11 +140,6 @@ async def test_setup_is_offline_and_forwards_only_after_coordinator_start(
 
     with (
         patch(
-            "custom_components.samsung_ac_windfree.async_bootstrap_credentials",
-            new=AsyncMock(side_effect=AssertionError("startup must be offline")),
-            create=True,
-        ),
-        patch(
             "custom_components.samsung_ac_windfree.WindFreeCoordinator",
             return_value=coordinator,
         ) as constructor,
@@ -1097,177 +1092,6 @@ async def test_permanent_entry_removal_purges_private_repair_state(
     assert ir.async_get(hass).async_get_issue(DOMAIN, "authentication_rejected") is None
 
 
-async def test_update_listener_reloads_entry(hass, credentials) -> None:
-    from custom_components.samsung_ac_windfree import _async_reload_entry
-
-    entry = _entry(credentials)
-    with patch.object(
-        hass.config_entries, "async_reload", new=AsyncMock(return_value=True)
-    ) as reload_entry:
-        await _async_reload_entry(hass, entry)
-    reload_entry.assert_awaited_once_with(entry.entry_id)
-
-
-async def test_update_reload_suppresses_auth_listener_and_does_not_start_reauth(
-    hass, credentials
-) -> None:
-    from custom_components.samsung_ac_windfree import (
-        _async_reload_entry,
-        async_setup_entry,
-    )
-
-    entry = _entry(credentials)
-    entry.async_start_reauth = MagicMock()
-    coordinator = MagicMock()
-    coordinator.async_start = AsyncMock()
-    coordinator.async_shutdown = AsyncMock()
-    coordinator.authentication_rejected = False
-    listener = None
-    unsubscribe = MagicMock()
-
-    def add_listener(candidate):
-        nonlocal listener
-        listener = candidate
-        return unsubscribe
-
-    coordinator.async_add_listener.side_effect = add_listener
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
-            return_value=coordinator,
-        ),
-        patch.object(
-            hass.config_entries,
-            "async_forward_entry_setups",
-            new=AsyncMock(),
-        ),
-    ):
-        assert await async_setup_entry(hass, entry)
-
-    async def reload(_entry_id):
-        coordinator.authentication_rejected = True
-        assert listener is not None
-        listener()
-        return True
-
-    with patch.object(hass.config_entries, "async_reload", side_effect=reload):
-        await _async_reload_entry(hass, entry)
-
-    unsubscribe.assert_called_once_with()
-    entry.async_start_reauth.assert_not_called()
-
-
-async def test_failed_reload_after_successful_unload_does_not_restore_old_lifecycle(
-    hass, credentials
-) -> None:
-    from custom_components.samsung_ac_windfree import (
-        _async_reload_entry,
-        _lifecycles,
-        async_setup_entry,
-    )
-
-    entry = _entry(credentials)
-    entry.async_start_reauth = MagicMock()
-    coordinator = MagicMock()
-    coordinator.async_start = AsyncMock()
-    coordinator.async_shutdown = AsyncMock()
-    coordinator.authentication_rejected = False
-    listeners = []
-    unsubscribes = []
-
-    def add_listener(listener):
-        listeners.append(listener)
-        unsubscribe = MagicMock()
-        unsubscribes.append(unsubscribe)
-        return unsubscribe
-
-    coordinator.async_add_listener.side_effect = add_listener
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
-            return_value=coordinator,
-        ),
-        patch.object(
-            hass.config_entries,
-            "async_forward_entry_setups",
-            new=AsyncMock(),
-        ),
-    ):
-        assert await async_setup_entry(hass, entry)
-
-    async def reload(_entry_id):
-        _lifecycles(hass).pop(entry.entry_id)
-        coordinator.authentication_rejected = True
-        return False
-
-    with (
-        patch.object(hass.config_entries, "async_reload", side_effect=reload),
-        pytest.raises(ConfigEntryError) as caught,
-    ):
-        await _async_reload_entry(hass, entry)
-
-    _assert_translated_entry_error(caught.value, "reload_failed")
-    unsubscribes[0].assert_called_once_with()
-    assert len(listeners) == 1
-    assert entry.entry_id not in _lifecycles(hass)
-    listeners[0]()
-    entry.async_start_reauth.assert_not_called()
-
-
-async def test_failed_reload_unload_restores_and_reconciles_auth_once(
-    hass, credentials
-) -> None:
-    from custom_components.samsung_ac_windfree import (
-        _async_reload_entry,
-        async_setup_entry,
-    )
-
-    entry = _entry(credentials)
-    entry.async_start_reauth = MagicMock()
-    coordinator = MagicMock()
-    coordinator.async_start = AsyncMock()
-    coordinator.async_shutdown = AsyncMock()
-    coordinator.authentication_rejected = False
-    listeners = []
-
-    def add_listener(listener):
-        listeners.append(listener)
-        return MagicMock()
-
-    coordinator.async_add_listener.side_effect = add_listener
-
-    with (
-        patch(
-            "custom_components.samsung_ac_windfree.WindFreeCoordinator",
-            return_value=coordinator,
-        ),
-        patch.object(
-            hass.config_entries,
-            "async_forward_entry_setups",
-            new=AsyncMock(),
-        ),
-    ):
-        assert await async_setup_entry(hass, entry)
-
-    async def reload(_entry_id):
-        coordinator.authentication_rejected = True
-        return False
-
-    with (
-        patch.object(hass.config_entries, "async_reload", side_effect=reload),
-        pytest.raises(ConfigEntryError) as caught,
-    ):
-        await _async_reload_entry(hass, entry)
-
-    _assert_translated_entry_error(caught.value, "reload_failed")
-    assert len(listeners) == 2
-    entry.async_start_reauth.assert_called_once_with(hass)
-    listeners[-1]()
-    entry.async_start_reauth.assert_called_once_with(hass)
-
-
 @pytest.mark.parametrize("version", [1])
 async def test_version_one_migration_is_idempotent(hass, credentials, version) -> None:
     from custom_components.samsung_ac_windfree import async_migrate_entry
@@ -1356,15 +1180,19 @@ _METADATA_FILES = (
     _INTEGRATION_DIR / "translations/en.json",
 )
 _CONFIG_ERRORS = {
-    "bootstrap_invalid_material",
-    "bootstrap_pin_mismatch",
-    "bootstrap_unavailable",
+    "credentials_invalid_key",
+    "credentials_invalid_chain",
+    "credentials_key_mismatch",
+    "credentials_expired",
+    "credentials_not_yet_valid",
+    "credentials_too_large",
+    "credentials_duplicate_file",
+    "credentials_unreadable",
     "cannot_connect",
     "cannot_resolve",
     "capability_mismatch",
     "dns_timeout",
-    "fetch_timeout",
-    "invalid_clock",
+    "invalid_stored_credentials",
     "read_timeout",
     "setup_timeout",
     "sweep_timeout",
@@ -1401,7 +1229,6 @@ _LIFECYCLE_EXCEPTION_KEYS = {
     "credentials_not_yet_valid",
     "invalid_stored_credentials",
     "invalid_stored_entry",
-    "reload_failed",
     "setup_failed",
     "unload_failed",
     "unsupported_device",
@@ -1416,8 +1243,6 @@ _EXCEPTION_KEYS = _LIFECYCLE_EXCEPTION_KEYS | {
 }
 _ISSUE_KEYS = {
     "authentication_rejected",
-    "bootstrap_pin_changed",
-    "bootstrap_unavailable",
     "certificate_expiring",
     "port_range_exhausted",
     "resource_contract_changed",
@@ -1506,7 +1331,12 @@ async def test_home_assistant_loads_translation_categories(
 def test_all_config_flow_translation_keys_are_defined() -> None:
     config = _load_strings()["config"]
 
-    assert set(config["step"]) == {"reauth_confirm", "reconfigure", "user"}
+    assert set(config["step"]) == {
+        "credentials",
+        "reauth_confirm",
+        "reconfigure",
+        "user",
+    }
     assert set(config["progress"]) == {"validate"}
     assert set(config["error"]) == _CONFIG_ERRORS
     assert set(config["abort"]) == _CONFIG_ABORTS
@@ -1556,7 +1386,6 @@ def test_platforms_explicitly_delegate_parallelism_to_coordinator() -> None:
         (ConfigEntryAuthFailed, "credentials_not_yet_valid"),
         (ConfigEntryError, "invalid_stored_credentials"),
         (ConfigEntryError, "invalid_stored_entry"),
-        (ConfigEntryError, "reload_failed"),
         (ConfigEntryNotReady, "setup_failed"),
         (ConfigEntryError, "unload_failed"),
         (ConfigEntryError, "unsupported_device"),
@@ -1615,28 +1444,25 @@ def test_all_repair_issue_and_fix_flow_keys_are_defined() -> None:
 
 
 def test_user_visible_metadata_contains_no_private_protocol_material() -> None:
-    from custom_components.samsung_ac_windfree.const import (
-        REMOVED_SIGNING_DIGEST_NAME,
-        BUNDLE_SHA256,
-        BUNDLE_URL,
-        SAMSUNG_IDENTITY_HOST,
-        SAMSUNG_IDENTITY_LEAF_SHA256,
-        SAMSUNG_IDENTITY_SPKI_SHA256,
-    )
-
+    # The provisioning constants no longer exist here, so this asserts on shape
+    # rather than on values: naming them would reintroduce what was removed.
     text = "\n".join(
         path.read_text()
         for path in (*_METADATA_FILES, Path("README.md"), Path("CHANGELOG.md"))
     )
-    for private_value in (
-        REMOVED_SIGNING_DIGEST_NAME,
-        BUNDLE_SHA256,
-        BUNDLE_URL,
-        SAMSUNG_IDENTITY_HOST,
-        SAMSUNG_IDENTITY_LEAF_SHA256,
-        SAMSUNG_IDENTITY_SPKI_SHA256,
+    # Deliberately generic. Naming the retired provisioning source or its
+    # identity here would republish the very pointer this release removed, so
+    # the assertions match shape instead: no raw-content URL, no pin constant,
+    # no bare digest.
+    for pattern in (
+        r"raw\.githubusercontent\.com",
+        r"\bBUNDLE_[A-Z_]+\b",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     ):
-        assert private_value not in text
+        assert re.search(pattern, text) is None, pattern
+    # No bare 64-hex digest: every pin was one, and so is the compatibility
+    # fingerprint, which belongs in const.py rather than in user-facing text.
+    assert re.search(r"\b[0-9a-f]{64}\b", text) is None
     assert "BEGIN PRIVATE KEY" not in text
     assert (
         re.search(
@@ -1658,12 +1484,11 @@ def test_readme_documents_security_scope_operation_and_examples() -> None:
         "AR60F12C1AWNEU",
         "TP1X_DA-AC-RAC-01001_0000",
         "does not report the consumer SKU",
-        "fully local after setup",
+        "Everything is local",
         "unofficial certificate",
         "Home Assistant backups",
         "SmartThings is not required",
         "host or IP address",
-        "one-time internet bootstrap",
         "OBSERVE",
         "polling",
         "Reconfigure",
@@ -1719,9 +1544,9 @@ def test_release_metadata_matches_manifest_and_supported_scope() -> None:
     changelog = Path("CHANGELOG.md").read_text()
     license_text = Path("LICENSE").read_text()
 
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.3.0"
     assert manifest["documentation"] in Path("README.md").read_text()
-    assert "## [0.2.0]" in changelog
+    assert "## [0.3.0]" in changelog
     for phrase in (
         "AR60F12C1AWNEU",
         "TP1X_DA-AC-RAC-01001_0000",

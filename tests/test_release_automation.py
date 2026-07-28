@@ -194,23 +194,6 @@ def test_workflow_uses_required_validation_actions_and_no_secrets() -> None:
     assert "ignore" not in hacs["steps"][-1]["with"]
 
 
-def test_pin_canary_reads_release_constants_without_importing_home_assistant() -> None:
-    script = (ROOT / ".github" / "scripts" / "check_samsung_pins.py").read_text()
-    assert "from custom_components" not in script
-    assert "ast.parse" in script
-    for name in (
-        "BUNDLE_SHA256",
-        "BUNDLE_URL",
-        "SAMSUNG_IDENTITY_HOST",
-        "SAMSUNG_IDENTITY_LEAF_SHA256",
-        "SAMSUNG_IDENTITY_SPKI_SHA256",
-    ):
-        assert name in script
-    assert "ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)" in script
-    assert "context.check_hostname = False" in script
-    assert "context.verify_mode = ssl.CERT_NONE" in script
-
-
 def test_changelog_release_evidence_is_counts_only() -> None:
     changelog = (ROOT / "CHANGELOG.md").read_text()
     marker = "### Verification"

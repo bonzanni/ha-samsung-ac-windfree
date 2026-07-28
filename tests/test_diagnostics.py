@@ -23,8 +23,8 @@ from custom_components.samsung_ac_windfree.diagnostics import (
 )
 from custom_components.samsung_ac_windfree.models import UpdateSource, WindFreeData
 from custom_components.samsung_ac_windfree.repairs import (
+    async_delete_legacy_bootstrap_issues,
     async_purge_entry_issues,
-    async_sync_bootstrap_issue,
     async_sync_certificate_issue,
     async_sync_runtime_issues,
 )
@@ -321,20 +321,26 @@ async def test_entry_listener_synchronizes_runtime_transitions(
     lifecycle.suspend()
 
 
-async def test_bootstrap_repairs_are_mutually_exclusive_and_recover(hass) -> None:
+async def test_legacy_bootstrap_repairs_are_deleted_on_setup(hass) -> None:
+    """Persistent issues survive a version that no longer defines them."""
+
     registry = ir.async_get(hass)
+    for issue_id in ("bootstrap_pin_changed", "bootstrap_unavailable"):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=issue_id,
+        )
+        assert registry.async_get_issue(DOMAIN, issue_id) is not None
 
-    async_sync_bootstrap_issue(hass, "bootstrap_pin_mismatch")
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is not None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+    async_delete_legacy_bootstrap_issues(hass)
 
-    async_sync_bootstrap_issue(hass, "bootstrap_unavailable")
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is not None
-
-    async_sync_bootstrap_issue(hass, None)
-    assert registry.async_get_issue(DOMAIN, "bootstrap_pin_changed") is None
-    assert registry.async_get_issue(DOMAIN, "bootstrap_unavailable") is None
+    for issue_id in ("bootstrap_pin_changed", "bootstrap_unavailable"):
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 async def test_certificate_repair_boundary_and_recovery(hass) -> None:

@@ -9,15 +9,19 @@
       "unknown": "An unexpected error occurred"
     },
     "error": {
-      "bootstrap_invalid_material": "The one-time certificate bootstrap returned invalid material",
-      "bootstrap_pin_mismatch": "The pinned certificate bootstrap source changed. Installation was stopped for safety",
-      "bootstrap_unavailable": "The one-time certificate bootstrap service is unavailable",
       "cannot_connect": "Unable to establish a local authenticated connection to the air conditioner",
       "cannot_resolve": "Unable to resolve the air conditioner address",
       "capability_mismatch": "The device resource contract does not match the supported air conditioner",
+      "credentials_duplicate_file": "The same file was supplied for both the key and the certificate chain.",
+      "credentials_expired": "The supplied certificate has already expired.",
+      "credentials_invalid_chain": "The certificate file is not a valid PEM certificate chain.",
+      "credentials_invalid_key": "The client key file is not a single unencrypted private key in PEM form.",
+      "credentials_key_mismatch": "The private key does not match the first certificate in the chain.",
+      "credentials_not_yet_valid": "The supplied certificate is not valid yet.",
+      "credentials_too_large": "The supplied file is too large to be a client credential.",
+      "credentials_unreadable": "The uploaded files could not be read. Upload them again.",
       "dns_timeout": "Resolving the air conditioner address timed out",
-      "fetch_timeout": "Downloading the one-time certificate bootstrap material timed out",
-      "invalid_clock": "The Home Assistant clock differs too much from the authenticated server clock",
+      "invalid_stored_credentials": "The stored credential is unusable. Renew it from the integration menu.",
       "read_timeout": "Reading the local device identity timed out",
       "setup_timeout": "Validating the air conditioner timed out",
       "sweep_timeout": "Searching the supported local secure ports timed out",
@@ -25,12 +29,32 @@
       "unsupported_device": "This model, firmware, platform, or device type is not supported"
     },
     "progress": {
-      "validate": "Creating local credentials and validating the air conditioner"
+      "validate": "Validating the air conditioner locally"
     },
     "step": {
+      "credentials": {
+        "title": "Upload the client credential",
+        "description": "Upload the client key and certificate chain for this air conditioner. They are validated locally and stored in this configuration entry; nothing is downloaded.",
+        "data": {
+          "client_key_file": "Client key (PEM)",
+          "client_chain_file": "Client certificate chain (PEM)"
+        },
+        "data_description": {
+          "client_key_file": "The private key file for this air conditioner.",
+          "client_chain_file": "The certificate chain file. Its first certificate must match the key."
+        }
+      },
       "reauth_confirm": {
-        "description": "Renew the locally stored client certificate. This performs the one-time internet bootstrap again, then validates the air conditioner locally.",
-        "title": "Renew local credentials"
+        "title": "Renew local credentials",
+        "description": "Upload a replacement client key and certificate chain. The existing entry is only updated once the air conditioner accepts them.",
+        "data": {
+          "client_key_file": "Client key (PEM)",
+          "client_chain_file": "Client certificate chain (PEM)"
+        },
+        "data_description": {
+          "client_key_file": "The private key file for this air conditioner.",
+          "client_chain_file": "The certificate chain file. Its first certificate must match the key."
+        }
       },
       "reconfigure": {
         "data": {
@@ -39,7 +63,7 @@
         "data_description": {
           "host": "The new hostname or IP address of the same air conditioner."
         },
-        "description": "Enter the new local address. Home Assistant will verify that it belongs to the already configured air conditioner.",
+        "description": "Enter a new address for the same air conditioner. The stored credential is reused and is not replaced.",
         "title": "Reconfigure Samsung WindFree AC"
       },
       "user": {
@@ -49,7 +73,7 @@
         "data_description": {
           "host": "The hostname or IP address of the air conditioner."
         },
-        "description": "Home Assistant will perform a one-time internet certificate bootstrap, find the supported local secure port, and verify the exact device contract.",
+        "description": "Enter the address of the air conditioner. You will then be asked to upload the client credential it should authenticate with.",
         "title": "Set up Samsung WindFree AC"
       }
     }
@@ -134,9 +158,6 @@
     "invalid_temperature": {
       "message": "Set point must be a whole number from 16 to 30 °C"
     },
-    "reload_failed": {
-      "message": "The Samsung WindFree integration could not reload"
-    },
     "setup_failed": {
       "message": "The air conditioner is temporarily unavailable"
     },
@@ -156,20 +177,12 @@
         },
         "step": {
           "confirm": {
-            "description": "Select Submit to start reauthentication for affected Samsung WindFree entries. The one-time certificate bootstrap needs internet access; normal operation remains local afterward.",
+            "description": "Select Submit to upload a replacement credential for affected Samsung WindFree entries. Generate one first; nothing is downloaded.",
             "title": "Renew rejected local credentials"
           }
         }
       },
       "title": "Samsung WindFree local authentication was rejected"
-    },
-    "bootstrap_pin_changed": {
-      "description": "The digest-pinned certificate bootstrap source no longer matches the reviewed bytes. Setup and credential renewal stop intentionally. Do not bypass this check; update the integration only after the maintainer has reviewed and released new pins.",
-      "title": "Samsung WindFree bootstrap source changed"
-    },
-    "bootstrap_unavailable": {
-      "description": "The one-time certificate bootstrap could not be reached. Check temporary internet access, DNS, and time synchronization, then retry setup or reauthentication.",
-      "title": "Samsung WindFree bootstrap is unavailable"
     },
     "certificate_expiring": {
       "fix_flow": {
@@ -179,7 +192,7 @@
         },
         "step": {
           "confirm": {
-            "description": "Select Submit to renew credentials for affected Samsung WindFree entries. The one-time certificate bootstrap needs internet access; normal operation remains local afterward.",
+            "description": "Select Submit to upload a replacement credential for affected Samsung WindFree entries. Generate one first; nothing is downloaded.",
             "title": "Renew expiring local credentials"
           }
         }
