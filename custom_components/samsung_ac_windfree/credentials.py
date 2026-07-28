@@ -19,9 +19,7 @@ from itertools import pairwise
 from typing import Any
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
 from .models import Credentials
 
@@ -142,24 +140,18 @@ def parse_uploaded_credential(
     # unrelated, duplicated, misordered or expired certificate placed after the
     # leaf is accepted and stored, and only fails much later at the handshake.
     for child, parent in pairwise(chain):
-        if child.issuer != parent.subject:
-            raise CredentialError(ERROR_INVALID_CHAIN)
         if not (parent.not_valid_before_utc <= moment < parent.not_valid_after_utc):
             raise CredentialError(ERROR_INVALID_CHAIN)
         try:
-            parent.public_key().verify(
-                child.signature,
-                child.tbs_certificate_bytes,
-                padding.PKCS1v15(),
-                child.signature_hash_algorithm,
-            )
-        except InvalidSignature:
-            raise CredentialError(ERROR_INVALID_CHAIN) from None
+            # Dispatches on the certificate's own algorithm and key type, and
+            # checks issuer/subject too. Verifying by hand would mean assuming a
+            # signature scheme: assuming RSA PKCS#1 v1.5 both accepts a bad EC
+            # signature (the TypeError looks like "unsupported") and rejects a
+            # valid RSA-PSS one.
+            child.verify_directly_issued_by(parent)
         except Exception:
-            # Non-RSA parents and unsupported legacy hashes are not rejected
-            # here: the issuer/subject and validity links above still hold, and
-            # the device is the authority on whether the chain is acceptable.
-            pass
+            # Fail closed: anything we cannot positively verify is not a chain.
+            raise CredentialError(ERROR_INVALID_CHAIN) from None
 
     return Credentials(
         client_key_pem=key_bytes.decode("ascii", "strict"),

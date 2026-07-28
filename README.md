@@ -164,22 +164,25 @@ Use **Reconfigure** from the integration entry after its address changes.
 
 **The uploaded credential is rejected**
 
-Temporarily allow Home Assistant outbound HTTPS and working DNS. Verify the host
-clock is synchronized. Retry setup; do not paste or manually supply certificate
-material.
+The error names the reason. The key must be a single unencrypted PEM private
+key; the chain must contain only PEM certificates with no trailing bytes; the
+key must match the first certificate; each certificate must be issued by the
+next one; and the leaf must be valid right now. Verify the host clock is
+synchronized, then upload both files again — an upload is consumed on use, so a
+retry always needs fresh files.
 
 **The certificate has expired**
 
-Stop. This is a security boundary, not a connectivity error. Install a reviewed
-integration release with updated pins. Never disable pin checks or use an
-unpinned source.
+Generate a replacement credential and upload it through the repair that Home
+Assistant raises. The integration cannot renew a credential itself.
 
 **Authentication rejected or certificate expiry**
 
-Open the Home Assistant repair and start reauthentication. Temporary internet
-access is needed to renew credentials; local device access is needed to validate
-them. A repair is raised before certificate expiry. If the certificate has
-already expired, reauthentication starts before normal coordinator setup.
+Open the Home Assistant repair and start reauthentication, which asks for a
+replacement credential. No internet access is required; local device access is
+needed to validate it. A repair is raised before certificate expiry. If the
+certificate has already expired, reauthentication starts before normal
+coordinator setup.
 
 **Entities are unavailable or commands are rejected**
 

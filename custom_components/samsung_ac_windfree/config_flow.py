@@ -17,6 +17,7 @@ from homeassistant.helpers.selector import FileSelector, FileSelectorConfig
 
 from .const import DOMAIN, HOST_RESOLVE_TIMEOUT, SETUP_TIMEOUT
 from .credentials import (
+    ERROR_TOO_LARGE,
     MAX_CREDENTIAL_BYTES,
     CredentialError,
     parse_uploaded_credential,
@@ -110,7 +111,10 @@ async def _async_read_uploaded_credential(
     left behind in Home Assistant's temporary storage.
     """
 
-    def _consume(upload_id: str) -> bytes | None:
+    class _TooLarge(Exception):
+        """Marker so an oversized upload keeps its own error category."""
+
+    def _consume(upload_id: str) -> bytes:
         """Consume one upload, refusing to read more than a credential's worth.
 
         The size is checked inside the context so an oversized file is still
@@ -120,23 +124,29 @@ async def _async_read_uploaded_credential(
 
         with process_uploaded_file(hass, upload_id) as path:
             if path.stat().st_size > MAX_CREDENTIAL_BYTES:
-                return None
+                raise _TooLarge
             return path.read_bytes()
 
-    def _read() -> tuple[bytes | None, bytes | None]:
+    def _read() -> tuple[bytes | None, bytes | None, bool]:
         # Every handle is consumed even when an earlier one fails, so a rejected
         # upload never strands a file in Home Assistant's temporary storage.
         key_bytes: bytes | None = None
         chain_bytes: bytes | None = None
+        too_large = False
         try:
-            key_bytes = _consume(key_id)
+            try:
+                key_bytes = _consume(key_id)
+            except _TooLarge:
+                too_large = True
         finally:
             if chain_id != key_id:
                 try:
                     chain_bytes = _consume(chain_id)
+                except _TooLarge:
+                    too_large = True
                 except Exception:
                     chain_bytes = None
-        return key_bytes, chain_bytes
+        return key_bytes, chain_bytes, too_large
 
     if key_id == chain_id:
         # A single handle cannot be consumed twice, but it must still be
@@ -148,10 +158,12 @@ async def _async_read_uploaded_credential(
         raise CredentialError("credentials_duplicate_file")
 
     try:
-        key_bytes, chain_bytes = await hass.async_add_executor_job(_read)
+        key_bytes, chain_bytes, too_large = await hass.async_add_executor_job(_read)
     except Exception:
         raise CredentialError("credentials_unreadable") from None
 
+    if too_large:
+        raise CredentialError(ERROR_TOO_LARGE)
     if key_bytes is None or chain_bytes is None:
         raise CredentialError("credentials_unreadable")
 

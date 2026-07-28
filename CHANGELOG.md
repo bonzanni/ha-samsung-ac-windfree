@@ -20,7 +20,8 @@ All notable changes to this project are documented in this file.
 - The certificate provisioning path, its pinned constants, and the scheduled
   pin canary. Obtaining a credential is outside the scope of this integration.
 - The `bootstrap_pin_changed` and `bootstrap_unavailable` repair issues. Both
-  were persistent, so this release deletes any that already exist.
+  were persistent, so entry setup deletes any that already exist. An entry that
+  stays disabled never runs setup, so its issues persist until it is enabled.
 
 ### Fixed
 

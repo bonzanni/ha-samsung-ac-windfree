@@ -64,9 +64,13 @@ def _self_signed_sha1(
         serialization.NoEncryption(),
     )
     legacy.sign(crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem), "sha1")
-    return x509.load_der_x509_certificate(
+    signed = x509.load_der_x509_certificate(
         crypto.dump_certificate(crypto.FILETYPE_ASN1, legacy)
     )
+    # Asserted so a future change cannot silently drop the SHA-1 property that
+    # test_dependency_contract exists to exercise.
+    assert isinstance(signed.signature_hash_algorithm, hashes.SHA1)
+    return signed
 
 
 @pytest.fixture(scope="session")

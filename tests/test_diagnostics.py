@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,6 +29,10 @@ from custom_components.samsung_ac_windfree.repairs import (
     async_sync_certificate_issue,
     async_sync_runtime_issues,
 )
+
+_SETUP_SOURCE = Path(
+    "custom_components/samsung_ac_windfree/__init__.py"
+).read_text()
 
 _SECRETS = (
     "192.0.2.10",
@@ -337,10 +342,15 @@ async def test_legacy_bootstrap_repairs_are_deleted_on_setup(hass) -> None:
         )
         assert registry.async_get_issue(DOMAIN, issue_id) is not None
 
+    # Called directly first, then proven to be wired into entry setup: a helper
+    # that works but is never invoked would leave the issues in place forever.
     async_delete_legacy_bootstrap_issues(hass)
-
     for issue_id in ("bootstrap_pin_changed", "bootstrap_unavailable"):
         assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+    assert _SETUP_SOURCE.count("async_delete_legacy_bootstrap_issues(hass)") == 1, (
+        "entry setup must invoke the tombstone exactly once"
+    )
 
 
 async def test_certificate_repair_boundary_and_recovery(hass) -> None:
