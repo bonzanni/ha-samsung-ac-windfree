@@ -36,14 +36,19 @@ ha_get() {
 }
 
 step "1/7 waiting for CI on PR #$PR"
-until [ "$(gh pr checks "$PR" --json bucket --jq 'all(.bucket != "pending")' 2>/dev/null)" = "true" ]; do
+# `gh pr checks` has no --json in this CLI version; its plain output is
+# tab-separated NAME<TAB>STATE<TAB>ELAPSED<TAB>URL.
+check_states() { gh pr checks "$PR" 2>/dev/null | awk -F'\t' 'NF > 1 {print $2}'; }
+until [ -n "$(check_states)" ] && ! check_states | grep -qx 'pending'; do
     sleep 20
 done
-if ! gh pr checks "$PR" --json bucket,name --jq 'all(.bucket == "pass" or .bucket == "skipping")' | grep -q true; then
-    gh pr checks "$PR" | grep -v pass || true
+# Treat anything that is not an explicit pass or skip as a failure, so a
+# cancelled or timed-out run can never be mistaken for success.
+if check_states | grep -qvE '^(pass|skipping)$'; then
+    gh pr checks "$PR" | awk -F'\t' 'NF > 1 && $2 != "pass" && $2 != "skipping"'
     fail "CI is not green on PR #$PR"
 fi
-echo "CI green"
+echo "CI green: $(check_states | grep -cx pass) passing"
 
 step "2/7 merging PR #$PR"
 if [ "$(gh pr view "$PR" --json state --jq .state)" = "MERGED" ]; then
