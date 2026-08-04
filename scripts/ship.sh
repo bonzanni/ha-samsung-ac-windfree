@@ -104,7 +104,8 @@ step "6/7 updating the integration on the N150 via HACS (restarts HA Core)"
 # restart, so --restart is required for the upgrade to take effect. It also
 # clears the entry stranded by the old permanent ConfigEntryError, which never
 # retries on its own (issue #6).
-bash "$PLUGIN/integration-update.sh" --version "$VERSION" --yes --restart || fail "HACS update"
+# HACS identifies releases by tag name (v0.4.0), not by bare version.
+bash "$PLUGIN/integration-update.sh" --version "$TAG" --yes --restart || fail "HACS update"
 
 step "7/7 waiting for Home Assistant and verifying the entity"
 TOKEN="$(ha_token)"
