@@ -88,9 +88,11 @@ if gh release view "$TAG" >/dev/null 2>&1; then
     echo "release exists"
 else
     # Release notes are the changelog section for this version.
-    awk -v v="## \\[$VERSION\\]" '
-        $0 ~ v {inside=1; next}
-        inside && /^## \[/ {exit}
+    # index(), not a regex: the version's dots and brackets would otherwise be
+    # read as a character class and never match the heading.
+    awk -v marker="## [$VERSION]" '
+        index($0, marker) == 1 {inside = 1; next}
+        inside && index($0, "## [") == 1 {exit}
         inside {print}
     ' CHANGELOG.md > /tmp/ship-notes.md
     [ -s /tmp/ship-notes.md ] || fail "no changelog section for $VERSION"
