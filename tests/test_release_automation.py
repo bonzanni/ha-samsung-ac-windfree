@@ -105,7 +105,6 @@ def test_workflow_uses_supported_test_environments_and_immutable_actions() -> No
         "hassfest",
         "hacs",
         "beta-canary",
-        "samsung-pin-canary",
     } <= jobs.keys()
     assert "minimum" not in jobs
 
@@ -125,8 +124,8 @@ def test_workflow_uses_supported_test_environments_and_immutable_actions() -> No
     assert "ubuntu-24.04-arm" in rendered
     assert "linux/amd64" in rendered
     assert "linux/arm64" in rendered
-    assert "cryptography==48.0.1" in rendered
-    assert "ruff check custom_components tests .github/scripts" in rendered
+    assert "ruff check custom_components tests" in rendered
+    assert ".github/scripts" not in rendered
     assert "@master" not in rendered
     assert "@main" not in rendered
     for job in jobs.values():
@@ -165,15 +164,11 @@ def test_workflow_canaries_are_scheduled_nonblocking_and_exact() -> None:
     assert "schedule" in workflow[True]
     jobs = workflow["jobs"]
     beta = yaml.safe_dump(jobs["beta-canary"])
-    pins = yaml.safe_dump(jobs["samsung-pin-canary"])
     assert jobs["beta-canary"]["continue-on-error"] is True
-    assert jobs["samsung-pin-canary"]["continue-on-error"] is True
     assert "--pre --upgrade pytest-homeassistant-custom-component" in beta
     assert "smartthings-local==0.1.0" in beta
     assert "cbor2==6.1.3" in beta
     assert "homeassistant" in beta
-    assert ".github/scripts/check_samsung_pins.py" in pins
-    assert "git diff --exit-code" in pins
 
 
 def test_workflow_uses_required_validation_actions_and_no_secrets() -> None:

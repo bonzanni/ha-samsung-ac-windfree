@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0] - 2026-08-04
+
+### Changed
+
+- A Samsung platform-firmware update no longer breaks the integration. `mnfv`
+  was an exact identity gate, so the routine OTA of 2026-07-28 (which changed
+  it from `…_11260401` to `…_11260720` and nothing else) made every setup and
+  every reconnect fail for days. No read or write path depends on that build
+  string, so it is no longer gated: it is now recorded as
+  `TESTED_PLATFORM_FIRMWARE` — the newest platform firmware the live capability
+  matrix was actually run against — and reported in diagnostics as observed
+  versus tested.
+- The unit fingerprint now hashes the model-number discriminator instead of the
+  whole model number. The old hash covered the firmware prefix too, so any
+  firmware change invalidated the only per-unit anchor the integration had.
+- The device model (`mnmc`) is now actually verified against the wire. It was
+  previously assigned from a constant without ever being compared, so a wrong
+  model was not detected.
+
+### Fixed
+
+- A prolonged outage is no longer invisible. Health flags that flip while the
+  device is already unavailable (such as `port_range_exhausted`) now notify
+  coordinator listeners, so the matching repair issue is raised and reauth can
+  start mid-outage instead of only on an availability transition. The
+  reconnect loop also logs a warning once the port range is exhausted, at most
+  hourly within a single outage and re-armed by a successful recovery. A
+  firmware change that lands while the device is disconnected is now reported
+  as identity drift instead of a generic connection failure, so it no longer
+  masquerades as an unreachable device. (#1)
+- Diagnostics no longer report a hardcoded `0.1.0`: the integration version
+  comes from the manifest and the dependency version from the installed
+  `smartthings-local` distribution. (#2)
+
 ## [0.3.0] - 2026-07-28
 
 ### Changed

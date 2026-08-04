@@ -15,7 +15,6 @@ from .const import (
     SUPPORTED_FIRMWARE,
     SUPPORTED_MODEL,
     SUPPORTED_PLATFORM,
-    SUPPORTED_PLATFORM_FIRMWARE,
     SUPPORTED_PRODUCT_VERSION,
     SUPPORTED_UNIT_FINGERPRINT_SHA256,
 )
@@ -317,6 +316,7 @@ def parse_identity(
 
     device_id = oic_d.get("di")
     device_types = oic_d.get("rt")
+    model = oic_d.get("mnmc")
     product_version = oic_p.get("mnpv")
     platform = oic_p.get("mnos")
     platform_firmware = oic_p.get("mnfv")
@@ -341,15 +341,16 @@ def parse_identity(
         or not _is_sequence(device_types)
         or not all(isinstance(item, str) for item in device_types)
         or SUPPORTED_DEVICE_TYPE not in device_types
+        or model != SUPPORTED_MODEL
         or product_version != SUPPORTED_PRODUCT_VERSION
         or platform != SUPPORTED_PLATFORM
-        or platform_firmware != SUPPORTED_PLATFORM_FIRMWARE
+        or not _is_string(platform_firmware)
         or firmware != SUPPORTED_FIRMWARE
         or separator != "|"
         or model_firmware != firmware
         or not model_discriminator
         or not hmac.compare_digest(
-            hashlib.sha256(model_number.encode("utf-8")).hexdigest(),
+            hashlib.sha256(model_discriminator.encode("utf-8")).hexdigest(),
             SUPPORTED_UNIT_FINGERPRINT_SHA256,
         )
     ):
@@ -361,6 +362,7 @@ def parse_identity(
         device_type=SUPPORTED_DEVICE_TYPE,
         firmware=firmware,
         platform=platform,
+        platform_firmware=platform_firmware,
     )
 
 

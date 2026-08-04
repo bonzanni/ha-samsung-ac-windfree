@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -10,8 +11,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call
 
 import pytest
+from homeassistant.helpers import issue_registry as ir
 
-from custom_components.samsung_ac_windfree.const import COMPATIBILITY
+from custom_components.samsung_ac_windfree.const import COMPATIBILITY, DOMAIN
 from custom_components.samsung_ac_windfree.coordinator import (
     COLD_PATHS,
     HOT_PATHS,
@@ -33,7 +35,10 @@ from custom_components.samsung_ac_windfree.models import (
     PresetMode,
     UpdateSource,
 )
+from custom_components.samsung_ac_windfree.repairs import async_sync_runtime_issues
 from custom_components.samsung_ac_windfree.transport import TransportError
+
+_COORDINATOR_LOGGER = "custom_components.samsung_ac_windfree.coordinator"
 
 
 class FakeClock:
@@ -128,7 +133,7 @@ def test_live_compatibility_fixture_matches_production_contract(
 
 
 @pytest.fixture
-async def coordinator(
+async def coordinator_with_clock(
     hass,
     credentials,
     resource_representations,
@@ -149,8 +154,14 @@ async def coordinator(
         start_scheduler=False,
     )
     await instance.async_start()
-    yield instance
+    yield instance, clock
     await instance.async_shutdown()
+
+
+@pytest.fixture
+async def coordinator(coordinator_with_clock):
+    instance, _clock = coordinator_with_clock
+    return instance
 
 
 async def test_start_seeds_identity_contract_observe_and_immutable_data(
@@ -2239,3 +2250,157 @@ async def test_every_public_command_failure_scrubs_internal_secrets(
             continue
         rendered = tuple(repr(value) for value in frame.f_locals.values())
         assert all(marker not in item for marker in forbidden for item in rendered)
+
+
+async def _drop_connection(coordinator: WindFreeCoordinator) -> None:
+    """Drive the real outage path: hot failures, disconnect, no background loop."""
+    coordinator.transport.async_get.side_effect = TimeoutError
+    for _ in range(3):
+        await coordinator.async_run_hot_cycle()
+    assert not coordinator.data.available
+    task = coordinator._reconnect_task
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        coordinator._reconnect_task = None
+
+
+async def test_reconnect_flag_change_notifies_listeners_mid_outage(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = TransportError("connect")
+    await _drop_connection(coordinator)
+    assert not coordinator.health.port_range_exhausted
+
+    observed: list[bool] = []
+    coordinator.async_add_listener(
+        lambda: observed.append(coordinator.health.port_range_exhausted)
+    )
+    factory.discover.side_effect = ConnectionError("transport_discovery_failed")
+    coordinator._stored_port_failures = 2
+    await coordinator.async_run_reconnect_attempt()
+
+    assert coordinator.health.port_range_exhausted
+    assert True in observed
+
+
+async def test_outage_port_exhaustion_creates_repair_issue_without_recovery(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = TransportError("connect")
+    factory.discover.side_effect = ConnectionError("transport_discovery_failed")
+    await _drop_connection(coordinator)
+
+    entry_id = "01TESTENTRYID"
+    coordinator.async_add_listener(
+        lambda: async_sync_runtime_issues(
+            coordinator.hass, entry_id, coordinator.health
+        )
+    )
+    for _ in range(3):
+        await coordinator.async_run_reconnect_attempt()
+
+    registry = ir.async_get(coordinator.hass)
+    assert registry.async_get_issue(DOMAIN, "port_range_exhausted") is not None
+
+
+async def test_first_port_range_exhaustion_logs_one_actionable_warning(
+    coordinator_with_clock,
+    caplog,
+) -> None:
+    coordinator, _clock = coordinator_with_clock
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = TransportError("connect")
+    factory.discover.side_effect = ConnectionError("transport_discovery_failed")
+    await _drop_connection(coordinator)
+
+    with caplog.at_level(logging.WARNING, logger=_COORDINATOR_LOGGER):
+        for _ in range(6):
+            await coordinator.async_run_reconnect_attempt()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "power-cycl" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert all("device.invalid" not in record.getMessage() for record in caplog.records)
+
+
+async def test_unreachable_warning_repeats_after_an_hour(
+    coordinator_with_clock,
+    caplog,
+) -> None:
+    coordinator, clock = coordinator_with_clock
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = TransportError("connect")
+    factory.discover.side_effect = ConnectionError("transport_discovery_failed")
+    await _drop_connection(coordinator)
+
+    with caplog.at_level(logging.WARNING, logger=_COORDINATOR_LOGGER):
+        for _ in range(3):
+            await coordinator.async_run_reconnect_attempt()
+        clock.now += 3600.0
+        coordinator._stored_port_failures = 2
+        await coordinator.async_run_reconnect_attempt()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "power-cycl" in record.getMessage()
+    ]
+    assert len(warnings) == 2
+
+
+async def test_recovery_rearms_the_unreachable_warning(
+    coordinator_with_clock,
+    caplog,
+) -> None:
+    """A second outage within the hour must still warn once recovered."""
+    coordinator, clock = coordinator_with_clock
+    factory = coordinator.transport_factory
+    factory.reconnect.side_effect = TransportError("connect")
+    factory.discover.side_effect = ConnectionError("transport_discovery_failed")
+    await _drop_connection(coordinator)
+
+    with caplog.at_level(logging.WARNING, logger=_COORDINATOR_LOGGER):
+        for _ in range(3):
+            await coordinator.async_run_reconnect_attempt()
+
+        factory.reconnect.side_effect = factory._reconnect
+        await coordinator.async_run_reconnect_attempt()
+        assert coordinator.data.available
+
+        factory.reconnect.side_effect = TransportError("connect")
+        await _drop_connection(coordinator)
+        clock.now += 60.0
+        coordinator._stored_port_failures = 2
+        await coordinator.async_run_reconnect_attempt()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "power-cycl" in record.getMessage()
+    ]
+    assert len(warnings) == 2
+
+
+async def test_reconnect_into_unsupported_identity_reports_identity_not_ports(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    """A firmware change while disconnected must surface as identity drift.
+
+    Otherwise the outage looks like an unreachable device and the operator is
+    told to power-cycle a unit that is answering perfectly well.
+    """
+    factory = coordinator.transport_factory
+    await _drop_connection(coordinator)
+    factory.resources["/oic/p"]["mnos"] = "TizenRT 3.0"
+
+    await coordinator.async_run_reconnect_attempt()
+
+    assert coordinator.health.unsupported_identity_after_update
+    assert not coordinator.health.port_range_exhausted

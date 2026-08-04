@@ -9,6 +9,7 @@ from types import MappingProxyType
 
 import pytest
 
+from custom_components.samsung_ac_windfree.const import SUPPORTED_MODEL
 from custom_components.samsung_ac_windfree.device import (
     AUTO_CLEAN_PATH,
     DISPLAY_LIGHT_PATH,
@@ -92,7 +93,7 @@ def test_identity_rejects_a_different_exact_firmware_release() -> None:
         ("oic_d", "rt", ["oic.d.light"]),
         ("oic_p", "mnpv", "SYSTEM 1.0"),
         ("oic_p", "mnos", "TizenRT 3.0"),
-        ("oic_p", "mnfv", "ARA-KR-OLDER"),
+        ("oic_d", "mnmc", "AR60F12C1AWNEV"),
         (
             "device_0",
             "/information/vs/0",
@@ -1125,3 +1126,65 @@ def test_command_surface_excludes_unverified_controls() -> None:
         "welcome_cooling",
     }
     assert excluded.isdisjoint({kind.value for kind in CommandKind})
+
+
+def test_identity_accepts_a_platform_firmware_update() -> None:
+    """A Samsung OTA bumps mnfv; no read or write contract depends on it."""
+    oic_d, oic_p, device_0 = identity_parts()
+    oic_p["mnfv"] = "ARA-KR-TP1-25-ARXX00_11260720"
+
+    identity = parse_identity(oic_d, oic_p, device_0)
+
+    assert identity.platform_firmware == "ARA-KR-TP1-25-ARXX00_11260720"
+    assert identity.model == SUPPORTED_MODEL
+
+
+def test_unit_fingerprint_survives_a_revalidated_firmware_bump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fingerprint anchors on the unit discriminator, not the firmware.
+
+    Bumping SUPPORTED_FIRMWARE after re-validation must not also require
+    recomputing the unit fingerprint, which the whole-modelNum hash did.
+    """
+    import custom_components.samsung_ac_windfree.device as device_module
+
+    oic_d, oic_p, device_0 = identity_parts()
+    information = device_0["/information/vs/0"]
+    discriminator = information["x.com.samsung.da.modelNum"].partition("|")[2]
+    revalidated = "TP1X_DA-AC-RAC-01001_0001"
+    monkeypatch.setattr(device_module, "SUPPORTED_FIRMWARE", revalidated)
+    information["x.com.samsung.da.description"] = revalidated
+    information["x.com.samsung.da.modelNum"] = f"{revalidated}|{discriminator}"
+
+    identity = parse_identity(oic_d, oic_p, device_0)
+
+    assert identity.firmware == revalidated
+
+
+@pytest.mark.parametrize("replacement", ["AR60F12C1AWNEV", "", None])
+def test_identity_rejects_a_wrong_or_missing_model(replacement: object) -> None:
+    oic_d, oic_p, device_0 = identity_parts()
+    oic_d["mnmc"] = replacement
+
+    with pytest.raises(UnsupportedDevice, match="unsupported_device"):
+        parse_identity(oic_d, oic_p, device_0)
+
+
+def test_frozen_command_payload_rejects_mutation_and_shares_copies() -> None:
+    """Command payloads are handed to callers; they must stay immutable."""
+    command = build_command(CommandKind.HVAC_MODE, HvacMode.COOL)
+    payload = command.payload
+    modes = payload["x.com.samsung.da.modes"]
+
+    assert copy.copy(payload) is payload
+    assert copy.deepcopy(payload) is payload
+    assert repr(payload) == repr(dict(payload.items()))
+    with pytest.raises(KeyError):
+        payload["x.com.samsung.da.absent"]
+
+    assert copy.copy(modes) is modes
+    assert copy.deepcopy(modes) is modes
+    assert repr(modes) == repr(list(modes))
+    with pytest.raises(TypeError, match="command payload is immutable"):
+        modes.append("Heat")

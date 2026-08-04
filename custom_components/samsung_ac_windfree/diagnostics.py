@@ -2,18 +2,44 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime
+from importlib import metadata
+from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import SUPPORTED_MODEL
+from .const import SUPPORTED_MODEL, TESTED_PLATFORM_FIRMWARE
 from .coordinator import ResourceCoverage, WindFreeCoordinator
 
-_INTEGRATION_VERSION = "0.1.0"
-_DEPENDENCY_VERSION = "0.1.0"
+
+def _read_versions() -> tuple[str | None, str | None]:
+    """Resolve both versions once at import, keeping requests free of I/O.
+
+    Home Assistant imports platform modules in the import executor, so the
+    manifest read and the distribution-metadata scan never run on the event
+    loop, and no lookup failure can escape into a diagnostics request frame.
+    """
+    try:
+        manifest = json.loads((Path(__file__).parent / "manifest.json").read_text())
+        integration_version: str | None = str(manifest["version"])
+    except Exception as error:
+        error.__traceback__ = None
+        error = None
+        integration_version = None
+    try:
+        dependency_version: str | None = metadata.version("smartthings-local")
+    except Exception as error:
+        error.__traceback__ = None
+        error = None
+        dependency_version = None
+    return integration_version, dependency_version
+
+
+_INTEGRATION_VERSION, _DEPENDENCY_VERSION = _read_versions()
 
 
 def _certificate(
@@ -90,7 +116,11 @@ async def async_get_config_entry_diagnostics(
         error.__traceback__ = None
         error = None
         coordinator = None
+    observed_platform_firmware: str | None = None
     if type(coordinator) is WindFreeCoordinator:
+        identity = coordinator.data.identity
+        if identity is not None and isinstance(identity.platform_firmware, str):
+            observed_platform_firmware = identity.platform_firmware
         health = coordinator.health
         coverage = coordinator.resource_coverage
         connection = {
@@ -187,6 +217,13 @@ async def async_get_config_entry_diagnostics(
         "integration_version": _INTEGRATION_VERSION,
         "dependency_version": _DEPENDENCY_VERSION,
         "supported_product": SUPPORTED_MODEL,
+        # Version strings only: never the device id, raw model number, or unit
+        # discriminator, which would make diagnostics a unit-tracking handle.
+        "firmware": {
+            "platform_firmware_observed": observed_platform_firmware,
+            "platform_firmware_tested": TESTED_PLATFORM_FIRMWARE,
+            "matches_tested": observed_platform_firmware == TESTED_PLATFORM_FIRMWARE,
+        },
         "connection": connection,
         "updates": updates,
         "resource_coverage": resource_coverage,

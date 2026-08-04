@@ -230,8 +230,9 @@ def use_sanitized_unit_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
     model_number = identity["device_0"]["/information/vs/0"][
         "x.com.samsung.da.modelNum"
     ]
+    discriminator = model_number.partition("|")[2]
     monkeypatch.setattr(
         device_module,
         "SUPPORTED_UNIT_FINGERPRINT_SHA256",
-        hashlib.sha256(model_number.encode("utf-8")).hexdigest(),
+        hashlib.sha256(discriminator.encode("utf-8")).hexdigest(),
     )

@@ -19,11 +19,15 @@ SUPPORTED_MODEL = "AR60F12C1AWNEU"
 SUPPORTED_DEVICE_TYPE = "oic.d.airconditioner"
 SUPPORTED_FIRMWARE = "TP1X_DA-AC-RAC-01001_0000"
 SUPPORTED_UNIT_FINGERPRINT_SHA256 = (
-    "8010a4b7a22d927fcccd68d572437efbc5c8c686fbc66241a57152be05099652"
+    "3a9cffedec67d951674c61307dfd80891cd7879f435bd733da55a3e09088e1f8"
 )
 SUPPORTED_PLATFORM = "TizenRT 4.0"
 SUPPORTED_PRODUCT_VERSION = "SYSTEM 2.0"
-SUPPORTED_PLATFORM_FIRMWARE = "ARA-KR-TP1-25-ARXX00_11260401"
+# Telemetry only, never an identity gate: Samsung bumps this build string on
+# routine OTAs and no read or write path depends on it. Its value records the
+# newest platform firmware the live capability matrix was actually run against,
+# so diagnostics can show tested-versus-observed.
+TESTED_PLATFORM_FIRMWARE = "ARA-KR-TP1-25-ARXX00_11260401"
 COMPATIBILITY = MappingProxyType(
     {
         "always_allowed": ("power", "hvac_mode", "display_light", "auto_clean"),
