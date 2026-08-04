@@ -38,17 +38,22 @@ ha_get() {
 step "1/7 waiting for CI on PR #$PR"
 # `gh pr checks` has no --json in this CLI version; its plain output is
 # tab-separated NAME<TAB>STATE<TAB>ELAPSED<TAB>URL.
-check_states() { gh pr checks "$PR" 2>/dev/null | awk -F'\t' 'NF > 1 {print $2}'; }
-until [ -n "$(check_states)" ] && ! check_states | grep -qx 'pending'; do
+while :; do
+    # One snapshot per iteration: polling three times could observe three
+    # different runs and report a verdict that never actually held.
+    states="$(gh pr checks "$PR" 2>/dev/null | awk -F'\t' 'NF > 1 {print $2}')"
+    if [ -n "$states" ] && ! grep -qx 'pending' <<<"$states"; then
+        break
+    fi
     sleep 20
 done
 # Treat anything that is not an explicit pass or skip as a failure, so a
 # cancelled or timed-out run can never be mistaken for success.
-if check_states | grep -qvE '^(pass|skipping)$'; then
+if grep -qvE '^(pass|skipping)$' <<<"$states"; then
     gh pr checks "$PR" | awk -F'\t' 'NF > 1 && $2 != "pass" && $2 != "skipping"'
     fail "CI is not green on PR #$PR"
 fi
-echo "CI green: $(check_states | grep -cx pass) passing"
+echo "CI green: $(grep -cx 'pass' <<<"$states") passing"
 
 step "2/7 merging PR #$PR"
 if [ "$(gh pr view "$PR" --json state --jq .state)" = "MERGED" ]; then
@@ -58,7 +63,8 @@ else
 fi
 
 step "3/7 syncing main"
-git checkout -q main && git pull -q --ff-only || fail "pull main"
+# Name the remote and branch explicitly: main may have no upstream configured.
+git checkout -q main && git pull -q --ff-only origin main || fail "pull main"
 git log --oneline -1
 
 step "4/7 tagging $TAG"
