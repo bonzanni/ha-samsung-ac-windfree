@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.metadata
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +14,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.samsung_ac_windfree.const import (
     DOMAIN,
     SUPPORTED_MODEL,
+    TESTED_PLATFORM_FIRMWARE,
 )
 from custom_components.samsung_ac_windfree.coordinator import (
     COLD_PATHS,
@@ -22,7 +25,11 @@ from custom_components.samsung_ac_windfree.coordinator import (
 from custom_components.samsung_ac_windfree.diagnostics import (
     async_get_config_entry_diagnostics,
 )
-from custom_components.samsung_ac_windfree.models import UpdateSource, WindFreeData
+from custom_components.samsung_ac_windfree.models import (
+    DeviceIdentity,
+    UpdateSource,
+    WindFreeData,
+)
 from custom_components.samsung_ac_windfree.repairs import (
     async_delete_legacy_bootstrap_issues,
     async_purge_entry_issues,
@@ -31,6 +38,9 @@ from custom_components.samsung_ac_windfree.repairs import (
 )
 
 _SETUP_SOURCE = Path("custom_components/samsung_ac_windfree/__init__.py").read_text()
+_MANIFEST = json.loads(
+    Path("custom_components/samsung_ac_windfree/manifest.json").read_text()
+)
 
 _SECRETS = (
     "192.0.2.10",
@@ -116,6 +126,7 @@ async def test_diagnostics_are_explicit_allowlist_and_zero_io(
         "integration_version",
         "dependency_version",
         "supported_product",
+        "firmware",
         "connection",
         "updates",
         "resource_coverage",
@@ -458,3 +469,102 @@ async def test_multi_entry_certificate_issue_waits_for_all_entries(
         now=now,
     )
     assert registry.async_get_issue(DOMAIN, "certificate_expiring") is None
+
+
+async def test_versions_track_manifest_and_installed_dependency(coordinator) -> None:
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = _entry(coordinator, expires=now + timedelta(days=91))
+
+    result = await async_get_config_entry_diagnostics(
+        coordinator.hass,
+        entry,
+        now=now,
+    )
+
+    assert result["integration_version"] == _MANIFEST["version"]
+    assert result["dependency_version"] == importlib.metadata.version(
+        "smartthings-local"
+    )
+
+
+async def test_version_lookup_never_runs_during_a_diagnostics_request(
+    coordinator,
+    monkeypatch,
+) -> None:
+    from custom_components.samsung_ac_windfree import diagnostics as diagnostics_module
+
+    expected_dependency = importlib.metadata.version("smartthings-local")
+
+    def explode(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("version lookup at request time")
+
+    monkeypatch.setattr(diagnostics_module.metadata, "version", explode)
+    monkeypatch.setattr(
+        diagnostics_module, "async_get_integration", explode, raising=False
+    )
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = _entry(coordinator, expires=now + timedelta(days=91))
+
+    result = await async_get_config_entry_diagnostics(
+        coordinator.hass,
+        entry,
+        now=now,
+    )
+
+    assert result["integration_version"] == _MANIFEST["version"]
+    assert result["dependency_version"] == expected_dependency
+
+
+async def test_diagnostics_report_tested_versus_observed_platform_firmware(
+    coordinator,
+) -> None:
+    observed = "ARA-KR-TP1-25-ARXX00_11260720"
+    coordinator.data = replace(
+        coordinator.data,
+        identity=DeviceIdentity(
+            device_id=_SECRETS[1],
+            model=SUPPORTED_MODEL,
+            device_type="oic.d.airconditioner",
+            firmware="TP1X_DA-AC-RAC-01001_0000",
+            platform="TizenRT 4.0",
+            platform_firmware=observed,
+        ),
+    )
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    entry = _entry(coordinator, expires=now + timedelta(days=91))
+
+    result = await async_get_config_entry_diagnostics(
+        coordinator.hass,
+        entry,
+        now=now,
+    )
+
+    assert result["firmware"] == {
+        "platform_firmware_observed": observed,
+        "platform_firmware_tested": TESTED_PLATFORM_FIRMWARE,
+        "matches_tested": False,
+    }
+    assert _SECRETS[1] not in repr(result)
+
+
+def test_version_lookup_failures_degrade_to_none_without_leaking() -> None:
+    """A broken manifest or missing distribution must not break diagnostics."""
+    from custom_components.samsung_ac_windfree import diagnostics as diagnostics_module
+
+    secret = "unreadable-path-with-secret"
+
+    def explode(*_args: object, **_kwargs: object) -> str:
+        raise OSError(secret)
+
+    original_loads = diagnostics_module.json.loads
+    original_version = diagnostics_module.metadata.version
+    diagnostics_module.json.loads = explode
+    diagnostics_module.metadata.version = explode
+    try:
+        integration_version, dependency_version = diagnostics_module._read_versions()
+    finally:
+        diagnostics_module.json.loads = original_loads
+        diagnostics_module.metadata.version = original_version
+
+    assert integration_version is None
+    assert dependency_version is None

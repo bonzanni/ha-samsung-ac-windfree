@@ -94,6 +94,7 @@ _ALL_WRITE_PATHS = frozenset(
 _PERIODS = {1: 5.0, 2: 30.0, 3: 300.0}
 _RECONCILE_PERIOD = 300.0
 _SHORT_GENERATION = 10.0
+_UNREACHABLE_WARNING_INTERVAL = 3600.0
 _FATAL_COAP_CODES = frozenset({129, 131})
 _FATAL_ALERTS = frozenset(
     {
@@ -404,6 +405,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._disabled_write_paths: set[str] = set()
         self._reconnect_attempts = 0
         self._port_range_exhausted = False
+        self._unreachable_warned_at: float | None = None
         self._update_counts = {
             UpdateSource.POLL: 0,
             UpdateSource.OBSERVE: 0,
@@ -810,6 +812,7 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         self._stored_port_failures = 0
         self._reconnect_delay = 0
         self._port_range_exhausted = False
+        self._unreachable_warned_at = None
         self._started = True
         self._publish(seeded.data)
 
@@ -1508,6 +1511,13 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
         *,
         advance_backoff: bool = True,
     ) -> None:
+        # Seeding parses identity, so a firmware change that lands while the
+        # device is disconnected surfaces here. Without this it is retried as a
+        # plain connection failure, and the operator is eventually told the
+        # ports are unreachable on a device that is answering normally.
+        if isinstance(error, UnsupportedDevice):
+            self._identity_drift = True
+            self._disabled_write_paths = set(_ALL_WRITE_PATHS)
         classification = self._fatal_classification(error)
         error = None
         if self._record_fatal_signal(classification, generation):
@@ -1530,9 +1540,50 @@ class WindFreeCoordinator(DataUpdateCoordinator[WindFreeData]):
             "windfree reconnect attempt",
         )
 
+    def _runtime_issue_flags(self) -> tuple[bool, bool, bool, bool]:
+        health = self.health
+        return (
+            health.authentication_rejected,
+            health.resource_contract_changed,
+            health.unsupported_identity_after_update,
+            health.port_range_exhausted,
+        )
+
+    def _warn_unreachable_throttled(self) -> None:
+        if (
+            self._shutting_down
+            or self._terminated
+            or self.data.available
+            or not self._port_range_exhausted
+        ):
+            return
+        now = self._monotonic()
+        if (
+            self._unreachable_warned_at is not None
+            and now - self._unreachable_warned_at < _UNREACHABLE_WARNING_INTERVAL
+        ):
+            return
+        self._unreachable_warned_at = now
+        _LOGGER.warning(
+            "Samsung WindFree AC is unreachable: the stored port and the "
+            "discovery range both refused after %d reconnect attempts; if the "
+            "unit still answers on the network, power-cycle the air "
+            "conditioner to restart its local API",
+            self._reconnect_attempts,
+        )
+
     async def _async_run_reconnect_attempt_impl(self) -> None:
-        async with self._generation_lock:
-            await self._async_run_reconnect_attempt_locked()
+        # Repair issues and reauth are driven by coordinator listeners, but a
+        # failed attempt never publishes (the entry is already unavailable), so
+        # flags that flip mid-outage must notify listeners explicitly.
+        flags_before = self._runtime_issue_flags()
+        try:
+            async with self._generation_lock:
+                await self._async_run_reconnect_attempt_locked()
+        finally:
+            if self._runtime_issue_flags() != flags_before:
+                self.async_update_listeners()
+            self._warn_unreachable_throttled()
 
     async def _async_run_reconnect_attempt_locked(self) -> None:
         if self._shutting_down or self._authentication_rejected:

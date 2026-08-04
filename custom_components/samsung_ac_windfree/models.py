@@ -83,6 +83,7 @@ class DeviceIdentity:
     device_type: str
     firmware: str
     platform: str
+    platform_firmware: str = ""
 
 
 @dataclass(frozen=True, slots=True)

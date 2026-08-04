@@ -2,7 +2,11 @@
   "oic_d": {
     "di": "00000000-0000-4000-8000-000000000001",
     "dmv": "ocf.res.1.3.0",
-    "rt": ["oic.wk.d", "oic.d.airconditioner"]
+    "rt": [
+      "oic.wk.d",
+      "oic.d.airconditioner"
+    ],
+    "mnmc": "AR60F12C1AWNEU"
   },
   "oic_p": {
     "mnpv": "SYSTEM 2.0",
