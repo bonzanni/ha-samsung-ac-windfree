@@ -37,12 +37,20 @@ ha_get() {
 
 step "1/7 waiting for CI on PR #$PR"
 # `gh pr checks` has no --json in this CLI version; its plain output is
-# tab-separated NAME<TAB>STATE<TAB>ELAPSED<TAB>URL.
-while :; do
+# tab-separated NAME<TAB>STATE<TAB>ELAPSED<TAB>URL. It also exits non-zero on a
+# merged PR, so a re-run after a partial failure must not wait on it forever.
+if [ "$(gh pr view "$PR" --json state --jq .state 2>/dev/null || echo UNKNOWN)" = "MERGED" ]; then
+    echo "PR already merged; its CI gate was satisfied before the merge"
+    states="pass"
+fi
+while [ -z "${states:-}" ]; do
     # One snapshot per iteration: polling three times could observe three
     # different runs and report a verdict that never actually held.
-    states="$(gh pr checks "$PR" 2>/dev/null | awk -F'\t' 'NF > 1 {print $2}')"
-    if [ -n "$states" ] && ! grep -qx 'pending' <<<"$states"; then
+    # `|| true`: gh exits non-zero for a merged or check-less PR, and
+    # pipefail would otherwise abort the whole run at this assignment.
+    snapshot="$(gh pr checks "$PR" 2>/dev/null | awk -F'\t' 'NF > 1 {print $2}')" || true
+    if [ -n "$snapshot" ] && ! grep -qx 'pending' <<<"$snapshot"; then
+        states="$snapshot"
         break
     fi
     sleep 20
