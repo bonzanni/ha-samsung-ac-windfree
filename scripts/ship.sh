@@ -3,7 +3,7 @@
 #
 #   scripts/ship.sh <pr-number> <version>       e.g. scripts/ship.sh 7 0.4.0
 #
-# Scope: this covers only what the ha-prod-console plugin does NOT do — the
+# Scope: this covers only what the ha-console plugin does NOT do — the
 # GitHub half (CI gate, merge, tag, release) and the post-deploy verification.
 # The deploy itself is delegated to the plugin's integration-update, which owns
 # the HACS and Supervisor semantics; do not reimplement that here.
@@ -14,16 +14,18 @@
 # names the stage that failed.
 #
 # Requires: gh (authenticated), ssh access to the host named in
-# .claude/ha-prod-console.yml, and `op` for the Home Assistant token.
+# .claude/ha-console.yml (or ~/.config/ha-console/config.yml), and `op` for the
+# Home Assistant token.
 set -euo pipefail
 
 PR="${1:?usage: ship.sh <pr-number> <version>}"
 VERSION="${2:?usage: ship.sh <pr-number> <version>}"
 TAG="v${VERSION}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_ROOT="${HA_PROD_CONSOLE_SCRIPTS:-}"
-PLUGIN_CACHE="$HOME/.claude-lesina/plugins/cache/bonzanni-claude-plugins/ha-prod-console"
-CONFIG="$REPO_DIR/.claude/ha-prod-console.yml"
+PLUGIN_ROOT="${HA_CONSOLE_SCRIPTS:-}"
+PLUGIN_CACHE="$HOME/.claude-lesina/plugins/cache/bonzanni-claude-plugins/ha-console"
+CONFIG="$REPO_DIR/.claude/ha-console.yml"
+USER_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/ha-console/config.yml"
 
 cd "$REPO_DIR"
 step() { printf '\n=== %s\n' "$*"; }
@@ -35,25 +37,30 @@ fail() { printf '!!! FAILED: %s\n' "$*" >&2; exit 1; }
 resolve_plugin() {
     if [ -n "$PLUGIN_ROOT" ]; then
         [ -x "$PLUGIN_ROOT/integration-update.sh" ] ||
-            fail "HA_PROD_CONSOLE_SCRIPTS=$PLUGIN_ROOT has no integration-update.sh"
+            fail "HA_CONSOLE_SCRIPTS=$PLUGIN_ROOT has no integration-update.sh"
         echo "$PLUGIN_ROOT"
         return
     fi
-    [ -d "$PLUGIN_CACHE" ] || fail "ha-prod-console plugin not installed at $PLUGIN_CACHE"
+    [ -d "$PLUGIN_CACHE" ] || fail "ha-console plugin not installed at $PLUGIN_CACHE"
     local newest
     newest="$(find "$PLUGIN_CACHE" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
         sort -V | tail -1)"
-    [ -n "$newest" ] || fail "no ha-prod-console versions under $PLUGIN_CACHE"
+    [ -n "$newest" ] || fail "no ha-console versions under $PLUGIN_CACHE"
     [ -f "$PLUGIN_CACHE/$newest/scripts/integration-update.sh" ] ||
-        fail "ha-prod-console $newest has no scripts/integration-update.sh (layout changed?)"
+        fail "ha-console $newest has no scripts/integration-update.sh (layout changed?)"
     echo "$PLUGIN_CACHE/$newest/scripts"
 }
 
-# The host lives in the plugin's project config; do not duplicate it here.
+# The host lives in the plugin's config (project file, else the user file the
+# plugin merges under it); do not duplicate it here.
 ha_host() {
-    local host
-    host="$(sed -n 's/^host:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$CONFIG" | head -1)"
-    [ -n "$host" ] || fail "no host: in $CONFIG"
+    local host="" f
+    for f in "$CONFIG" "$USER_CONFIG"; do
+        [ -f "$f" ] || continue
+        host="$(sed -n 's/^host:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$f" | head -1)"
+        [ -n "$host" ] && break
+    done
+    [ -n "$host" ] || fail "no host: in $CONFIG or $USER_CONFIG"
     # ssh alias -> address, so the REST API can be reached directly.
     ssh -G "$host" 2>/dev/null | awk '/^hostname /{print $2; exit}'
 }
@@ -131,7 +138,7 @@ else
     gh release create "$TAG" --title "$TAG" --notes-file "$notes" || fail "release"
 fi
 
-step "6/7 deploying to production via ha-prod-console (restarts HA Core)"
+step "6/7 deploying to production via ha-console (restarts HA Core)"
 PLUGIN="$(resolve_plugin)"
 echo "using $PLUGIN"
 # HACS identifies releases by tag name, not by bare version. --restart is

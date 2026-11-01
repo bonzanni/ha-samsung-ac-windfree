@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1] - 2026-11-01
+
+### Fixed
+
+- The climate entity no longer offers controls that always fail. Its supported
+  features were fixed, so in Heat Home Assistant showed fan, swing, and preset
+  selectors that the mode contract rejects, and every write to them failed with
+  "not compatible with the current operating mode", even a no-op such as
+  setting `auto` while already on `auto`. Supported features now follow the
+  current mode's allowed controls, so the selectors are hidden and Home
+  Assistant refuses those services up front (#8).
+
 ## [0.4.0] - 2026-08-04
 
 ### Changed

@@ -89,6 +89,13 @@ _MODE_GATED = frozenset(
     }
 )
 
+_MODE_FEATURES = (
+    (CommandKind.TEMPERATURE, ClimateEntityFeature.TARGET_TEMPERATURE),
+    (CommandKind.FAN, ClimateEntityFeature.FAN_MODE),
+    (CommandKind.SWING, ClimateEntityFeature.SWING_MODE),
+    (CommandKind.PRESET, ClimateEntityFeature.PRESET_MODE),
+)
+
 
 def _translated_error(key: str) -> HomeAssistantError:
     return HomeAssistantError(
@@ -119,14 +126,23 @@ class WindFreeClimate(WindFreeEntity, ClimateEntity):
     _attr_min_temp = 16.0
     _attr_max_temp = 30.0
     _attr_target_temperature_step = 1.0
-    _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.SWING_MODE
-        | ClimateEntityFeature.PRESET_MODE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
-    )
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Advertise only the controls the contract allows in the current mode.
+
+        HA then hides the rest in the UI and refuses their services before
+        they reach the device, instead of offering controls that always fail.
+        """
+
+        controls = self.coordinator.data.contract.mode_controls.get(
+            self.coordinator.data.climate.mode, frozenset()
+        )
+        features = ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
+        for kind, feature in _MODE_FEATURES:
+            if kind.value in controls:
+                features |= feature
+        return features
 
     @property
     def hvac_mode(self) -> HVACMode:
