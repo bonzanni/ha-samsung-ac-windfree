@@ -25,6 +25,7 @@ from custom_components.samsung_ac_windfree.coordinator import (
 from custom_components.samsung_ac_windfree.device import (
     HVAC_MODE_PATH,
     POWER_PATH,
+    PRESET_PATH,
     TEMPERATURE_PATH,
     CommandKind,
 )
@@ -787,6 +788,23 @@ async def test_preset_values_are_mode_specific_and_fail_before_io(
     coordinator.transport.reset_mock()
     await coordinator.async_command(CommandKind.PRESET, PresetMode.DRY_COMFORT)
     coordinator.transport.async_post.assert_awaited_once()
+
+
+async def test_heat_accepts_quiet_and_refuses_windfree_before_io(
+    coordinator: WindFreeCoordinator,
+) -> None:
+    await coordinator.async_set_hvac_mode(HvacMode.HEAT)
+    coordinator.transport.reset_mock()
+
+    for preset in (PresetMode.WINDFREE, PresetMode.WINDFREE_SLEEP):
+        with pytest.raises(CommandRejected, match="command_incompatible"):
+            await coordinator.async_command(CommandKind.PRESET, preset)
+    coordinator.transport.async_post.assert_not_awaited()
+
+    await coordinator.async_command(CommandKind.PRESET, PresetMode.QUIET)
+    assert [
+        call.args[0] for call in coordinator.transport.async_post.await_args_list
+    ] == [PRESET_PATH]
 
 
 async def test_auto_clean_is_rejected_without_io_while_power_is_off(

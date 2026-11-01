@@ -518,7 +518,7 @@ async def test_version_lookup_never_runs_during_a_diagnostics_request(
 async def test_diagnostics_report_tested_versus_observed_platform_firmware(
     coordinator,
 ) -> None:
-    observed = "ARA-KR-TP1-25-ARXX00_11260720"
+    observed = "ARA-KR-TP1-25-ARXX00_11261015"
     coordinator.data = replace(
         coordinator.data,
         identity=DeviceIdentity(

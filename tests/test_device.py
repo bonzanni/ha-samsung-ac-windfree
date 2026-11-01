@@ -491,7 +491,7 @@ def test_validate_contract_accepts_exact_live_safe_write_contract() -> None:
         HvacMode.COOL: frozenset({"temperature", "fan", "swing", "preset"}),
         HvacMode.DRY: frozenset({"preset"}),
         HvacMode.FAN: frozenset(),
-        HvacMode.HEAT: frozenset({"temperature"}),
+        HvacMode.HEAT: frozenset({"temperature", "fan", "swing", "preset"}),
     }
 
 
