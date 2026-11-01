@@ -112,6 +112,9 @@ writes in Cool and Heat, the seven general presets in Cool, and
 operating. Power, HVAC mode, and display light remain general controls. Home
 Assistant rejects incompatible commands instead of guessing at undocumented
 behavior, and waits two seconds after a mode change for the firmware to settle.
+The climate entity advertises only the controls the current mode allows, so in
+Heat, Auto, Fan, and Dry the unsupported fan, swing, or preset selectors are
+hidden, and their services are refused before anything reaches the unit.
 
 Additional entities are:
 

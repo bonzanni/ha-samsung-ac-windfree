@@ -19,7 +19,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceNotSupported
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -179,15 +179,57 @@ def test_climate_exposes_complete_local_state(climate, coordinator) -> None:
     assert climate.hvac_action is None
 
 
-def test_supported_features_are_exact(climate) -> None:
-    assert climate.supported_features == (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.SWING_MODE
-        | ClimateEntityFeature.PRESET_MODE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
+_ON_OFF = ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            HvacMode.COOL,
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.FAN_MODE
+            | ClimateEntityFeature.SWING_MODE
+            | ClimateEntityFeature.PRESET_MODE
+            | _ON_OFF,
+        ),
+        (HvacMode.HEAT, ClimateEntityFeature.TARGET_TEMPERATURE | _ON_OFF),
+        (HvacMode.DRY, ClimateEntityFeature.PRESET_MODE | _ON_OFF),
+        (HvacMode.AUTO, _ON_OFF),
+        (HvacMode.FAN, _ON_OFF),
+    ],
+)
+def test_supported_features_follow_the_mode_contract(
+    climate, coordinator, mode, expected
+) -> None:
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, mode=mode),
     )
+    assert climate.supported_features == expected
+
+
+async def test_heat_hides_controls_the_contract_rejects(
+    hass: HomeAssistant,
+    live_climate_entity: tuple[str, MagicMock],
+) -> None:
+    entity_id, coordinator = live_climate_entity
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, power=True, mode=HvacMode.HEAT),
+    )
+    entity = next(iter(hass.data["climate"].entities))
+    entity.async_write_ha_state()
+    await hass.async_block_till_done()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == HVACMode.HEAT
+    assert state.attributes["supported_features"] == (
+        ClimateEntityFeature.TARGET_TEMPERATURE | _ON_OFF
+    )
+    for attribute in ("fan_modes", "swing_modes", "preset_modes"):
+        assert attribute not in state.attributes
 
 
 def test_mapping_tables_and_advertised_lists_are_isolated(coordinator) -> None:
@@ -732,4 +774,24 @@ async def test_real_unavailable_entity_is_not_called(live_climate_entity, hass) 
         blocking=True,
     )
 
+    coordinator.async_command.assert_not_awaited()
+
+
+async def test_heat_fan_service_is_refused_by_ha_before_the_device(
+    hass: HomeAssistant,
+    live_climate_entity: tuple[str, MagicMock],
+) -> None:
+    entity_id, coordinator = live_climate_entity
+    coordinator.data = replace(
+        coordinator.data,
+        climate=replace(coordinator.data.climate, power=True, mode=HvacMode.HEAT),
+    )
+
+    with pytest.raises(ServiceNotSupported):
+        await hass.services.async_call(
+            "climate",
+            "set_fan_mode",
+            {ATTR_ENTITY_ID: entity_id, ATTR_FAN_MODE: "auto"},
+            blocking=True,
+        )
     coordinator.async_command.assert_not_awaited()
