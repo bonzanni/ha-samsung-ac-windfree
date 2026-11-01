@@ -62,7 +62,7 @@ _COMPATIBILITY: Mapping[str, object] = {
         "Cool": ["temperature", "fan", "swing", "preset"],
         "Dry": ["preset"],
         "Fan": [],
-        "Heat": ["temperature"],
+        "Heat": ["temperature", "fan", "swing", "preset"],
     },
 }
 

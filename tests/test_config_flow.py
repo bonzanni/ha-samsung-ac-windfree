@@ -9,7 +9,7 @@ from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.samsung_ac_windfree.const import DOMAIN
+from custom_components.samsung_ac_windfree.const import COMPATIBILITY, DOMAIN
 from custom_components.samsung_ac_windfree.credentials import CredentialError
 from custom_components.samsung_ac_windfree.models import (
     CapabilityMismatch,
@@ -816,3 +816,18 @@ def test_public_validation_error_excludes_host_and_secrets_from_repr_and_traceba
     assert credentials.client_key_pem not in repr(error)
     assert credentials.client_chain_pem not in repr(error)
     assert error.args == ("cannot_connect",)
+
+
+def test_setup_validation_uses_the_runtime_mode_contract() -> None:
+    from custom_components.samsung_ac_windfree.config_flow import _COMPATIBILITY
+
+    def normalized(compatibility):
+        return (
+            frozenset(compatibility["always_allowed"]),
+            {
+                str(mode): frozenset(controls)
+                for mode, controls in compatibility["by_mode"].items()
+            },
+        )
+
+    assert normalized(_COMPATIBILITY) == normalized(COMPATIBILITY)

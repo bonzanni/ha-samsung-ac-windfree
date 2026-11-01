@@ -27,7 +27,7 @@ SUPPORTED_PRODUCT_VERSION = "SYSTEM 2.0"
 # routine OTAs and no read or write path depends on it. Its value records the
 # newest platform firmware the live capability matrix was actually run against,
 # so diagnostics can show tested-versus-observed.
-TESTED_PLATFORM_FIRMWARE = "ARA-KR-TP1-25-ARXX00_11260401"
+TESTED_PLATFORM_FIRMWARE = "ARA-KR-TP1-25-ARXX00_11260720"
 COMPATIBILITY = MappingProxyType(
     {
         "always_allowed": ("power", "hvac_mode", "display_light", "auto_clean"),
@@ -37,7 +37,7 @@ COMPATIBILITY = MappingProxyType(
                 HvacMode.COOL.value: ("temperature", "fan", "swing", "preset"),
                 HvacMode.DRY.value: ("preset",),
                 HvacMode.FAN.value: (),
-                HvacMode.HEAT.value: ("temperature",),
+                HvacMode.HEAT.value: ("temperature", "fan", "swing", "preset"),
             }
         ),
     }
@@ -48,6 +48,15 @@ PRESETS_BY_MODE = MappingProxyType(
             preset for preset in PresetMode if preset is not PresetMode.DRY_COMFORT
         ),
         HvacMode.DRY: (PresetMode.NONE, PresetMode.DRY_COMFORT),
+        # Live run 2026-11-01 (#9): the unit answers the WindFree presets with
+        # "unavailable func" in Heat and keeps its previous preset.
+        HvacMode.HEAT: (
+            PresetMode.NONE,
+            PresetMode.QUIET,
+            PresetMode.SMART,
+            PresetMode.BOOST,
+            PresetMode.SLEEP,
+        ),
     }
 )
 PROBE_PORTS = tuple(range(49152, 49161))

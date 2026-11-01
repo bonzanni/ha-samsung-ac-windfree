@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-11-01
+
+### Added
+
+- Heat now offers fan, swing, and preset control. A live run on the unit
+  (platform firmware `ARA-KR-TP1-25-ARXX00_11260720`) showed that in Heat it
+  accepts and keeps every fan speed, all four swing modes, and the presets
+  `none`, `quiet`, `smart`, `boost`, and `sleep`. It refuses `windfree` and
+  `windfree_sleep` ("unavailable func") and keeps its previous preset, so Heat
+  does not offer them (#9).
+
+### Changed
+
+- `TESTED_PLATFORM_FIRMWARE` is now `ARA-KR-TP1-25-ARXX00_11260720`, the build
+  the Heat matrix ran against.
+
+### Verification
+
+- direct live AC matrix in Heat, 2026-11-01: fan auto/low/medium/high/turbo,
+  swing Fix/Up_And_Low/Left_And_Right/All, and presets Off/Quiet/Smart/Speed/Sleep
+  accepted and read back after 2 s; Nano and NanoSleep refused with CoAP 2.04
+  carrying `controlResponse.result: false`, read-back unchanged. Unit restored
+  afterwards. Full record on #9.
+- sound at the bed in Heat (phone meter, relative): fan auto -69.5 dB,
+  fan low -80 dB, preset Quiet -81 dB, preset Sleep -68.5 dB.
+
 ## [0.4.1] - 2026-11-01
 
 ### Fixed

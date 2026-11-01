@@ -92,7 +92,7 @@ def test_fixed_product_contract() -> None:
     assert SUPPORTED_FIRMWARE == "TP1X_DA-AC-RAC-01001_0000"
     assert SUPPORTED_PLATFORM == "TizenRT 4.0"
     assert SUPPORTED_PRODUCT_VERSION == "SYSTEM 2.0"
-    assert TESTED_PLATFORM_FIRMWARE == "ARA-KR-TP1-25-ARXX00_11260401"
+    assert TESTED_PLATFORM_FIRMWARE == "ARA-KR-TP1-25-ARXX00_11260720"
     assert re.fullmatch(r"[0-9a-f]{64}", SUPPORTED_UNIT_FINGERPRINT_SHA256)
     sanitized_identity = json.loads(
         (Path(__file__).parent / "fixtures" / "device_identity.json").read_text()
@@ -1544,9 +1544,9 @@ def test_release_metadata_matches_manifest_and_supported_scope() -> None:
     changelog = Path("CHANGELOG.md").read_text()
     license_text = Path("LICENSE").read_text()
 
-    assert manifest["version"] == "0.4.1"
+    assert manifest["version"] == "0.5.0"
     assert manifest["documentation"] in Path("README.md").read_text()
-    assert "## [0.4.1]" in changelog
+    assert "## [0.5.0]" in changelog
     for phrase in (
         "AR60F12C1AWNEU",
         "TP1X_DA-AC-RAC-01001_0000",

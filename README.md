@@ -106,15 +106,20 @@ Climate controls include:
 - presets `none`, `quiet`, `smart`, `boost`, `windfree`,
   `windfree_sleep`, `sleep`, and `dry_comfort`.
 
-The live contract allows fan and swing writes in Cool mode, target-temperature
-writes in Cool and Heat, the seven general presets in Cool, and
+The live contract allows target-temperature, fan, and swing writes in Cool and
+Heat, the seven general presets in Cool, `none`/`quiet`/`smart`/`boost`/`sleep`
+in Heat (the unit refuses `windfree` and `windfree_sleep` there), and
 `dry_comfort`/`none` in Dry. Auto-clean is writable only while the unit is
 operating. Power, HVAC mode, and display light remain general controls. Home
 Assistant rejects incompatible commands instead of guessing at undocumented
 behavior, and waits two seconds after a mode change for the firmware to settle.
 The climate entity advertises only the controls the current mode allows, so in
-Heat, Auto, Fan, and Dry the unsupported fan, swing, or preset selectors are
+Auto, Fan, and Dry the unsupported fan, swing, or preset selectors are
 hidden, and their services are refused before anything reaches the unit.
+
+For quiet heating at night, preset `quiet` or fan `low` are the measured
+choices: on the live unit both were about 11 dB quieter than fan `auto` in
+Heat. Preset `sleep` was louder than `auto` and sweeps the louver on its own.
 
 Additional entities are:
 
@@ -152,8 +157,8 @@ reconnect or restart.
   energy tariff, schedule, firmware update, or owner-account management.
 - Local protocol compatibility can change after a Samsung firmware update.
 - The device may accept only a small number of authenticated local clients.
-- Heating is exposed as `heat` with verified whole-degree target-temperature
-  control. Fan, swing, and preset writes remain unavailable in Heat.
+- The louver cannot be aimed at a fixed angle: the local protocol offers only
+  the four swing modes, and `fixed` freezes the louver wherever it is.
 - An immediate transition away from Auto can be rejected by the firmware; the
   integration applies the live-verified two-second settle interval.
 
